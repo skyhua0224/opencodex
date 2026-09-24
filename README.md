@@ -1,3 +1,5 @@
+**English** | [简体中文](README.zh-CN.md)
+
 # opencodex — skyhua's hardening fork
 
 Fork of **opencodex 2.63.0** (MIT). Upstream: <https://github.com/lidge-jun/opencodex>.
