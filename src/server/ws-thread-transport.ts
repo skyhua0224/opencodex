@@ -14,7 +14,8 @@
  * rather than momentary, and it decays after a quiet window so a recovered thread starts fresh.
  */
 import { normalizeLogConversationId } from "./request-log-conversation";
-import { readFileSync, statSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
+import { atomicWriteFile } from "../config/atomic-write";
 import { join } from "node:path";
 import { getConfigDir } from "../config/paths";
 
@@ -111,7 +112,11 @@ function persistAffinityState(now: number): void {
     if (entry.affinityResetUntil > now) armed[key] = entry.affinityResetUntil;
   }
   try {
-    writeFileSync(affinityStatePath(), JSON.stringify({ version: AFFINITY_STATE_VERSION, armed }, null, 2) + "\n", { mode: 0o600 });
+    // atomicWriteFile, not writeFileSync: it is upstream's platform-aware replace -- a private
+    // temp plus a rename that retries EBUSY/EPERM/EACCES on Windows, where a plain overwrite of a
+    // file another process has open fails or truncates. The hold is small state, but it is exactly
+    // the state an operator notices losing.
+    atomicWriteFile(affinityStatePath(), JSON.stringify({ version: AFFINITY_STATE_VERSION, armed }, null, 2) + "\n");
   } catch {
     /* persistence is best-effort: the in-memory hold still applies for this process */
   }
