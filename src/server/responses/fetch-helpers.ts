@@ -270,6 +270,12 @@ export function providerFetch(
   const unpaced = async (input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
     const upstreamWebsocket = provider.upstreamWebsocket === true;
     if (!options.httpOnly && typeof input === "string" && init
+      // Explicit operator opt-out: `upstreamWebsocket: false` also closes the first-party
+      // ChatGPT lane, which otherwise rides WS unconditionally because it is measurably faster.
+      // Diagnostic value: when one conversation is being shed upstream while its siblings are
+      // fine, switching THAT lane's transport is the only client-side lever that can tell a
+      // transport-scoped refusal apart from a conversation-scoped one.
+      && provider.upstreamWebsocket !== false
       && shouldUseCodexWsUpstream(input, init, runtime, upstreamWebsocket)) {
       const egress = egressFor(input);
       if (providerEgressIsExplicit(egress)) {

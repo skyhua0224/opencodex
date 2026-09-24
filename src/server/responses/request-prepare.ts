@@ -50,6 +50,7 @@ import { formatErrorResponse } from "../../bridge";
 import type { OcxParsedRequest } from "../../types";
 import { buildToolBridgeMaps } from "./collaboration";
 import { parseRequest } from "../../responses/parser";
+import { observeTurnStateRequestBody } from "../turn-state-observer";
 import { anthropicSessionKeyFromParts } from "../../oauth/anthropic-routing";
 import { isTranslatorBudgetExceededError } from "../../lib/translator-budget";
 import { bindTurnTerminationScope, rememberDeliveredFinalAnswer } from "../../responses/turn-termination";
@@ -308,6 +309,14 @@ export async function prepareResponsesRequest(
   let toolBridgeMaps: ReturnType<typeof buildToolBridgeMaps>;
   try {
     parsed = parseRequest(body);
+    if (!options.comboAttempt) {
+      observeTurnStateRequestBody(body, req.headers, {
+        provider: logCtx.provider,
+        model: parsed.modelId,
+        direction: "request",
+        transport: options.inboundTransport ?? "http",
+      });
+    }
     parsed._promptCacheKeyIsSharedCohort = options.promptCacheKeyIsSharedCohort;
     // The body may have been rebuilt since the inbound observation (previous-response
     // expansion); alias the parsed raw body to the same draft so the outbound

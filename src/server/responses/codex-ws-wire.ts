@@ -148,6 +148,28 @@ export function codexWsPreResponseFailure(status: 502 | 504, message: string, pr
   return response;
 }
 
+/**
+ * A capacity decline the origin stated outright, settled so the caller MAY send the turn again.
+ *
+ * {@link codexWsPreResponseFailure} is deliberately non-replayable: a socket that died mid-send is
+ * ambiguous and the turn may be running. A DECLINE is not ambiguous -- the backend answered "not
+ * now" before producing anything -- and the difference is the whole reason this helper exists.
+ * Measured 2026-09-23/24: every shed that reached the client arrived as a decline after the
+ * prelude, was absorbed once by an in-socket resend, and then settled as a failure anyway (12 of 12
+ * absorbs in the log stopped at rung 1), because the second decline is not always an \`error\` frame
+ * and the socket is not always still open. Returning a replayable 503 instead lets the caller's
+ * capacity ladder re-dial a FRESH socket with its own pacing, which is the path that has been
+ * proven to work end to end.
+ */
+export function codexWsCapacityDeclineFailure(status: 502 | 503, message: string, prelude: Headers): Response {
+  const headers = new Headers(prelude);
+  headers.set("content-type", "application/json");
+  headers.set("cache-control", "no-store");
+  return new Response(JSON.stringify({
+    error: { type: "server_error", code: "server_is_overloaded", message },
+  }), { status, headers });
+}
+
 const CLOSED_BEFORE_TERMINAL = "codex websocket closed before a Responses terminal event";
 
 /**

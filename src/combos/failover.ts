@@ -11,10 +11,336 @@ import {
 
 interface TargetCooldown {
   cooldownUntil: number;
+  /**
+   * True when the hold came from the BREAKER (consecutive failures past the threshold), not from
+   * a single post-failure cooldown. Only a tripped breaker is a hard exclusion; everything short
+   * of it is a demotion that still lets the ladder reach the row when nothing better is left.
+   */
+  breakerTripped?: boolean;
+}
+
+/**
+ * Circuit-breaker policy, the 熔断 half of what cc-switch does next to its 降级 queue.
+ *
+ * Failover alone only says "this attempt failed, try the next one"; without a breaker a provider
+ * that is down for an hour still costs one full attempt on every request. These numbers mirror
+ * the cc-switch settings shape: consecutive failures to open, a recovery wait, then consecutive
+ * successes to close.
+ */
+export interface ComboBreakerPolicy {
+  /** Consecutive failures that open the circuit. */
+  failureThreshold: number;
+  /** Consecutive successes after a trial that close it again. */
+  successThreshold: number;
+  /** How long an opened circuit stays open before a trial is allowed. */
+  openMs: number;
+}
+
+export const DEFAULT_COMBO_BREAKER: ComboBreakerPolicy = {
+  failureThreshold: 3,
+  successThreshold: 2,
+  openMs: 180_000,
+};
+
+/** Effective breaker policy for one combo, falling back per field to the defaults above. */
+export function comboBreakerPolicy(combo: {
+  breakerFailureThreshold?: number;
+  breakerSuccessThreshold?: number;
+  breakerOpenMs?: number;
+} | undefined): ComboBreakerPolicy {
+  return {
+    failureThreshold: combo?.breakerFailureThreshold ?? DEFAULT_COMBO_BREAKER.failureThreshold,
+    successThreshold: combo?.breakerSuccessThreshold ?? DEFAULT_COMBO_BREAKER.successThreshold,
+    openMs: combo?.breakerOpenMs ?? DEFAULT_COMBO_BREAKER.openMs,
+  };
+}
+
+/** Per-target consecutive outcomes. A circuit is open while its cooldown is running. */
+interface TargetCircuit {
+  failures: number;
+  successes: number;
+}
+
+const targetCircuits = new Map<string, TargetCircuit>();
+
+/**
+ * Targets that were STUCK (first-byte deadline hit) recently, so the ladder puts them behind the
+ * others instead of paying the same timeout on them first every single turn. Time-boxed rather
+ * than counted: one stuck attempt defers the target for ten minutes, and a success clears it
+ * immediately, so a provider that recovers is back in its price slot right away.
+ */
+const targetStuckAt = new Map<string, number>();
+const TARGET_STUCK_DEFER_MS = 10 * 60_000;
+
+export function comboTargetDeferred(comboId: string, target: Pick<OcxComboTarget, "provider" | "model">, now = Date.now()): boolean {
+  const at = targetStuckAt.get(cooldownMapKey(comboId, target));
+  return at !== undefined && now - at < TARGET_STUCK_DEFER_MS;
 }
 
 const DEFAULT_COOLDOWN_MS = 60_000;
-const MAX_COOLDOWN_MS = 10 * 60_000;
+/**
+ * Failures this proxy produced itself, not verdicts from the provider.
+ *
+ * A local fence (main-profile maintenance/drain, credentials we refused to read) says nothing
+ * about the upstream account, so counting it as capacity used to park the official provider on the
+ * hour-scale ladder for an hour while the account was demonstrably serving direct traffic. Local
+ * fences still fail over and still cool the target; they just never escalate the provider ladder.
+ */
+function isLocalFenceMessage(message: string | undefined): boolean {
+  const text = message ?? "";
+  return /opencodex local .*maintenance is active|native-main profile|main profile (?:maintenance|drain)/i.test(text);
+}
+/**
+ * Ceiling for a target cooldown, INCLUDING a tripped breaker's open window.
+ *
+ * Short on purpose: a relay recovers on its own, and the tiered picker already keeps a tripped
+ * row out of the healthy set, so a long lock would only delay the recovery the operator asked
+ * for ("use it the moment it works again").
+ */
+const MAX_COOLDOWN_MS = 2 * 60_000;
+
+/**
+ * Provider-level capacity hold ladder, in milliseconds: 10min, then 1h, 3h, 6h, 12h, 24h flat.
+ *
+ * A capacity / risk-control verdict is not a transient blip -- the account is throttled or flagged
+ * and it recovers on the operator's side, not ours. Cooling the combo TARGET for a minute (the
+ * usual cooldown) would walk the same provider again on the next request, so the whole PROVIDER is
+ * parked instead, for longer each time it repeats, and a success clears it.
+ *
+ * The first rung is deliberately short: the account's own capacity window turned over in minutes
+ * on 2026-09-19 (direct traffic succeeded minutes after a park) while an hour-long first rung kept
+ * the working channel out of every combo. Escalation is unchanged -- a provider that still fails
+ * after a rung expires advances through the operator's original 1h/3h/6h/12h/24h steps.
+ */
+const CAPACITY_HOLD_LADDER_MS = [10, 60, 180, 360, 720, 1440].map(minutes => minutes * 60_000);
+
+interface ProviderCapacityHold {
+  until: number;
+  escalations: number;
+  reason: string;
+  /** `capacity` holds survive a success; `failures` holds are released once the provider answers. */
+  kind?: "capacity" | "failures";
+  /** Last capacity verdict seen, used to decay the escalation rung after a long quiet period. */
+  lastHitAt?: number;
+  /** Set while a half-open trial is in flight: the row stays skipped until it answers. */
+  probing?: boolean;
+  /** When the current expiry was last probed, so one expiry is probed exactly once. */
+  lastProbeAt?: number;
+  /** Failed background re-checks in this streak (relay holds stop probing at RELAY_PROBE_MAX). */
+  probes?: number;
+}
+
+const providerCapacityHolds = new Map<string, ProviderCapacityHold>();
+
+/**
+ * Repeated-failure trips, shared by EVERY combo that targets the provider.
+ *
+ * Per-(combo, target) cooldowns make each ladder learn the same lesson separately: four codex
+ * combos each had to trip the same broken channel before any of them stopped walking it. This
+ * ledger is provider-scoped instead, so the first ladder that discovers a dead channel parks it
+ * for all of them -- and the hold clears on the first success, so a recovered provider is back
+ * immediately. Deliberately SHORT compared with the official-OpenAI ladder: a relay channel
+ * usually recovers on its own, and 15 minutes is enough for its upstream to settle.
+ */
+const providerFailureTimes = new Map<string, number[]>();
+const PROVIDER_FAILURE_WINDOW_MS = 15 * 60_000;
+const PROVIDER_FAILURE_LIMIT = 3;
+/**
+ * How long a relay stays demoted after it tripped the shared failure ledger.
+ *
+ * Deliberately short: the hold is a "step aside for a moment", not a sentence. Background
+ * retries (below) keep checking the channel and the first success restores it immediately.
+ */
+const PROVIDER_FAILURE_HOLD_MS = 90_000;
+/** Background re-checks per hold: five tries, then leave the row demoted until it is used again. */
+const RELAY_PROBE_MAX = 5;
+const RELAY_PROBE_MIN_INTERVAL_MS = 30_000;
+const RELAY_PROBE_GIVE_UP_HOLD_MS = 5 * 60_000;
+
+/** Record one failed attempt for the provider; returns true when that trips a shared hold. */
+export function noteProviderFailure(provider: string, now = Date.now()): boolean {
+  const times = (providerFailureTimes.get(provider) ?? []).filter(at => now - at < PROVIDER_FAILURE_WINDOW_MS);
+  times.push(now);
+  providerFailureTimes.set(provider, times);
+  if (times.length < PROVIDER_FAILURE_LIMIT) return false;
+  const existing = providerCapacityHolds.get(provider);
+  const until = now + PROVIDER_FAILURE_HOLD_MS;
+  if (existing && existing.until >= until) return true;
+  providerCapacityHolds.set(provider, {
+    until,
+    escalations: (existing?.escalations ?? 0) + 1,
+    reason: `repeated failures (${times.length} in ${Math.round(PROVIDER_FAILURE_WINDOW_MS / 60000)}min)`,
+    kind: "failures",
+  });
+  return true;
+}
+
+/** Consecutive capacity verdicts, per provider; cleared by the first success from that provider. */
+const providerCapacityStreaks = new Map<string, number>();
+
+export function isProviderCapacityHeld(provider: string, now = Date.now()): boolean {
+  const hold = providerCapacityHolds.get(provider);
+  if (!hold) return false;
+  // A trial in flight keeps the row skipped: the whole point of the probe is that the operator
+  // never sees the failure it is looking for.
+  return hold.until > now || hold.probing === true;
+}
+
+/**
+ * Which kind of provider hold is active, for callers that must rank it.
+ *
+ * `capacity` is the official-OpenAI hour-scale ladder (never walked before anything else),
+ * `failures` is the short relay hold that only demotes the row.
+ */
+export function providerHoldKind(provider: string, now = Date.now()): "capacity" | "failures" | undefined {
+  const hold = providerCapacityHolds.get(provider);
+  if (!hold || (hold.until <= now && hold.probing !== true)) return undefined;
+  return hold.kind === "failures" ? "failures" : "capacity";
+}
+
+/**
+ * Claim the one probe an expired hold is allowed, or return false when there is nothing to probe.
+ *
+ * Called from the combo path, so a probe happens exactly when a request would otherwise have hit
+ * the just-expired hold -- once per expiry, not on a timer. At the first rung that is one tiny
+ * request per hour, far below anything an upstream reads as abuse; higher rungs are probed
+ * proportionally less often.
+ */
+export function claimProviderProbe(provider: string, now = Date.now()): boolean {
+  const hold = providerCapacityHolds.get(provider);
+  if (!hold || hold.probing === true) return false;
+  if (hold.kind === "capacity") {
+    // The official ladder probes exactly once per expiry, and only after that quiet hour (or
+    // three, or twelve) has actually elapsed. That patience is the point of the ladder.
+    if (hold.until > now) return false;
+    if ((hold.lastProbeAt ?? 0) >= hold.until) return false;
+    hold.probing = true;
+    hold.lastProbeAt = now;
+    return true;
+  }
+  // Relay hold: keep checking WHILE it is demoted -- a bounded number of tries, spaced out -- so
+  // a channel that recovers is back in its price slot within seconds instead of waiting for the
+  // hold to expire. The first success clears the hold outright (finishProviderProbe).
+  if ((hold.probes ?? 0) >= RELAY_PROBE_MAX) return false;
+  if (now - (hold.lastProbeAt ?? 0) < RELAY_PROBE_MIN_INTERVAL_MS) return false;
+  hold.probing = true;
+  hold.lastProbeAt = now;
+  return true;
+}
+
+/**
+ * Outcome of a half-open trial: success re-admits the provider immediately, failure advances the
+ * escalation rung so a still-overloaded provider is parked for longer, not retried as often.
+ */
+export function finishProviderProbe(provider: string, ok: boolean, now = Date.now()): void {
+  const hold = providerCapacityHolds.get(provider);
+  if (!hold) return;
+  hold.probing = false;
+  if (ok) {
+    providerCapacityHolds.delete(provider);
+    providerCapacityStreaks.delete(provider);
+    providerCapacityHits.delete(provider);
+    return;
+  }
+  // Relay rows only ever carry the short shared-failure hold. Escalating one here walked the
+  // hour-scale ladder (1h -> 3h -> 6h -> 12h -> 24h) onto channels whose upstreams recover on
+  // their own -- that ladder is the official-OpenAI policy and nobody else's. Re-arm the
+  // short hold instead, counting this failed background retry; after RELAY_PROBE_MAX of them the
+  // row stays demoted for a while and stops probing until a real request produces a new verdict.
+  if (hold.kind !== "capacity") {
+    const probes = (hold.probes ?? 0) + 1;
+    providerCapacityHolds.set(provider, {
+      ...hold,
+      until: now + (probes >= RELAY_PROBE_MAX ? RELAY_PROBE_GIVE_UP_HOLD_MS : PROVIDER_FAILURE_HOLD_MS),
+      probing: false,
+      probes,
+      lastHitAt: now,
+    });
+    return;
+  }
+  holdProviderForCapacity(provider, "half-open probe failed", now);
+}
+
+export function providerCapacityHold(provider: string, now = Date.now()): ProviderCapacityHold | undefined {
+  const hold = providerCapacityHolds.get(provider);
+  return hold && hold.until > now ? hold : undefined;
+}
+
+/** Park a provider after a capacity verdict and return the hold it now carries. */
+export function holdProviderForCapacity(provider: string, reason: string, now = Date.now()): ProviderCapacityHold {
+  const previous = providerCapacityHolds.get(provider);
+  // A verdict that arrives while the row is ALREADY parked is a retry hitting the same rail, not a
+  // new escalation. The ladder exists to buy the account quiet time (1h -> 3h -> 6h -> 12h -> 24h),
+  // and it must only advance when a FRESH attempt fails after that quiet -- the half-open probe
+  // does exactly that, because it runs on the expired hold. Counting request-level retries here
+  // walked the whole ladder to 24h inside one minute of client retries.
+  if (previous && previous.until > now) {
+    // Still parked: record the activity so the "a quiet day resets the ladder" rule does not fire
+    // while the row is provably still failing, but keep the rung and its expiry exactly as they
+    // were. Only an elapsed hold followed by a failed trial advances this ladder.
+    const activity: ProviderCapacityHold = { ...previous, lastHitAt: now };
+    providerCapacityHolds.set(provider, activity);
+    return activity;
+  }
+  const quiet = previous?.lastHitAt !== undefined && now - previous.lastHitAt > CAPACITY_RUNG_RESET_MS;
+  const streak = (quiet ? 0 : providerCapacityStreaks.get(provider) ?? 0) + 1;
+  providerCapacityStreaks.set(provider, streak);
+  const holdMs = CAPACITY_HOLD_LADDER_MS[Math.min(streak, CAPACITY_HOLD_LADDER_MS.length) - 1]!;
+  const hold: ProviderCapacityHold = { until: now + holdMs, escalations: streak, reason, kind: "capacity", lastHitAt: now };
+  providerCapacityHolds.set(provider, hold);
+  return hold;
+}
+
+/** A capacity rung decays after a full quiet day, so a recovered account starts at one hour again. */
+const CAPACITY_RUNG_RESET_MS = 24 * 60 * 60 * 1000;
+
+/** Capacity verdicts counted as "multiple" before the rung is used up. */
+const CAPACITY_HIT_WINDOW_MS = 30 * 60_000;
+const CAPACITY_HIT_LIMIT = 2;
+
+const providerCapacityHits = new Map<string, number[]>();
+
+/**
+ * Count a capacity verdict and trip the hold ladder once the provider produced several of them.
+ *
+ * Counting is windowed on purpose: the official account fails INTERMITTENTLY (a success between
+ * two overloads is common), so requiring consecutive failures means it never parks and the
+ * operator keeps seeing the overload error every other request. Two verdicts inside half an hour
+ * is the signal to give the account a rest.
+ */
+export function noteProviderCapacityVerdict(provider: string, reason: string, now = Date.now()): ProviderCapacityHold | null {
+  const hits = (providerCapacityHits.get(provider) ?? []).filter(at => now - at < CAPACITY_HIT_WINDOW_MS);
+  hits.push(now);
+  providerCapacityHits.set(provider, hits);
+  if (hits.length < CAPACITY_HIT_LIMIT) return null;
+  return holdProviderForCapacity(provider, reason, now);
+}
+
+export function noteProviderSuccess(provider: string): void {
+  // A success clears the RELAY failure ledger -- that provider is back in use -- but it must NOT
+  // clear an official-provider capacity hold: an account that alternates success and overload
+  // would never stay parked, so every other request would surface the overload again. The hold
+  // expires on its own, and the next verdict re-trips at the next rung.
+  const hold = providerCapacityHolds.get(provider);
+  if (!hold || hold.kind !== "capacity") providerCapacityHolds.delete(provider);
+  providerFailureTimes.delete(provider);
+}
+
+/**
+ * Does this failure read as capacity / risk control rather than a bad request?
+ *
+ * Covers the relay spellings (`capacity`, `capacity_exceeded`, `at capacity`), OpenAI's overload
+ * wording, and the rate-limit family that a flagged account returns.
+ */
+export function isCapacityVerdict(status: number | undefined, code: string | null | undefined, message: string | undefined): boolean {
+  const normalizedCode = String(code ?? "").trim().toLowerCase();
+  if (["capacity", "capacity_exceeded", "capacity_reached", "at_capacity", "insufficient_capacity"].includes(normalizedCode)) {
+    return true;
+  }
+  const text = String(message ?? "").toLowerCase();
+  if (/\bcapacity\b|at capacity|overloaded|over capacity|满载|容量不足|风控/.test(text)) return true;
+  return status === 429 && /rate limit|quota|limit/i.test(text);
+}
 /** Short cooldown for request-rate 429s (for example provider code 1302) that omit Retry-After. */
 export const COMBO_REQUEST_RATE_COOLDOWN_MS = 5_000;
 
@@ -159,6 +485,21 @@ export function isComboTargetInCooldown(
   return true;
 }
 
+/**
+ * Whether this target's hold is a TRIPPED BREAKER (consecutive failures past the threshold).
+ *
+ * The distinction matters to the picker: a single failure only demotes a row, while a tripped
+ * breaker takes it out of the healthy tier until it is probed or the window expires.
+ */
+export function isComboTargetBreakerOpen(
+  comboId: string,
+  target: Pick<OcxComboTarget, "provider" | "model">,
+  now = Date.now(),
+): boolean {
+  const entry = targetCooldowns.get(cooldownMapKey(comboId, target));
+  return Boolean(entry && entry.breakerTripped === true && entry.cooldownUntil > now);
+}
+
 export function isTransientRequestRateLimit(input: {
   status?: number;
   code?: string | null;
@@ -212,6 +553,13 @@ export function coolComboTarget(
     status?: number;
     code?: string | null;
     message?: string;
+    breaker?: ComboBreakerPolicy;
+    /**
+     * True only for the OFFICIAL OpenAI forward row. Its capacity / overload verdicts come from
+     * OpenAI's own risk control, which lasts hours, so they escalate through the hold ladder.
+     * Every other provider gets plain failover + breaker: it recovers when it recovers.
+     */
+    capacityHoldLadder?: boolean;
   },
 ): void {
   const now = options?.now ?? Date.now();
@@ -233,12 +581,85 @@ export function coolComboTarget(
       code: options?.code,
       message: options?.message,
     }) ? COMBO_REQUEST_RATE_COOLDOWN_MS : DEFAULT_COOLDOWN_MS);
-  targetCooldowns.set(cooldownMapKey(comboId, target), {
-    // Only the locally chosen fallback is capped at ten minutes. An explicit
-    // server lower bound (including one hour) remains authoritative.
-    cooldownUntil: now + (serverDelayMs ?? Math.min(Math.max(cooldownMs, 1), MAX_COOLDOWN_MS)),
+  const circuitKey = cooldownMapKey(comboId, target);
+  // A first-byte deadline (or an upstream gateway timeout) is the "this channel is stuck" shape:
+  // remember it so the ladder stops putting it first on every turn.
+  if (options?.status === 504 || String(options?.message ?? "").includes("first-byte timeout")) {
+    targetStuckAt.set(circuitKey, now);
+  }
+  // One failure still moves on immediately (that is the ladder); the long hold starts only once
+  // the same target has failed failureThreshold times in a row, and a success clears the count.
+  const circuit = targetCircuits.get(circuitKey) ?? { failures: 0, successes: 0 };
+  circuit.failures += 1;
+  circuit.successes = 0;
+  targetCircuits.set(circuitKey, circuit);
+  const breaker = options?.breaker;
+  const breakerTripped = Boolean(breaker && circuit.failures >= breaker.failureThreshold);
+  const fallbackCooldownMs = serverDelayMs ?? Math.min(Math.max(cooldownMs, 1), MAX_COOLDOWN_MS);
+  const holdMs = breakerTripped
+    ? Math.max(fallbackCooldownMs, breaker?.openMs ?? 0)
+    : fallbackCooldownMs;
+  targetCooldowns.set(circuitKey, {
+    cooldownUntil: now + Math.max(holdMs, 1),
+    ...(breakerTripped ? { breakerTripped: true } : {}),
   });
+  // Capacity / risk control parks the whole provider, not just this target: the verdict is about
+  // the account, so every combo and model that targets it should stay away until it recovers.
+  // The official OpenAI row is parked on ANY 5xx (plus an explicit capacity verdict at any
+  // status): its soft risk control shows up as "overloaded" 5xx with no capacity word in it, and
+  // the operator has asked for the hour-scale ladder rather than per-request retries. Every other
+  // provider needs the explicit capacity signal and otherwise keeps plain failover + breaker.
+  const parkWorthy = options?.capacityHoldLadder === true
+    && !isLocalFenceMessage(options?.message)
+    && (isCapacityVerdict(options?.status, options?.code, options?.message) || (options?.status ?? 0) >= 500);
+  if (parkWorthy) {
+    const hold = noteProviderCapacityVerdict(target.provider, String(options?.message ?? "capacity").slice(0, 120), now);
+    if (hold) {
+      console.warn(`[combo] ${comboId}: ${target.provider} parked ${Math.round((hold.until - now) / 60000)}min (capacity rung #${hold.escalations}, ${hold.reason})`);
+    }
+  } else if (((options?.status ?? 0) >= 500 || options?.status === 429)
+    && !isLocalFenceMessage(options?.message)) {
+    // Provider-side failures only: a 4xx that describes the request must not park a provider for
+    // everyone. 5xx and rate limits are the shapes a dead or throttled channel shows.
+    if (noteProviderFailure(target.provider, now)) {
+      const hold = providerCapacityHolds.get(target.provider)!;
+      console.warn(`[combo] ${comboId}: ${target.provider} parked ${Math.round((hold.until - now) / 60000)}min (shared failure hold #${hold.escalations})`);
+    }
+  }
   sweepExpiredOnWrite(now);
+}
+
+/**
+ * Record a successful attempt.
+ *
+ * After a tripped circuit this counts trial wins and closes the circuit once `successThreshold`
+ * of them land in a row (cc-switch's 恢复成功阈值); below the threshold a single success just
+ * clears the failure count, because the provider was never actually held.
+ */
+export function noteComboTargetSuccess(
+  comboId: string,
+  target: Pick<OcxComboTarget, "provider" | "model">,
+  breaker: ComboBreakerPolicy = DEFAULT_COMBO_BREAKER,
+): void {
+  const key = cooldownMapKey(comboId, target);
+  const circuit = targetCircuits.get(key);
+  targetStuckAt.delete(key);
+  // A success is the strongest evidence available -- the row just answered -- so its demotion ends
+  // right here: the next pick puts it back in its price slot ("cheaper one works again -> go
+  // back to it"). The consecutive-failure counter that OPENS the breaker is tracked separately
+  // below and still needs the breaker's success threshold to be considered fully reset.
+  targetCooldowns.delete(key);
+  if (!circuit) return;
+  if (circuit.failures >= breaker.failureThreshold) {
+    circuit.successes += 1;
+    if (circuit.successes >= breaker.successThreshold) {
+      circuit.failures = 0;
+      circuit.successes = 0;
+    }
+    return;
+  }
+  circuit.failures = 0;
+  circuit.successes = 0;
 }
 
 export function earliestComboCooldown(
@@ -380,6 +801,12 @@ function isRequestLocalTargetIncompatibility(status: number, message: string, co
     let payload: unknown;
     try { payload = JSON.parse(text); } catch { return false; }
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+    // A target can demand a different request SHAPE than the caller sent. The ChatGPT forward
+    // backend answers a non-stream body with `{detail:"Stream must be set to true"}`, which says
+    // nothing about the next combo target -- the relays accept the same body as-is. Hop instead of
+    // stopping there, and (via comboFailureCooldownScope) do not cool a rung for a shape refusal.
+    const detail = (payload as Record<string, unknown>).detail;
+    if (typeof detail === "string" && /stream\s+must\s+be\s+set\s+to\s+true/i.test(detail)) return true;
     const error = (payload as Record<string, unknown>).error;
     if (!error || typeof error !== "object" || Array.isArray(error)) return false;
     const e = error as Record<string, unknown>;
@@ -570,14 +997,10 @@ function isProviderTargetContextOverflow(
     && /\bprompt\s+\d+\s*>\s*\d+\s+maximum context length\b/i.test(message);
 }
 
-/** A status can carry a verdict about the REQUEST; 401/403/429 speak about the credential. */
+  /** A status can carry a verdict about the REQUEST; 401/403/429 speak about the credential. */
 const CONTEXT_VERDICT_STATUSES: ReadonlySet<number> = new Set([400, 413, 422]);
 
-/**
- * Phrases a provider emits when the INPUT does not fit this model's context window. Matched
- * against the innermost provider message only, so an unrelated refusal that merely quotes one
- * of these tokens in a code field cannot authorize a replay.
- */
+/** Phrases a provider emits when the input does not fit this model's context window. */
 const DEFINITE_CONTEXT_OVERFLOW_PHRASES = [
   "exceeds the context window",
   "exceed the context window",
@@ -587,8 +1010,6 @@ const DEFINITE_CONTEXT_OVERFLOW_PHRASES = [
   "maximum context window",
   "too many tokens",
 ];
-
-/** Wrapper envelopes unwrapped before the leaf message is read. */
 const MAX_CONTEXT_OVERFLOW_ENVELOPES = 4;
 
 function isDefiniteContextOverflowMessage(text: string): boolean {
@@ -597,25 +1018,11 @@ function isDefiniteContextOverflowMessage(text: string): boolean {
     || DEFINITE_CONTEXT_OVERFLOW_PHRASES.some(phrase => normalized.includes(phrase));
 }
 
-/**
- * Confirm a context overflow from the provider MESSAGE rather than from a code token that
- * merely appears somewhere in the envelope. An upstream controls both fields and can emit a
- * contradictory pair -- `context_length_exceeded` beside `Unsupported parameter: user` -- and
- * that is not evidence the turn is too large for this model. `classifyError` reads the whole
- * blob, which is exactly the looseness this must not inherit.
- *
- * A JSON-shaped body that fails to parse is truncated or corrupt, not prose: `classificationText`
- * is capped at 500 characters by `normalizeUpstreamErrorText` before it reaches this function, so
- * a long envelope arrives here as a JSON prefix. Reading that prefix as plain text would let an
- * arbitrary field that happens to sit in the first 500 bytes authorize a hop, so it fails closed.
- *
- * Only the exact proxy wrapper is unwrapped, within a fixed envelope budget and 16,384 characters.
- */
+/** Unwrap bounded provider envelopes before reading the leaf message. */
 function isDefiniteContextOverflow(status: number, message: string): boolean {
   if (!CONTEXT_VERDICT_STATUSES.has(status) && status < 500) return false;
   if (message.length > 16_384) return false;
   let text = message.trim();
-  // One pass per unwrapped envelope, plus one for the leaf the last envelope yields.
   for (let unwrapped = 0; unwrapped <= MAX_CONTEXT_OVERFLOW_ENVELOPES; unwrapped += 1) {
     const providerPrefix = /^Provider error \d{3}:\s*/.exec(text);
     if (providerPrefix) text = text.slice(providerPrefix[0].length).trim();
@@ -636,6 +1043,27 @@ function isDefiniteContextOverflow(status: number, message: string): boolean {
     text = (source.message as string).trim();
   }
   return false;
+}
+
+/** Narrow 400 capacity verdicts are target-local, not malformed requests. */
+const TARGET_CAPACITY_CODES = new Set([
+  "capacity",
+  "capacity_exceeded",
+  "capacity_reached",
+  "at_capacity",
+]);
+function isTargetCapacityRejection(status: number, message: string, code?: string | null): boolean {
+  const normalizedCode = normalizedFailureCode(code);
+  if (TARGET_CAPACITY_CODES.has(normalizedCode)) return true;
+  if (status !== 400) return false;
+  return /^(?:provider error 400:\s*)?(?:capacity|at capacity|capacity reached|capacity exceeded)[.!]?$/i
+    .test(message.trim());
+}
+function isTargetPayloadTooLarge(status: number, code?: string | null): boolean {
+  if (status !== 413) return false;
+  const normalizedCode = normalizedFailureCode(code);
+  return normalizedCode !== "outbound_body_too_large"
+    && normalizedCode !== "translation_buffer_limit";
 }
 
 export function comboFailureDecision(
@@ -663,6 +1091,8 @@ export function comboFailureDecision(
   if (isModelLifecycleGone(status, message, options?.code)) return "hop";
   const error = classifyError(status, "upstream_error", message);
   if (isCyberPolicyCode(error.code)) return "stop";
+  if (isTargetCapacityRejection(status, message, options?.code)) return "hop";
+  if (isTargetPayloadTooLarge(status, options?.code)) return "hop";
   // A provider can expose its own target hard cap with a non-semantic vendor code
   // (for example 5059 + invalid_request_prompt_too_long). That is evidence that this
   // target is too small, not that every later combo target is incapable of serving it.

@@ -1,7 +1,9 @@
 import { modelCapabilitiesConfigError, mergeModelCapabilities } from "../../config/provider-validation";
 import { DECLARABLE_HOSTED_TOOL_TYPES } from "../../responses/hosted-tool-policy";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { CatalogModel } from "../../codex/catalog";
 import { catalogModelSlug, invalidateCodexModelsCache, nativeModelRows, uniqueCatalogModelsForPublicList } from "../../codex/catalog";
@@ -63,6 +65,8 @@ import { clearAccountQuotaCache, clearProviderQuotaCache, fetchProviderQuotaRepo
 import { getCachedProviderRoutingQuota } from "../../providers/quota-routing-cache";
 import { PROVIDER_QUOTA_MAX_AGE_MS, type ProviderRoutingQuota } from "../../providers/quota-types";
 import { cachedProviderQuotaIsExhausted } from "../../combos/resolve";
+import { providerCapacityHold } from "../../combos/failover";
+import { getConfigDir } from "../../config/paths";
 import { clearKeyCooldowns, forgetApiKeyRotationCursor } from "../../providers/key-failover";
 import { providerRequestPacingStatus } from "../../providers/request-pacing";
 import { CODEX_FORWARD_BASE_URL, isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
@@ -832,6 +836,158 @@ function canonicalOpenAiBudgetPatchError(
     ?? providerEmptyToolOutputConfigError("openai", applied.next);
 }
 
+const PANEL_QUOTA_SOURCE_PREFIX = "panel:";
+
+/**
+ * How old the exported panel file may be before its rows are hidden, and when to re-run it.
+ *
+ * Routing keeps the strict 30-minute window (see quota-routing-cache); DISPLAY does not, because
+ * hiding the entire panel -- availability, plan windows, multipliers -- just because nobody ran a
+ * 20-second exporter in the last half hour reads as "the feature disappeared". Rows are shown with
+ * their age, and a stale file is refreshed in the background on the next look.
+ */
+const PANEL_QUOTA_DISPLAY_MAX_AGE_MS = 6 * 60 * 60_000;
+const PANEL_QUOTA_REFRESH_AFTER_MS = 15 * 60_000;
+
+/** The panel exporter, run when the operator presses "refresh all quotas". */
+const PANEL_QUOTA_EXPORT_TIMEOUT_MS = 90_000;
+let panelQuotaExportFlight: Promise<PanelQuotaRefresh> | null = null;
+
+interface PanelQuotaRefresh {
+  ok: boolean;
+  ms: number;
+  error?: string;
+}
+
+/**
+ * Re-run the panel exporter so the refresh button refreshes THESE rows too.
+ *
+ * The rows come from a file rather than from a probe, so without this the button would only
+ * refresh the Codex pool and leave the panel numbers (and their 30-minute freshness window)
+ * frozen. Concurrent refreshes share one flight; a failure keeps the previous file, and the
+ * outcome is reported back so the operator sees why nothing moved.
+ */
+function refreshPanelQuotaRows(): Promise<PanelQuotaRefresh> {
+  if (panelQuotaExportFlight) return panelQuotaExportFlight;
+  const started = Date.now();
+  const script = join(getConfigDir(), "tools", "quota-report.py");
+  if (!existsSync(script)) {
+    return Promise.resolve({ ok: false, ms: 0, error: "未找到 " + script });
+  }
+  const python = process.env["OCX_PANEL_QUOTA_PYTHON"]?.trim() || "python3";
+  panelQuotaExportFlight = new Promise<PanelQuotaRefresh>(resolve => {
+    execFile(python, [script, "--export"], { timeout: PANEL_QUOTA_EXPORT_TIMEOUT_MS }, error => {
+      const outcome: PanelQuotaRefresh = { ok: !error, ms: Date.now() - started };
+      if (error) outcome.error = String(error.message || error).slice(0, 200);
+      resolve(outcome);
+    });
+  }).finally(() => { panelQuotaExportFlight = null; });
+  return panelQuotaExportFlight;
+}
+
+/**
+ * Quota rows derived from relay panels, written by `ocxquota --export`.
+ *
+ * The probe pipeline only understands the Codex account pool, so the plan state of the relay
+ * sites that actually serve these combos never appeared in the report. Their numbers are merged
+ * in as their own rows. Note the deliberate boundary: a panel window that stops service is a
+ * BILLING rule, shown for the operator to act on -- it is NOT fed into the routing cache, so the
+ * panel informs routing without silently gating it.
+ */
+function panelQuotaRows(config: OcxConfig, now: number): Array<Record<string, unknown>> {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(readFileSync(join(getConfigDir(), "provider-quota.json"), "utf8"));
+  } catch {
+    return [];
+  }
+  if (!payload || typeof payload !== "object") return [];
+  const generatedAt = (payload as { generatedAt?: unknown }).generatedAt;
+  if (typeof generatedAt !== "number") return [];
+  const ageMs = now - generatedAt;
+  if (ageMs > PANEL_QUOTA_DISPLAY_MAX_AGE_MS) return [];
+  if (ageMs > PANEL_QUOTA_REFRESH_AFTER_MS) void refreshPanelQuotaRows();
+  const providers = (payload as { providers?: unknown }).providers;
+  if (!providers || typeof providers !== "object") return [];
+  const rows: Array<Record<string, unknown>> = [];
+  for (const [name, entry] of Object.entries(providers as Record<string, unknown>)) {
+    if (!hasOwnProvider(config.providers, name) || !entry || typeof entry !== "object") continue;
+    const quotas = ((entry as { quotas?: unknown }).quotas ?? {}) as Record<string, unknown>;
+    // `opencodex` is the ready-to-route shape (named windows + custom windows such as 日限);
+    // `quotas` is the older percent-only view and still works for files written before it.
+    const source = ((entry as { opencodex?: unknown }).opencodex ?? quotas) as Record<string, unknown>;
+    const quota: Record<string, unknown> = { updatedAt: generatedAt };
+    for (const key of ["fiveHourPercent", "fiveHourResetAt", "weeklyPercent", "weeklyResetAt",
+      "monthlyPercent", "monthlyResetAt"] as const) {
+      const value = source[key];
+      if (typeof value === "number" && Number.isFinite(value)) quota[key] = value;
+    }
+    if (Array.isArray(source.customWindows)) {
+      quota.customWindows = source.customWindows;
+    }
+    const hasWindow = ["fiveHourPercent", "weeklyPercent", "monthlyPercent"]
+      .some(key => typeof quota[key] === "number" && Number.isFinite(quota[key] as number))
+      || Array.isArray(quota.customWindows);
+    if (!hasWindow) continue;
+    const site = (entry as { site?: unknown }).site;
+    const account = (entry as { account?: unknown }).account;
+    const exportedLabel = (entry as { label?: unknown }).label;
+    const label: string[] = [];
+    if (typeof exportedLabel === "string" && exportedLabel.trim()) label.push(exportedLabel.trim());
+    else {
+      label.push("面板 " + String(site ?? "?"));
+      if (account) label.push(String(account));
+      const official = ((entry as { official?: unknown }).official ?? {}) as Record<string, unknown>;
+      if (official.state) label.push("官方 " + String(official.state));
+    }
+    if (ageMs > 5 * 60_000) label.push(`数据 ${Math.round(ageMs / 60_000)} 分钟前`);
+    rows.push({
+      provider: name,
+      label: label.join(" · "),
+      source: PANEL_QUOTA_SOURCE_PREFIX + String(site ?? "unknown"),
+      quota,
+      updatedAt: generatedAt,
+    });
+  }
+  return rows;
+}
+
+/** State and validity for a panel row: the same >=100% rule the probe rows use, no cache lookup. */
+function panelRoutingQuota(quota: Record<string, unknown>, now: number): ProviderRoutingQuota {
+  const hasWindow = ["fiveHourPercent", "weeklyPercent", "monthlyPercent"]
+    .some(key => typeof quota[key] === "number" && Number.isFinite(quota[key] as number))
+    // A relay whose only windows are custom (a daily cap, or a daily window the panel resets
+    // itself) still has a verdict -- reading only the named fields reports it as unknown.
+    || (Array.isArray(quota.customWindows) && quota.customWindows.length > 0);
+  if (!hasWindow) return { state: "unknown" };
+  // The panel reports epoch SECONDS while the shared predicate compares against a millisecond
+  // `now`; without this a reset that is days away reads as long past and the window never looks
+  // exhausted.
+  const normalized: Record<string, unknown> = { ...quota };
+  for (const key of ["fiveHourResetAt", "weeklyResetAt", "monthlyResetAt"]) {
+    const value = normalized[key];
+    if (typeof value === "number" && Number.isFinite(value) && value < 1e12) normalized[key] = value * 1000;
+  }
+  if (Array.isArray(normalized.customWindows)) {
+    normalized.customWindows = (normalized.customWindows as Array<Record<string, unknown>>).map(window => (
+      typeof window.resetAt === "number" && Number.isFinite(window.resetAt) && window.resetAt < 1e12
+        ? { ...window, resetAt: window.resetAt * 1000 }
+        : window));
+  }
+  const exhausted = cachedProviderQuotaIsExhausted(
+    normalized as unknown as Parameters<typeof cachedProviderQuotaIsExhausted>[0], now);
+  const resets = ["fiveHourResetAt", "weeklyResetAt", "monthlyResetAt"]
+    .map(key => normalized[key])
+    .concat((normalized.customWindows as Array<{ resetAt?: number }> | undefined ?? [])
+      .map(window => window.resetAt))
+    .filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > now);
+  return {
+    state: exhausted ? "exhausted" : "available",
+    updatedAt: typeof quota.updatedAt === "number" ? quota.updatedAt : now,
+    validUntil: resets.length ? Math.min(...resets) : now + PROVIDER_QUOTA_MAX_AGE_MS,
+  };
+}
+
 function providerRoutingQuota(config: OcxConfig, name: string, now: number): ProviderRoutingQuota {
   const provider = hasOwnProvider(config.providers, name) ? config.providers[name] : undefined;
   const quota = getCachedProviderRoutingQuota(name, provider, now);
@@ -873,12 +1029,26 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
     const forceRefresh = url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true";
     const snapshot = await fetchProviderQuotaReports(config, forceRefresh);
     const now = Date.now();
+    // The refresh button has to move these rows too: they are file-backed, not probed.
+    const panelRefresh = forceRefresh ? await refreshPanelQuotaRows() : undefined;
+    const external = panelQuotaRows(config, Date.now());
     return jsonResponse({
       ...snapshot,
-      reports: snapshot.reports.map(report => ({
-        ...report,
-        routingQuota: providerRoutingQuota(config, report.provider, now),
-      })),
+      ...(panelRefresh ? { panelRefresh } : {}),
+      reports: [...snapshot.reports, ...external].map(report => {
+        const source = typeof report.source === "string" ? report.source : "";
+        const provider = typeof report.provider === "string" ? report.provider : "";
+        const capacityHold = providerCapacityHold(provider, now);
+        return {
+          ...report,
+          routingQuota: source.startsWith(PANEL_QUOTA_SOURCE_PREFIX)
+            ? panelRoutingQuota(report.quota as Record<string, unknown>, now)
+            : providerRoutingQuota(config, provider, now),
+          // A capacity / soft-risk-control verdict parks the whole provider; surfacing it here is
+          // the only place the operator can see why a healthy-looking provider is being skipped.
+          ...(capacityHold ? { capacityHold } : {}),
+        };
+      }),
     });
   }
 

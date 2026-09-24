@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { stampApiKeyAccountLabel, usesApiKeyAccount } from "../providers/label";
 import { KEY_ACCOUNT_LOG_LABEL_RE } from "../codex/account-label";
 import { readBoundedResponseBody } from "../lib/bounded-body";
+import { noteThreadOverloadVerdict } from "./ws-thread-transport";
 import type { ResponsesTerminalStatus } from "../bridge";
 import {
   classifyError,
@@ -1071,6 +1072,7 @@ function captureUpstreamErrorParsed(
     const message = upstreamErrorMessageFromPayload(parsed);
     if (typeof message === "string" && message.trim()) {
       logCtx.upstreamError = redactSecretString(message).slice(0, 500);
+      noteThreadOverloadVerdict(logCtx.conversationId, logCtx.upstreamError);
       return;
     }
     // No human-readable error message: fall back to the structured incomplete reason emitted by
@@ -1086,6 +1088,7 @@ function captureUpstreamErrorParsed(
   const trimmed = text.trim();
   if (trimmed) {
     logCtx.upstreamError = redactSecretString(trimmed).slice(0, 500);
+    noteThreadOverloadVerdict(logCtx.conversationId, logCtx.upstreamError);
   }
 }
 

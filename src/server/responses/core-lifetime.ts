@@ -1,5 +1,11 @@
 import type { TranslatorBudget } from "../../lib/translator-budget";
 import {
+  createTurnStateSniffer,
+  observeTurnStateResponseHeaders,
+  observeTurnStateUpstreamStatus,
+  type TurnStateWhere,
+} from "../turn-state-observer";
+import {
   isNativePassthroughSseResponse,
   markNativePassthroughSseResponse,
   isEagerRelaySseResponse,
@@ -35,12 +41,17 @@ export const UPSTREAM_JSON_BODY_READ_OPTIONS = {
 
 
 
-export function finalizeOwnedTranslatorBudget(response: Response, budget: TranslatorBudget): Response {
+export function finalizeOwnedTranslatorBudget(response: Response, budget: TranslatorBudget, turnStateWhere?: TurnStateWhere): Response {
   if (!response.body) {
     budget.dispose();
     return response;
   }
   const reader = response.body.getReader();
+  const turnStateSniffer = turnStateWhere ? createTurnStateSniffer(turnStateWhere) : undefined;
+  if (turnStateWhere) {
+    observeTurnStateUpstreamStatus(response.status, turnStateWhere);
+    observeTurnStateResponseHeaders(response.headers, turnStateWhere);
+  }
   let finalized = false;
   const finalize = () => {
     if (finalized) return;
@@ -52,17 +63,21 @@ export function finalizeOwnedTranslatorBudget(response: Response, budget: Transl
       try {
         const result = await reader.read();
         if (result.done) {
+          try { turnStateSniffer?.finish(); } catch { /* observer never breaks the relay */ }
           finalize();
           controller.close();
         } else {
+          try { turnStateSniffer?.feed(result.value); } catch { /* observer never breaks the relay */ }
           controller.enqueue(result.value);
         }
       } catch (error) {
+        try { turnStateSniffer?.finish(); } catch { /* observer never breaks the relay */ }
         finalize();
         controller.error(error);
       }
     },
     async cancel(reason) {
+      try { turnStateSniffer?.finish(); } catch { /* observer never breaks the relay */ }
       try { await reader.cancel(reason); } finally { finalize(); }
     },
   });

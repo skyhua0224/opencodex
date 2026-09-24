@@ -60,7 +60,15 @@ export async function handleResponses(
       // Once at ingress, spend observer included: a combo child inherits the parent's holder.
       sendBudget: options.sendBudget ?? createRequestExecutionBudget(undefined, undefined, attachRequestSpendTracker(req, logCtx)),
     });
-    return ownsBudget ? finalizeOwnedTranslatorBudget(response, translatorBudget) : response;
+    return ownsBudget
+      ? finalizeOwnedTranslatorBudget(response, translatorBudget, {
+        provider: logCtx.provider,
+        model: logCtx.model,
+        comboId: logCtx.comboId,
+        direction: "response",
+        transport: "http",
+      })
+      : response;
   } catch (error) {
     if (ownsBudget) translatorBudget.dispose();
     throw error;

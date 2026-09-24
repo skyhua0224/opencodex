@@ -22,6 +22,7 @@ import { repairLegacyDottedToolCallNames } from "../../responses/legacy-dotted-t
 import { preparePlaintextV2AgentMessages } from "../../responses/plaintext-v2-agent-messages";
 import { isMetaAiResponsesDestination, rewriteMuseToolNamesForUpstream } from "../../responses/muse-tool-name-alias";
 import { openaiResponsesUrl } from "../openai-responses-url";
+import { conversationKeyFromHeaders, threadAffinityResetActive } from "../../server/ws-thread-transport";
 import { normalizeResponsesCodeMode } from "../responses-code-mode";
 import { injectXaiResponsesXSearch, normalizeXaiResponsesWebSearch } from "../xai-web-search";
 import {
@@ -229,6 +230,19 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
                 }
               }
               headers[h] = v; // …so genuine forwarded fields win.
+            }
+          }
+          // A conversation the backend keeps serving slowly and shedding gets its routing identity
+          // re-rolled. Both per-conversation hints go: the client's window id AND the server-issued
+          // turn state (a token the backend handed back for this conversation, which the next
+          // request normally echoes). Dropping only the window id moved that conversation from
+          // 14-22s to 8.1-8.3s for about ten minutes and then it drifted back, so the second hint
+          // is dropped as well. Content, model, credential and cache prefix are untouched.
+          const affinityKey = conversationKeyFromHeaders(incoming?.headers);
+          if (affinityKey && threadAffinityResetActive(affinityKey)) {
+            for (const name of Object.keys(headers)) {
+              const lower = name.toLowerCase();
+              if (lower === "x-codex-window-id" || lower === "x-codex-turn-state") delete headers[name];
             }
           }
         }

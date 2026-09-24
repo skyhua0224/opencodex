@@ -8,9 +8,11 @@ import { CodexWsMetadata, type CodexWsQuotaObserver } from "./codex-ws-metadata"
 import { CODEX_RESPONSES_HTTP_URL, type PreparedCodexWsRequest } from "./codex-ws-request";
 import { CodexWsCorrelation } from "./codex-ws-correlation";
 import type { CodexWsSession } from "./codex-ws-session";
+import { isOverloadVerdictText } from "../ws-thread-transport";
 import { UPGRADE_DEADLINE_MS, CODEX_WS_LIVENESS_PING_INTERVAL_MS, CODEX_WS_RESPONSE_PRELUDE_TIMEOUT_MS, MAX_CODEX_WS_FRAME_BYTES,
   MAX_CODEX_WS_QUEUE_BYTES, markCodexWsResponse, normalizeResponsesWsRelayEvent, closedBeforeTerminalMessage,
   codexWsCreateFrameExceedsLimit, codexWsFailureDetail, codexWsPreResponseFailure, markCodexWsStage, codexWsOcxVersion,
+  codexWsCapacityDeclineFailure,
   type CodexWsFailureStage, type CodexWsStageRecord } from "./codex-ws-wire";
 
 interface ExchangeOptions {
@@ -90,6 +92,59 @@ function wrappedRejectionResponse(payload: Record<string, unknown>, prelude: Hea
   }), { status, headers });
 }
 
+/**
+ * Events the backend sends before it has generated anything: they describe the response it is about
+ * to produce, and nothing in them is user-visible content.
+ *
+ * The capacity absorbs below are only honest while no CONTENT has been relayed, and these two are
+ * exactly the events that carry no content of their own. Anything else -- an output item, a delta,
+ * a terminal event -- means the turn has begun and a re-send would be a second generation.
+ */
+const PRELUDE_EVENT_TYPES: ReadonlySet<string> = new Set(["response.created", "response.in_progress"]);
+
+/**
+ * Terminal markers that carry no content of their own.
+ *
+ * A \`response.failed\` is a verdict, not a payload: it must not count as "content was delivered",
+ * or a decline that arrives as a failed event instead of an \`error\` frame would be relayed
+ * unchecked (and the retryable-decline path below would never run).
+ */
+/**
+ * Waits before an in-socket resend of a declined create frame.
+ *
+ * Short on purpose: this path exists for LATENCY, not for patience. The socket is already open and
+ * the backend has stated it did not start the turn, so a one-frame retry after a beat is the
+ * cheapest possible recovery. The patient ladder (5/12/25/45s, fresh socket each time) takes over
+ * as soon as this budget is spent or the socket is gone.
+ */
+const CODEX_WS_CAPACITY_ABSORB_DELAYS_MS: readonly number[] = [1_500, 4_000];
+
+const CONTENT_FREE_TERMINALS: ReadonlySet<string> = new Set(["response.failed", "response.incomplete"]);
+
+/**
+ * How long the two prelude events may be held before the client is told the response started.
+ *
+ * They are held so a decline that arrives AFTER the prelude is still a pre-commit event: the whole
+ * point is that nothing has been promised to the client yet, so the turn can be re-dialled instead
+ * of surfacing a capacity error. Sheds arrive 1-36s after the prelude (measured), so the window is
+ * generous; anything the backend actually generates flushes it immediately.
+ */
+const CODEX_WS_PRELUDE_HOLD_MS = 25_000;
+
+
+/** The message an upstream error frame carries, in any of the shapes the backend uses. */
+function errorVerdictText(payload: Record<string, unknown>): string {
+  const error = record(payload.error) ? payload.error : undefined;
+  // A refusal can arrive either as a bare \`error\` event or as a terminal \`response.failed\`, and the
+  // failed form nests its reason under \`response.error\`. Reading only the flat shape made the
+  // second kind look like ordinary content, which is how it reached the client while the first kind
+  // was being absorbed.
+  const nested = record(payload.response) && record(payload.response.error) ? payload.response.error : undefined;
+  return [payload.message, payload.code, error?.message, error?.code, nested?.message, nested?.code]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ");
+}
+
 /** The sole SSE exchange state machine for both one-shot and retained sockets. */
 export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
   const { session, url, init, prepared, sseFallback, onQuota, beforeDispatch, bunVersion, nativeControl, beforeContinuation } = options;
@@ -112,6 +167,19 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
     let relayedEvents = 0;
     let pings = 0;
     let pongs = 0;
+    /** Relayed events that were neither a prelude event nor an error: the turn has begun. */
+    let contentEvents = 0;
+    /** How many capacity verdicts this exchange has already absorbed with a re-send. */
+    /**
+     * Prelude frames held back until something content-shaped arrives, and the timer that gives up
+     * waiting. Holding them is what keeps a late decline pre-commit, which is what makes the turn
+     * re-dialable instead of reportable.
+     */
+    /** In-socket resends already spent on this exchange. */
+    let capacityAbsorbsUsed = 0;
+    let absorbTimer: ReturnType<typeof setTimeout> | undefined;
+    const heldPrelude: Uint8Array[] = [];
+    let preludeHoldTimer: ReturnType<typeof setTimeout> | undefined;
     let sentAt: number | null = null;
     let firstFrameAt: number | null = null;
     // Numeric close code for the durable stage record; the reason string stays
@@ -146,6 +214,8 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
       clearTimeout(upgradeTimer);
       clearTimeout(silenceTimer);
       clearTimeout(pingTimer);
+      clearTimeout(absorbTimer);
+      clearTimeout(preludeHoldTimer);
       signal?.removeEventListener("abort", onAbort);
       metadata?.finish();
       correlation?.finish();
@@ -202,6 +272,7 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
       responseCommitted = true;
       clearTimeout(silenceTimer);
       clearTimeout(pingTimer);
+      clearTimeout(preludeHoldTimer);
       const responseHeaders = metadata?.snapshot() ?? new Headers();
       responseHeaders.set("content-type", "text/event-stream; charset=utf-8");
       const response = new Response(stream, { status: 200, headers: responseHeaders });
@@ -211,6 +282,24 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
       markCodexWsStage(response, stageRecord(null));
       committedResponse = response;
       resolve(response);
+    };
+
+    /**
+     * Release the held prelude: commit the response and then relay what was held, in order.
+     *
+     * Called the moment anything else has to reach the client (content, a terminal event, or a
+     * decline we are NOT re-dialling) and by the hold timer, so a backend that produces nothing for
+     * {@link CODEX_WS_PRELUDE_HOLD_MS} still gets its prelude delivered instead of a silent stall.
+     */
+    const flushHeldPrelude = () => {
+      clearTimeout(preludeHoldTimer);
+      preludeHoldTimer = undefined;
+      if (heldPrelude.length === 0) return;
+      const frames = heldPrelude.splice(0, heldPrelude.length);
+      commitResponse();
+      for (const frame of frames) {
+        try { controller?.enqueue(frame); } catch { /* the stream is already gone */ }
+      }
     };
 
     const failStream = (error: unknown, status: 502 | 504 = 502) => {
@@ -482,20 +571,98 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
         // Correlation must run first: a reused socket's foreign-stream error settles as a
         // non-replayable 502 above, never as the refused-create 4xx projection below, which
         // is the one status family that could authorize an account replay.
-        if (metadata && sent && !responseCommitted && type === "error") {
-          let rejection: Response | null;
-          try { rejection = wrappedRejectionResponse(normalized.payload, metadata.snapshot()); }
-          catch (error) { failStream(error); return; }
-          if (rejection) {
-            terminal = true;
-            cleanup();
-            try { controller.close(); } catch { /* unused stream already closed */ }
-            session.dispose();
-            resolve(rejection);
-            return;
+        if (metadata && sent && type === "error") {
+          if (!responseCommitted) {
+            let rejection: Response | null;
+            try { rejection = wrappedRejectionResponse(normalized.payload, metadata.snapshot()); }
+            catch (error) { failStream(error); return; }
+            if (rejection) {
+              terminal = true;
+              cleanup();
+              try { controller.close(); } catch { /* unused stream already closed */ }
+              session.dispose();
+              resolve(rejection);
+              return;
+            }
           }
         }
-        commitResponse();
+        // A decline the backend stated outright, before anything was relayed: settle it as a
+        // REPLAYABLE 503 instead of dragging it into the client's stream.
+        //
+        // This replaces the in-socket absorb that used to live here. Twelve of twelve absorbs in
+        // the log stopped at rung 1 and the turn failed anyway: the second decline does not always
+        // arrive as an "error" frame and the socket is not always still open, so a resend on the
+        // same socket is a bet this lane kept losing. The caller's capacity ladder re-dials a
+        // FRESH socket with its own pacing, and that path is proven end to end.
+        //
+        // Only while nothing has been relayed: once content is out, a resend would generate a
+        // second answer for the same turn, so the decline is relayed and the client's own retry
+        // owns the outcome.
+        const capacityDecline = metadata != null
+          && sent
+          && !responseCommitted
+          && contentEvents === 0
+          && !nativeControl
+          && (type === "error" || CONTENT_FREE_TERMINALS.has(type))
+          && isOverloadVerdictText(errorVerdictText(normalized.payload));
+        if (capacityDecline) {
+          const declineText = errorVerdictText(normalized.payload).trim() || "upstream refused to start the turn";
+          // Fast path first: the backend declined BEFORE producing anything, so a resend on the
+          // socket that is already open cannot duplicate work, and it costs one frame instead of a
+          // fresh dial plus the ladder's first wait. This is the resend that used to live here and
+          // never worked -- it never recognised a decline stated as response.failed, so the second
+          // refusal was relayed instead. Both shapes are recognised now, and anything the declined
+          // attempt had already held is discarded so the client sees exactly one prelude.
+          if (!nativeControl
+            && capacityAbsorbsUsed < CODEX_WS_CAPACITY_ABSORB_DELAYS_MS.length
+            && ws.readyState === WebSocket.OPEN) {
+            const waitMs = CODEX_WS_CAPACITY_ABSORB_DELAYS_MS[capacityAbsorbsUsed]!;
+            capacityAbsorbsUsed += 1;
+            heldPrelude.length = 0;
+            console.warn(
+              "[codex-ws] " + type + " declined before any content - resending on the live socket in "
+              + waitMs + "ms (" + capacityAbsorbsUsed + "/" + CODEX_WS_CAPACITY_ABSORB_DELAYS_MS.length + ")",
+            );
+            armSilence();
+            schedulePing();
+            absorbTimer = setTimeout(() => {
+              if (terminal || contentEvents > 0 || signal?.aborted) return;
+              try {
+                ws.send(frameText);
+                sentAt = Date.now();
+                received = false;
+              } catch {
+                failStream("codex websocket capacity resend failed");
+              }
+            }, waitMs);
+            return;
+          }
+          // No socket to reuse (or the resend budget is spent): settle a REPLAYABLE 503 so the
+          // caller's capacity ladder re-dials a fresh socket with its own pacing.
+          terminal = true;
+          cleanup();
+          try { controller.close(); } catch { /* unused stream already closed */ }
+          session.dispose();
+          console.warn(
+            "[codex-ws] " + type + " declined before any content and the socket cannot be reused -"
+            + " settling a replayable 503 so the retry ladder re-dials (" + declineText.slice(0, 60) + ")",
+          );
+          resolve(codexWsCapacityDeclineFailure(503, declineText, metadata.snapshot()));
+          return;
+        }
+        // Prelude events are HELD until something else has to be delivered, so a decline that
+        // arrives after them is still pre-commit, and therefore still re-dialable. Nothing is
+        // withheld from the client for long: any content, any terminal event, or the hold timer
+        // releases the frames immediately.
+        const holdPrelude = metadata != null && !responseCommitted
+          && contentEvents === 0 && PRELUDE_EVENT_TYPES.has(type);
+        if (!holdPrelude) commitResponse();
+        if (holdPrelude) {
+          preludeHoldTimer ??= setTimeout(() => {
+            console.warn("[codex-ws] prelude held for the capacity window - releasing it to the client");
+            flushHeldPrelude();
+          }, CODEX_WS_PRELUDE_HOLD_MS);
+        }
       }
       const prefix = encoder.encode(`event: ${type}\ndata: `);
       const suffix = encoder.encode("\n\n");
@@ -513,6 +680,12 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
       sseFrame.set(prefix);
       sseFrame.set(encodedText, prefix.byteLength);
       sseFrame.set(suffix, prefix.byteLength + encodedText.byteLength);
+      if (metadata != null && !responseCommitted && PRELUDE_EVENT_TYPES.has(type) && contentEvents === 0) {
+        heldPrelude.push(sseFrame);
+        relayedEvents += 1;
+        return;
+      }
+      flushHeldPrelude();
       try {
         controller.enqueue(sseFrame);
       } catch {
@@ -520,6 +693,10 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
         return;
       }
       if (!controlFrame) relayedEvents += 1;
+      // Counted separately from relayedEvents: the absorb budget is priced in CONTENT, and a
+      // prelude event or an error is not content.
+      if (!controlFrame && !PRELUDE_EVENT_TYPES.has(type) && type !== "error"
+        && !CONTENT_FREE_TERMINALS.has(type)) contentEvents += 1;
       if (nativeControl ? steeringEnded : (type === "response.completed" || type === "response.failed" || type === "response.incomplete" || type === "error")) {
         const completedId = correlation?.completed(normalized.payload) ?? null;
         terminal = true;

@@ -1,4 +1,5 @@
 import { isSafeResponseHeader, safeResponseHeaders } from "../safe-response-headers";
+import { observeTurnStateResponseHeaders } from "../turn-state-observer";
 
 export const CODEX_WS_METADATA_MAX_BYTES = 32 * 1024;
 export const CODEX_WS_METADATA_MAX_FAMILIES = 16;
@@ -109,6 +110,13 @@ export class CodexWsMetadata {
     if (!this.committed) this.preludeBytes += bytes;
     if (this.preludeBytes > CODEX_WS_METADATA_MAX_BYTES) throw new Error("codex websocket metadata prelude exceeds the size limit");
     const updates = event.type === "codex.rate_limits" ? quotaHeaders(event) : responseHeaders(event.headers);
+    // Read-only turn-state observation for the WebSocket transport: the Codex backend delivers
+    // `x-codex-turn-state` as response metadata on this wire, which the HTTP hook cannot see.
+    try {
+      observeTurnStateResponseHeaders(updates, { direction: "response", transport: "codex-ws" });
+    } catch {
+      /* observation must never affect metadata handling */
+    }
     const next = this.snapshot();
     for (const name of updates.keys()) {
       if (!name.endsWith("-used-percent")) continue;

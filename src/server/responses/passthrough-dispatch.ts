@@ -110,6 +110,7 @@ import { streamingContextOverflowResponse } from "./context-overflow";
 import {
   SendBudgetExhaustedError,
   fetchWithTransientRetry,
+  CAPACITY_RETRY_DELAYS_MS,
   applyUpstreamRecoveryInit,
   isNonReplayableResponse,
   refetchAfterProtocolSafeReset,
@@ -158,6 +159,20 @@ import { ambiguousResendAllowanceFor, selfContainedResponsesBody } from "./reset
 import { upstreamErrorMessageFromPayload, ENCRYPTED_FUNCTION_OUTPUT_REJECTION } from "../../lib/errors";
 import { isTransientConsoleGoUploadRejection } from "../../providers/opencode-zen-rate-limit";
 import { planReasoningEffortDowngrade } from "../../providers/reasoning-metadata";
+
+/**
+ * The paced capacity ladder for one provider, or nothing when it is not opted in.
+ *
+ * Only the canonical OpenAI forward row earns it by default: that is the lane whose shed answers
+ * ("Our servers are currently overloaded", 8% of one conversation's turns on 2026-09-23) are the
+ * operator's actual complaint. OCX_CAPACITY_ABSORB_ALL=1 widens it for every provider,
+ * which exists so the same path can be exercised against a local stub instead of production.
+ */
+function capacityAbsorbDelays(provider: OcxProviderConfig): readonly number[] | undefined {
+  if (isCanonicalOpenAiForwardProvider(provider)) return CAPACITY_RETRY_DELAYS_MS;
+  return process.env.OCX_CAPACITY_ABSORB_ALL === "1" ? CAPACITY_RETRY_DELAYS_MS : undefined;
+}
+
 
 /** Prepares and recovers one native Responses exchange before client commitment. */
 export async function preparePassthroughExchange(
@@ -889,6 +904,15 @@ export async function preparePassthroughExchange(
         { abortSignal: upstream.signal, label: safeHostLabel(request.url),
           attempts: remainingTransientSendBudget(transientSendAttempts()), onSendsConsumed: noteTransientSends,
           claimAmbiguousResend: claimPreHeaderResend,
+          // The FIRST send of a native request needs the capacity ladder too. It was missing here
+          // while the four recovery legs already had it, and the consequence was exact: a native
+          // gpt-6-sol turn whose first send came back 503 "Our servers are currently overloaded"
+          // went straight to the client as a capacity error (measured 2026-09-24 13:27, three in a
+          // row, sendCount=1) while the same provider on the recovery legs retried. Scoped to the
+          // canonical forward row; the ladder's sends are additional to the budget and unlock only
+          // on 502/503/504.
+          retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
+          retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider), retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider),
           // The OpenCode Go destination stalls-then-drops inference sends (ambiguous
           // pre-header resets surfacing as refused 429s); its subscription traffic is
           // inference-only, so a bounded reset replay here absorbs the blip instead of
@@ -994,7 +1018,12 @@ export async function preparePassthroughExchange(
               .then(adoptObservedResponse);
           },
           { abortSignal: upstream.signal, label: safeHostLabel(request.url), attempts: allowance.attempts,
-            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend },
+            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend,
+            // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
+            // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
+            retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
+            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider),
+            retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider) },
         );
       } catch (err) {
         return { failed: transportFailureResponse(err) };
@@ -1121,7 +1150,12 @@ export async function preparePassthroughExchange(
           },
           { abortSignal: upstream.signal, label: safeHostLabel(request.url),
             attempts: remainingTransientSendBudget(transientSendAttempts()),
-            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend },
+            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend,
+            // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
+            // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
+            retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
+            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider),
+            retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider) },
         );
       } catch (err) {
         return transportFailureResponse(err);
@@ -1247,7 +1281,12 @@ export async function preparePassthroughExchange(
               .then(adoptObservedResponse);
           },
           { abortSignal: upstream.signal, label: safeHostLabel(request.url), attempts: remainingTransientSendBudget(transientSendAttempts()),
-            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend },
+            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend,
+            // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
+            // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
+            retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
+            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider),
+            retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider) },
         );
       } catch (err) {
         return transportFailureResponse(err);
@@ -1380,7 +1419,12 @@ export async function preparePassthroughExchange(
               .then(adoptObservedResponse);
           },
           { abortSignal: upstream.signal, label: safeHostLabel(request.url), attempts: remainingTransientSendBudget(transientSendAttempts()),
-            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend },
+            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend,
+            // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
+            // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
+            retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
+            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider),
+            retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider) },
         );
       } catch (err) {
         return transportFailureResponse(err);

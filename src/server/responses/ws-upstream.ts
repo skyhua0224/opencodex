@@ -23,6 +23,8 @@ import { codexWsExchange } from "./codex-ws-exchange";
 import { CodexWsSession } from "./codex-ws-session";
 import { codexWsPool, codexWsReuseIdentity } from "./codex-ws-pool";
 import { codexWsCreateFrameExceedsLimit } from "./codex-ws-wire";
+import { conversationKeyFromHeaders, threadTransportDemotedToHttp } from "../ws-thread-transport";
+import { normalizeLogConversationId } from "../request-log-conversation";
 export { CODEX_WS_LIVENESS_PING_INTERVAL_MS, CODEX_WS_RESPONSE_PRELUDE_TIMEOUT_MS, MAX_CODEX_WS_FRAME_BYTES, MAX_CODEX_WS_QUEUE_BYTES,
   MAX_CODEX_WS_CREATE_FRAME_BYTES, CODEX_WS_CREATE_FRAME_LIMIT_BYTES, codexWsCreateFrameExceedsLimit,
   isCodexWsQuotaObservedResponse, isCodexWsUpstreamResponse } from "./codex-ws-wire";
@@ -105,11 +107,40 @@ export function shouldUseCodexWsUpstream(
   // substring matching) also keeps whitespace-formatted bodies routable.
   try {
     const parsed = JSON.parse(body) as unknown;
-    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
-      && (parsed as Record<string, unknown>).stream === true;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)
+      || (parsed as Record<string, unknown>).stream !== true) return false;
+    // Per-thread demotion: a conversation the WS lane keeps shedding rides HTTP instead, while
+    // every other conversation keeps the faster lane. See ../ws-thread-transport.ts.
+    const candidates = codexWsThreadKeys(parsed as Record<string, unknown>, init);
+    return !candidates.some(key => threadTransportDemotedToHttp(key));
   } catch {
     return false;
   }
+}
+
+/**
+ * Every identity this request could be known by in the transport ledger.
+ *
+ * The ledger records verdicts under the proxy's own conversation id, which is derived (and hashed)
+ * from the caller's headers; the Codex client also names the thread in `client_metadata.thread_id`.
+ * Checking both spellings keeps the demotion attached to the conversation even when the two differ.
+ */
+function codexWsThreadKeys(
+  parsed: Record<string, unknown>,
+  init: RequestInit,
+): string[] {
+  const keys: string[] = [];
+  const fromHeaders = conversationKeyFromHeaders(init.headers);
+  if (fromHeaders) keys.push(fromHeaders);
+  const metadata = parsed.client_metadata;
+  if (metadata && typeof metadata === "object" && !Array.isArray(metadata)) {
+    const thread = (metadata as Record<string, unknown>).thread_id;
+    if (typeof thread === "string" && thread.trim().length > 0) {
+      const normalized = normalizeLogConversationId(thread);
+      if (normalized && !keys.includes(normalized)) keys.push(normalized);
+    }
+  }
+  return keys;
 }
 
 export function codexWsUpstreamFetch(

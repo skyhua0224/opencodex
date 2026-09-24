@@ -19,6 +19,7 @@ import { clientCancelledResponse, readDisplaySafeErrorText, normalizeUpstreamErr
 import { redactSecretString } from "../../lib/redact";
 import { waitForProviderRequestSlot } from "../../providers/request-pacing";
 import { providerFetch, fetchWithHeaderTimeout, safeHostLabel } from "./fetch-helpers";
+import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
 import {
   transientRetryPolicyFor,
   rateLimitRetryPolicyFor,
@@ -32,6 +33,7 @@ import {
   fetchWithTransientRetry,
   fetchWithResetRetry,
   applyUpstreamRecoveryInit,
+  CAPACITY_RETRY_DELAYS_MS,
   SendBudgetExhaustedError,
   prepareSameTarget429Wait,
   sleepWithAbort,
@@ -311,7 +313,19 @@ export async function prepareAdapterExchange(
       // legacy direct-Google exception is preserved exactly; every other adapter still keeps
       // reset-only semantics so combo failover hops on the first 5xx.
       const transientPolicy = transientRetryPolicyFor(route.provider);
-      const fetchWithRetryPolicy = (route.provider.adapter === "google" || transientPolicy)
+      /**
+       * The canonical ChatGPT forward row needs the CAPACITY ladder even though it keeps a
+       * reset-only SEND budget.
+       *
+       * Measured 2026-09-24: native `gpt-6-sol` sessions (this path, not the combo passthrough) were
+       * handed every shed verdict as a 502/503, because `transientRetryPolicyFor` returns null for
+       * forward auth and this lane then wrapped the send in `fetchWithResetRetry`, which never
+       * retries a status. The exchange could settle a replayable 503 and nothing would use it. The
+       * ladder's sends are ADDITIONAL to the send budget and unlock only on 502/503/504, so a
+       * non-capacity failure still returns on the first response exactly as before.
+       */
+      const canonicalForwardRow = isCanonicalOpenAiForwardProvider(route.provider);
+      const fetchWithRetryPolicy = (route.provider.adapter === "google" || transientPolicy || canonicalForwardRow)
         ? fetchWithTransientRetry
         : fetchWithResetRetry;
       upstreamResponse = await fetchWithRetryPolicy(
@@ -339,6 +353,11 @@ export async function prepareAdapterExchange(
               attempts: remainingTransientSendBudget(transientPolicy.attempts),
               onSendsConsumed: noteTransientSends,
             }
+            : canonicalForwardRow
+              ? { attempts: 1, onSendsConsumed: noteTransientSends }
+              : {}),
+          ...(canonicalForwardRow
+            ? { retrySlowCapacity: true, retryCapacityDeferralsMs: CAPACITY_RETRY_DELAYS_MS }
             : {}),
         },
       );

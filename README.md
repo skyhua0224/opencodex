@@ -1,3 +1,7 @@
+> **Fork notice** -- this is skyhua's hardening fork of opencodex 2.63.0. What it changes, why,
+> and how to rebase it onto a newer upstream release: [FORK-NOTES.md](FORK-NOTES.md).
+> Upstream: <https://github.com/lidge-jun/opencodex>.
+
 <h3 align="center">make codex open!</h3>
 <p align="center"><b>Universal provider proxy for OpenAI Codex, Claude Code, Claude Desktop &amp; Grok Build</b><br>
 Two commands, and every one of them runs any LLM you point it at.</p>

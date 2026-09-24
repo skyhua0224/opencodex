@@ -3,6 +3,7 @@ import {
   CODEX_RESPONSES_LITE_HEADER,
   CODEX_RESPONSES_LITE_METADATA_KEY,
 } from "../../codex/forward-transport-headers";
+import { conversationKeyFromHeaders, threadAffinityResetActive } from "../ws-thread-transport";
 
 export const CODEX_RESPONSES_HTTP_URL = "https://chatgpt.com/backend-api/codex/responses";
 export const CODEX_RESPONSES_WS_URL = "wss://chatgpt.com/backend-api/codex/responses";
@@ -37,6 +38,18 @@ function applyLiteMetadata(body: Record<string, unknown>, headers: Headers): boo
     const current = body.client_metadata as Record<string, string> | undefined;
     if (value !== null && !Object.hasOwn(current ?? {}, name)) {
       body.client_metadata = { ...current, [name]: value };
+    }
+  }
+  // The affinity re-roll drops this conversation's identity hints, and this function is the one
+  // place the canonical WS path copies a header into the JSON frame: without the check, a header
+  // the forward builder already removed would come straight back through client_metadata.
+  const affinityKey = conversationKeyFromHeaders(headers);
+  if (affinityKey && threadAffinityResetActive(affinityKey)) {
+    const current = body.client_metadata as Record<string, string> | undefined;
+    if (current && Object.hasOwn(current, "x-codex-turn-state")) {
+      const next = { ...current };
+      delete next["x-codex-turn-state"];
+      body.client_metadata = next;
     }
   }
   return true;

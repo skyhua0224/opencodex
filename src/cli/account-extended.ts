@@ -272,6 +272,12 @@ function quotaParts(quota: ProviderQuotaDto): string[] {
   const parts: string[] = [];
   const add = (label: string, percent: number | undefined, resetAt?: number) => {
     if (percent === undefined) return;
+    // Availability / model rows are a dot matrix, not a budget: printing "… 78% resets <date>"
+    // after them reads as a quota window and drags a percentage onto something that is a state.
+    if (/^(?:官方|渠道|模型)/.test(label)) {
+      parts.push(label);
+      return;
+    }
     parts.push(`${label} ${percent}%`);
     const reset = resetIso(resetAt);
     if (reset) parts.push(`resets ${reset}`);
@@ -284,7 +290,13 @@ function quotaParts(quota: ProviderQuotaDto): string[] {
 }
 
 export function providerQuotaLine(name: string, report: ProviderQuotaReportDto): string {
-  return [name, ...quotaParts(report.quota)].join(" ");
+  // The label carries what the windows cannot: which site/account the row describes, that site's
+  // own availability verdict, and the channel's cost multiplier.
+  const hold = report.capacityHold;
+  const parked = hold
+    ? `parked(capacity #${hold.escalations}) until ${new Date(hold.until).toISOString()}`
+    : undefined;
+  return [name, report.label, ...quotaParts(report.quota), parked].filter(Boolean).join(" ");
 }
 
 export async function readStdinLine(deps: AccountDeps): Promise<string> {

@@ -168,16 +168,50 @@ export async function handleComboRoutes(ctx: ManagementContext): Promise<Respons
     const requestedCombo: Record<string, unknown> = body.combo;
     const effectiveCombo = {
       ...requestedCombo,
+      // Per-target tuning is not part of the editor's form shape, so a save that carries the same
+      // provider/model pair must INHERIT the rung's configured deadline instead of silently
+      // resetting it. Without this, editing a combo in the dashboard wipes the slow-rung tuning and
+      // the ladder goes back to paying full patience on every cheap, congested row.
+      ...(Array.isArray(requestedCombo.targets) && Array.isArray(previous?.targets)
+        ? {
+          targets: (requestedCombo.targets as unknown[]).map(entry => {
+            if (!isPlainRecord(entry)) return entry;
+            if (entry.firstByteTimeoutMs !== undefined) return entry;
+            const match = (previous!.targets as unknown[]).find(candidate =>
+              isPlainRecord(candidate)
+              && candidate.provider === entry.provider
+              && candidate.model === entry.model);
+            return isPlainRecord(match) && match.firstByteTimeoutMs !== undefined
+              ? { ...entry, firstByteTimeoutMs: match.firstByteTimeoutMs }
+              : entry;
+          }),
+        }
+        : {}),
       ...(!Object.hasOwn(requestedCombo, "cooldownMs") && previous?.cooldownMs !== undefined
         ? { cooldownMs: previous.cooldownMs }
         : {}),
       ...(!Object.hasOwn(requestedCombo, "waitForCooldownMs") && previous?.waitForCooldownMs !== undefined
         ? { waitForCooldownMs: previous.waitForCooldownMs }
         : {}),
-      // The dashboard does not expose this advanced CLI/API policy. Preserve it when
-      // a GUI round-trip omits the field instead of silently downgrading to fallback.
+      // The dashboard does not expose these advanced CLI/API policies. Preserve them when a
+      // GUI round-trip omits the fields instead of silently resetting ladder behavior.
       ...(!Object.hasOwn(requestedCombo, "defaultEffortMode") && previous?.defaultEffortMode !== undefined
         ? { defaultEffortMode: previous.defaultEffortMode }
+        : {}),
+      ...(!Object.hasOwn(requestedCombo, "firstByteTimeoutMs") && previous?.firstByteTimeoutMs !== undefined
+        ? { firstByteTimeoutMs: previous.firstByteTimeoutMs }
+        : {}),
+      ...(!Object.hasOwn(requestedCombo, "ladderBudgetMs") && previous?.ladderBudgetMs !== undefined
+        ? { ladderBudgetMs: previous.ladderBudgetMs }
+        : {}),
+      ...(!Object.hasOwn(requestedCombo, "breakerFailureThreshold") && previous?.breakerFailureThreshold !== undefined
+        ? { breakerFailureThreshold: previous.breakerFailureThreshold }
+        : {}),
+      ...(!Object.hasOwn(requestedCombo, "breakerSuccessThreshold") && previous?.breakerSuccessThreshold !== undefined
+        ? { breakerSuccessThreshold: previous.breakerSuccessThreshold }
+        : {}),
+      ...(!Object.hasOwn(requestedCombo, "breakerOpenMs") && previous?.breakerOpenMs !== undefined
+        ? { breakerOpenMs: previous.breakerOpenMs }
         : {}),
     };
     const error = comboConfigError(id, effectiveCombo, config.providers, {
