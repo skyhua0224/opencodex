@@ -1,42 +1,24 @@
 [English](README.md) | **简体中文**
 
-# 我 fork 的 opencodex（2.63.0）
+# opencodex — skyhua 的加固分支
 
-上游是 [lidge-jun/opencodex](https://github.com/lidge-jun/opencodex)，MIT。我这份就是把官方 2.63.0 拿来，把真实用起来必须改的地方改掉，然后自己一直用。两个镜像内容一样：
+基于 **opencodex 2.63.0**（MIT）的分支。上游：<https://github.com/lidge-jun/opencodex>。
+镜像：[GitHub](https://github.com/skyhua0224/opencodex) · [Gitea](https://gitea.sky-hua.xyz:24443/skyhua/opencodex)。
 
-- GitHub：<https://github.com/skyhua0224/opencodex>
-- Gitea：<https://gitea.sky-hua.xyz:24443/skyhua/opencodex>
+这个分支针对 ChatGPT Codex 后端的**真实行为**做了一组加固：请求被受理之后才到达的 capacity 判定、组合阶梯因为某一行的一条答复就整趟失败、只存在于网页控制台的供应商额度、以及会按会话悄悄降级的 WebSocket 车道。每一项改动背后的测量数据、以及如何把它重放到新的上游版本，都写在 **[FORK-NOTES.md](FORK-NOTES.md)**（英文）。
 
-## 为什么要改
-
-官方这版在我这儿有几个问题，而且不是配置能解决的：
-
-1. 官方的 capacity 判定会直接弹到客户端（`Selected model is at capacity`），可它其实是**先把请求受理了、过一会儿才拒绝**的，重试一次基本就能好。它却当场就把这趟判死，一次接一次。
-2. combo 阶梯碰上某一行的一条怪答复就整趟停住，后面的渠道压根没轮到。
-3. 中继站的额度只在人家网页控制台里能看到，代理这边不知道，于是一直去撞已经用完的站。
-4. 官方 WebSocket 车道会按会话悄悄变差：同一个账号、同一个模型，一个会话一直慢一直 capacity，另一个会话啥事没有。
-
-改法（细节、每处阈值的实测依据都在 [FORK-NOTES.md](FORK-NOTES.md)，英文）：
-
-- **capacity 不再冒到客户端**。先在同一个 socket 上重发；不行就把 prelude 暂存住等一会儿；再不行结算成一个能重放的 503，让上层换条**新连接**重来；最后还有 5s / 12s / 25s / 45s 的阶梯。SSE 那条路一样处理（后端先回 200、再把 overload 塞进流里的情况也吞掉重来）。已经出过字的那种不重发，重发就是重复生成，交给 Codex 自己重试。
-- **combo 阶梯一路走到底**。额度耗尽的站直接跳过，不当成墙；只有官方那一行进 10m → 1h → 3h → 6h → 12h → 24h 的冷静期；全都不行了就回 `503 combo_unavailable` 加 `Retry-After`，而不是回一个 Codex 根本不重试的裸 429。输出开始复读（重复片段、重复的工具调用）就把那行停 2 分钟，不禁用渠道。
-- **按会话换身份**。某个会话一直挨丢，就让它暂时不走 WebSocket，并把它独有的两个路由线索丢掉（客户端的 `x-codex-window-id`、服务端的 `x-codex-turn-state`），让后端重新安置它。这个状态会存盘，重启不丢。
-- **控制台里的额度喂给路由**。面板型订阅、自定义窗口、秒级重置时间戳、`>= 100%` 就当耗尽。
-- gpt-6 那批模型目录，以及加固要用到的供应商字段（`retryOnReset`、瞬时 5xx 策略、推理档位、上下文窗口）。
-
-## 怎么装
+## 安装
 
 ```bash
 git clone https://github.com/skyhua0224/opencodex.git
 cd opencodex
-npm install -g .        # 或者 bun install -g .
-ocx setup
-ocx start
+npm install -g .        # 或：bun install -g .
+ocx setup               # 之后：ocx start
 ```
 
-Node 18+ 就行，Bun 是 npm 装依赖时自带的，Windows 也不用 WSL。三个系统官方都支持：macOS（launchd）、Linux（systemd 用户服务）、Windows（任务计划程序，或者 `--native` 走 WinSW 原生服务）。
+只需要 Node 18+，Bun 由 `npm install` 自带；Windows 不需要 WSL。上游支持矩阵：macOS（arm64/x64，launchd）、Linux（x64/arm64，systemd user unit）、Windows（x64，任务计划程序或可选原生服务）均完全支持。
 
-自测（需要 bun）：
+自测（需要 bun，跨平台）：
 
 ```bash
 bun test/codex-ws-capacity-selftest.ts
@@ -45,12 +27,31 @@ bun test/capacity-absorb-selftest.ts
 bun test/thread-affinity-selftest.ts
 ```
 
-## 几件要注意的
+## 这个分支加了什么（一屏）
 
-- 这份锁在 **2.63.0**。**别跑 `ocx update`**，一跑就把官方版装回来、我的改动全没了。要跟新版本就照 FORK-NOTES 里那段，用 `patches/` 里的补丁在干净的新版本上重打一遍。
-- `src/oauth/google-antigravity.ts` 里那两个 Google 标识是上游自带的（文件注释里就写了是 Antigravity 桌面客户端的公开标识，可用环境变量覆盖）。想用自己的就设 `GOOGLE_ANTIGRAVITY_CLIENT_ID` / `GOOGLE_ANTIGRAVITY_CLIENT_SECRET`。仓库里没别的凭据。
-- prelude 暂存最长会让首包晚 25 秒，但只在后端迟迟不出字的时候；一出内容立刻放行。
-- 阈值都是按 2026 年 9 月的实测调的，代码里每处常量都写了为什么，当起点用，别当真理。
-- 我只在 Linux 上实跑过。代码里没有平台相关的分支、自测也跨平台，但 macOS / Windows 上我没跑过测试；哪边出问题先跑上面那四个脚本，能直接分清是改造逻辑还是环境问题。
+- **官方车道上，capacity 判定不再冒到客户端**。四层，从便宜到贵：被拒的 create 帧首发先在同一个 socket 上重发；WebSocket 车道把 prelude 暂存住；实在不行结算成**可重放的 503**，让调用方**重拨一个新 socket**；再不行走 5s/12s/25s/45s 的节奏阶梯。SSE 车道同样处理：已经回了 200、但把拒因塞在**响应体里**的情况，会被吞掉并把新一趟的帧续进同一个响应体（`src/lib/sse-prelude-retry.ts`）。**已经出过内容的拒因照旧透传**——那种情况下重发就是重复生成，只能交给 Codex 自己重试。
+- **组合阶梯会一路走到底**。某一行拒绝重放不再让整条阶梯停住；额度耗尽的站点是**跳过**而不是当成墙；只有官方那一行会进入 10m → 1h → 3h → 6h → 12h → 24h 的阶梯冷静；全梯队都不可用时回 `503 combo_unavailable` 加 `Retry-After`，而不是回一个 Codex 不肯重试的裸 429；输出退化（重复片段、重复的工具调用签名）会把那一行停 2 分钟，而不是禁用整个渠道。
+- **按会话的传输策略**：持续被丢的会话会暂时离开 WebSocket 车道，并且**重投它的路由身份**——对该会话丢掉客户端的 `x-codex-window-id` 和服务端的 `x-codex-turn-state`，这个状态会持久化、重启不丢。
+- **控制台才知道的额度**：面板型订阅（`/subscriptions/active`、`/subscriptions/progress`）会喂给路由：自定义窗口、以秒为单位的重置时间戳、`>= 100%` 判为耗尽。
+- **模型目录与管理接口**：`gpt-6` 家族条目，以及加固需要的供应商字段（`retryOnReset`、瞬时 5xx 策略、推理档位、上下文窗口）。
 
-许可证还是 MIT，保留上游的版权声明，见 [LICENSE](LICENSE)。
+## 与上游的关系、以及如何 rebase
+
+- 本分支锁定在 **2.63.0**。`patches/` 里是同样一组改动，可以直接打到干净的 2.63.0 上：
+  `patch -p1 < patches/opencodex-2.63.0-capacity-complete-20260924.patch`
+  —— 这是把改动带到更新版本上游上最快的方式。
+- **不要在这个 fork 上执行 `ocx update`**：它会把官方版本装回来、覆盖掉这些改动。
+- 上游与本分支没有隶属关系：加固相关的问题提到本仓库，opencodex 本身的问题提到上游。
+
+## 凭据说明
+
+`src/oauth/google-antigravity.ts` 里带的是 **Antigravity 桌面客户端的公开 OAuth 标识**，与上游发布的一模一样（文件自带注释就写明是 public identifiers、可用环境变量覆盖；Google 桌面客户端的 client secret 按设计也无法保密）。想用你自己的凭据，设 `GOOGLE_ANTIGRAVITY_CLIENT_ID` 与 `GOOGLE_ANTIGRAVITY_CLIENT_SECRET` 即可。本仓库中除此之外没有别的凭据。
+
+## 注意事项
+
+- 一些阈值是按 2026 年 9 月官方后端与中继的实测行为调的，代码里每处常量都写了它背后的测量；把它们当作起点，而不是物理定律。
+- prelude 暂存**只在后端迟迟不产生内容时**才会让客户端的首包最多晚 25 秒；一旦有任何内容形状的事件到达，暂存的帧立刻放行。
+
+## 许可证
+
+MIT，未做改动，保留上游的版权声明——见 [LICENSE](LICENSE)。
