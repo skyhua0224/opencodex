@@ -83,6 +83,16 @@ ocx setup               # then: ocx start
   anything about opencodex itself belongs upstream.
 - License: MIT, unchanged, with the original copyright notice (see `LICENSE`).
 
+## Credential note (why GitHub push protection complains)
+
+The file src/oauth/google-antigravity.ts ships the Antigravity desktop client public OAuth
+identifiers, exactly as upstream publishes them (its own docstring says so, and both values are
+overridable with GOOGLE_ANTIGRAVITY_CLIENT_ID / GOOGLE_ANTIGRAVITY_CLIENT_SECRET). GitHub push
+protection flags the pattern anyway, because it matches a real Google client-id/secret shape. If
+you mirror this fork on GitHub you will be asked to allow those two values once (repository
+Security tab, Secret scanning, push protection, Allow), or you can strip the inline defaults and
+require the env vars instead. Nothing else in this fork contains credentials.
+
 ## Caveats
 
 - Some thresholds are tuned to what the official backend and the relays in front of it were doing
