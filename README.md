@@ -1,6 +1,65 @@
-> **Fork notice** -- this is skyhua's hardening fork of opencodex 2.63.0. What it changes, why,
-> and how to rebase it onto a newer upstream release: [FORK-NOTES.md](FORK-NOTES.md).
-> Upstream: <https://github.com/lidge-jun/opencodex>.
+# opencodex — skyhua's hardening fork
+
+Fork of **opencodex 2.63.0** (MIT). Upstream: <https://github.com/lidge-jun/opencodex>.
+Mirrors: [GitHub](https://github.com/skyhua0224/opencodex) · [Gitea](https://gitea.sky-hua.xyz:24443/skyhua/opencodex).
+
+This fork carries a hardening patch set written against how the ChatGPT Codex backend actually
+behaves: capacity verdicts that arrive *after* a request has been accepted, combo ladders that
+used to fail a whole turn on one row's answer, relay quotas that only exist in a web panel, and
+WebSocket lanes that degrade quietly per conversation. The full inventory, the measurements behind
+each threshold, and how to rebase it onto a newer upstream release live in
+**[FORK-NOTES.md](FORK-NOTES.md)**.
+
+## Install
+
+```bash
+git clone https://github.com/skyhua0224/opencodex.git
+cd opencodex
+npm install -g .        # or: bun install -g .
+ocx setup               # then: ocx start
+```
+
+Self-tests for the new paths (bun):
+
+```bash
+bun test/codex-ws-capacity-selftest.ts
+bun test/sse-prelude-retry-selftest.ts
+bun test/capacity-absorb-selftest.ts
+bun test/thread-affinity-selftest.ts
+```
+
+## What this fork adds, in one screen
+
+- **Capacity verdicts never reach the client on the official lane.** Four layers, cheapest first:
+  an in-socket resend after a declined create, a WebSocket prelude hold, a replayable 503 that lets
+  the caller re-dial, and a paced 5s/12s/25s/45s ladder. The SSE lane gets the same treatment: a
+  decline that arrives inside an already-200 body is swallowed and a fresh attempt is spliced in
+  (`src/lib/sse-prelude-retry.ts`). A decline after content is passed through, because resending
+  there would generate a second answer for the same turn.
+- **Combo ladders that keep walking.** One row's replay refusal no longer stops the ladder;
+  quota-exhausted sites are skipped rather than treated as walls; the official row alone escalates
+  onto the 10m → 1h → 3h → 6h → 12h → 24h capacity hold; an exhausted fleet answers
+  `503 combo_unavailable` with `Retry-After` instead of a bare 429 the Codex client refuses to
+  retry; and degenerate output (repeated segments, a repeated tool signature) parks that row for
+  two minutes instead of disabling the channel.
+- **Per-conversation transport.** A conversation that keeps collecting overload verdicts steps off
+  the WebSocket lane for a while and has its routing identity re-rolled (the client's
+  `x-codex-window-id` and the server's `x-codex-turn-state` are dropped for that conversation, and
+  the hold survives restarts).
+- **Quota the panel knows and the API does not.** Panel-family subscriptions feed the router:
+  custom windows, epoch-second reset stamps, and `>= 100%` means exhausted.
+- **Model catalog and management surface** for the `gpt-6` family and the provider fields the
+  hardening needs (`retryOnReset`, transient-5xx policy, reasoning efforts, context windows).
+
+## License
+
+MIT, unchanged, with upstream's copyright notice — see [LICENSE](LICENSE). Upstream is not
+affiliated with this fork; issues about the hardening work belong here, anything about opencodex
+itself belongs upstream.
+
+---
+
+## Upstream README
 
 <h3 align="center">make codex open!</h3>
 <p align="center"><b>Universal provider proxy for OpenAI Codex, Claude Code, Claude Desktop &amp; Grok Build</b><br>
