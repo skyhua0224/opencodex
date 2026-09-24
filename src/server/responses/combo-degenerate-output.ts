@@ -420,7 +420,6 @@ export function guardComboDegenerateOutput(
           monitor.dispose();
           try { controller.enqueue(DEGENERATE_TERMINAL_FRAME); } catch { /* consumer already gone */ }
           try { controller.close(); } catch { /* consumer already gone */ }
-          console.error("[TMP-guard] cut, cancelling upstream reader");
           void reader.cancel("combo degenerate output").catch(() => undefined);
           return;
         }
@@ -439,6 +438,131 @@ export function guardComboDegenerateOutput(
   });
 }
 
+
+/**
+ * The same repetition monitor, for a session that called a provider directly (no combo).
+ *
+ * A native turn has no second row to hop to, so the two halves of the combo response change shape:
+ * the cut stays (stop paying for a loop), and the failover becomes the CLIENT's retry -- which is
+ * what a fresh generation usually needs to break out of a loop. The verdict is announced on the
+ * lane so a combo serving that conversation later demotes this target on its next pass, and the
+ * caller records it on the request log through onVerdict.
+ */
+export interface NativeDegenerateGuardOptions {
+  /** Conversation key, for the log line and the cross-turn attribution. */
+  lane?: string | undefined;
+  /** "provider/model", for the log line. */
+  label?: string;
+  /** Called once, before the terminal frame is written. */
+  onVerdict?: (detail: string) => void;
+}
+
+function nativeTerminalFrame(label: string): Uint8Array {
+  const error = {
+    type: "upstream_error",
+    code: COMBO_DEGENERATE_CODE,
+    message: "The channel started repeating itself; this proxy cut the stream so the turn can be"
+      + " retried instead of paying for the loop" + (label ? " (" + label + ")" : "") + ".",
+  };
+  const payload = JSON.stringify({
+    type: "response.failed",
+    response: { status: "failed", error, last_error: error },
+  });
+  return new TextEncoder().encode("event: response.failed\n\ndata: " + payload + "\n\ndata: [DONE]\n\n");
+}
+
+export function guardNativeDegenerateOutput(
+  response: Response,
+  options: NativeDegenerateGuardOptions = {},
+): Response {
+  if (!guardableComboStream(response)) return response;
+  const reader = response.body!.getReader();
+  let finished = false;
+  const monitor = createDegenerateStreamMonitor(detail => {
+    // Attribution only: the ledger below decides which target a later combo pass demotes.
+    if (options.lane) noteLaneDegenerate(options.lane, detail);
+    console.warn(
+      "[degenerate] " + (options.label ?? "native stream") + " repeated itself; cutting the stream"
+      + (options.lane ? " (lane " + options.lane.slice(0, 8) + ")" : "") + ": " + detail,
+    );
+    options.onVerdict?.(detail);
+  });
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (finished) return;
+      for (;;) {
+        let next: Awaited<ReturnType<typeof reader.read>>;
+        try {
+          next = await reader.read();
+        } catch (error) {
+          finished = true;
+          monitor.dispose();
+          try { controller.error(error); } catch { /* consumer already gone */ }
+          return;
+        }
+        if (next.done) {
+          finished = true;
+          monitor.dispose();
+          try { controller.close(); } catch { /* consumer already gone */ }
+          return;
+        }
+        try {
+          controller.enqueue(next.value);
+        } catch (error) {
+          finished = true;
+          monitor.dispose();
+          throw error;
+        }
+        monitor.feed(next.value);
+        if (monitor.triggered) {
+          finished = true;
+          monitor.dispose();
+          try { controller.enqueue(nativeTerminalFrame(options.label ?? "")); } catch { /* consumer already gone */ }
+          try { controller.close(); } catch { /* consumer already gone */ }
+          void reader.cancel("degenerate output").catch(() => undefined);
+          return;
+        }
+      }
+    },
+    cancel(reason) {
+      finished = true;
+      monitor.dispose();
+      return reader.cancel(reason);
+    },
+  });
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
+/** Lane key -> the target that was repeating, so a later combo pass can demote it. */
+const laneDegenerate = new Map<string, { detail: string; at: number }>();
+
+function noteLaneDegenerate(lane: string, detail: string): void {
+  laneDegenerate.delete(lane);
+  laneDegenerate.set(lane, { detail, at: Date.now() });
+  while (laneDegenerate.size > LANE_LEDGER_CAPACITY) {
+    const oldest = laneDegenerate.keys().next().value;
+    if (oldest === undefined) break;
+    laneDegenerate.delete(oldest);
+  }
+}
+
+/**
+ * The verdict a lane collected while being served natively, if it is still fresh.
+ *
+ * Read by the combo guard when the same conversation comes back through a combo: the row that just
+ * served it natively is the row to demote, because that is where the loop came from.
+ */
+export function takeLaneDegenerateVerdict(lane: string | undefined, now = Date.now()): string | undefined {
+  if (!lane) return undefined;
+  const entry = laneDegenerate.get(lane);
+  if (!entry) return undefined;
+  laneDegenerate.delete(lane);
+  return now - entry.at <= LANE_LEDGER_TTL_MS ? entry.detail : undefined;
+}
 interface LaneRoundTripEntry {
   signature: string;
   digest: string;

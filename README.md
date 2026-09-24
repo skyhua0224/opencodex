@@ -48,6 +48,17 @@ bun test/thread-affinity-selftest.ts
   the WebSocket lane for a while and has its routing identity re-rolled (the client's
   `x-codex-window-id` and the server's `x-codex-turn-state` are dropped for that conversation, and
   the hold survives restarts).
+- **Native sessions get the repetition guard too.** The metrics combos have used (repeat ratio,
+  longest repeated segment, zlib ratio, identical tool-call signature) now watch directly-routed
+  streams as well: a channel that starts repeating is cut with `response.failed`/`degenerate_output`
+  instead of being relayed to the end, and the verdict is remembered for that conversation, so a
+  combo serving it later demotes the row that looped.
+- **Model, tier and safety-buffer attestation.** When the origin reports a different model than the
+  one requested, answers on a lower service tier than the one configured, or announces a safety
+  buffer that can serve the turn on a faster model, that lands in `~/.opencodex/model-attestation.jsonl`
+  and on the log. Nothing is rewritten and nothing errors.
+- **`ocx-tiers`**, one command over `usage.jsonl` plus that ledger: did the tier drop, was a model
+  substituted, how many streams were cut for repetition.
 - **Quota the panel knows and the API does not.** Panel-family subscriptions feed the router:
   custom windows, epoch-second reset stamps, and `>= 100%` means exhausted.
 - **Model catalog and management surface** for the `gpt-6` family and the provider fields the

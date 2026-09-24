@@ -159,6 +159,9 @@ import { ambiguousResendAllowanceFor, selfContainedResponsesBody } from "./reset
 import { upstreamErrorMessageFromPayload, ENCRYPTED_FUNCTION_OUTPUT_REJECTION } from "../../lib/errors";
 import { isTransientConsoleGoUploadRejection } from "../../providers/opencode-zen-rate-limit";
 import { planReasoningEffortDowngrade } from "../../providers/reasoning-metadata";
+import { withResponseAttestation } from "../../lib/response-attestation";
+import { guardNativeDegenerateOutput } from "./combo-degenerate-output";
+import { conversationKeyFromHeaders } from "../ws-thread-transport";
 
 /**
  * The paced capacity ladder for one provider, or nothing when it is not opted in.
@@ -168,6 +171,50 @@ import { planReasoningEffortDowngrade } from "../../providers/reasoning-metadata
  * operator's actual complaint. OCX_CAPACITY_ABSORB_ALL=1 widens it for every provider,
  * which exists so the same path can be exercised against a local stub instead of production.
  */
+/**
+ * Observers applied to an upstream stream before it is delivered, for every provider.
+ *
+ * Two jobs, both of them "this proxy should have said something" problems:
+ *
+ * 1. A conversation that called a provider DIRECTLY gets the same repetition guard combos have had
+ *    since the 2-minute park patch. Without it a looping native stream (the exact shape that made
+ *    a relay answer every turn with the same paragraph) was simply relayed until the client gave up.
+ *    A native turn has no second row, so the guard cuts the stream and announces the verdict; the
+ *    retry that follows is the client's, and the verdict is remembered for the lane so a combo
+ *    serving that conversation later demotes the row the loop came from.
+ * 2. Attestation: record when the origin reports a different model than the one asked for, when it
+ *    answers on a lower service tier than the one configured, or when it announces a safety buffer
+ *    that may serve the turn on a faster model. None of those raise an error, and none of them used
+ *    to leave a trace.
+ */
+function applyResponseGuards(
+  response: Response,
+  ctx: {
+    lane: string | undefined;
+    provider: string;
+    model: string;
+    configuredTier: string | undefined;
+    comboAttempt: boolean;
+    logCtx: { upstreamError?: string };
+  },
+): Response {
+  if (!response.ok || !response.body) return response;
+  let guarded = response;
+  if (!ctx.comboAttempt) {
+    guarded = guardNativeDegenerateOutput(guarded, {
+      lane: ctx.lane,
+      label: ctx.provider + "/" + ctx.model,
+      onVerdict: detail => { ctx.logCtx.upstreamError = "degenerate output: " + detail; },
+    });
+  }
+  return withResponseAttestation(guarded, {
+    requestedModel: ctx.model,
+    configuredTier: ctx.configuredTier,
+    provider: ctx.provider,
+    lane: ctx.lane,
+  });
+}
+
 function capacityAbsorbDelays(provider: OcxProviderConfig): readonly number[] | undefined {
   if (isCanonicalOpenAiForwardProvider(provider)) return CAPACITY_RETRY_DELAYS_MS;
   return process.env.OCX_CAPACITY_ABSORB_ALL === "1" ? CAPACITY_RETRY_DELAYS_MS : undefined;
@@ -921,6 +968,14 @@ export async function preparePassthroughExchange(
           replaySafe: isOpenCodeGoDestination(route.provider),
         },
       );
+      upstreamResponse = applyResponseGuards(upstreamResponse, {
+        lane: conversationKeyFromHeaders(req.headers),
+        provider: route.providerName,
+        model: route.modelId,
+        configuredTier: logCtx.configuredServiceTier,
+        comboAttempt: options.comboAttempt === true,
+        logCtx,
+      });
     } catch (err) {
       return transportFailureResponse(err);
     } finally {

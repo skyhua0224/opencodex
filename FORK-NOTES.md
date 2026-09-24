@@ -83,6 +83,29 @@ ocx setup               # then: ocx start
   anything about opencodex itself belongs upstream.
 - License: MIT, unchanged, with the original copyright notice (see `LICENSE`).
 
+### 6. Observability: what the origin actually served
+
+- **Repetition guard for native sessions** (`guardNativeDegenerateOutput` in
+  `src/server/responses/combo-degenerate-output.ts`). Until this existed only combo children were
+  watched for degenerate output; a session calling a provider directly relayed the loop to the client
+  until it gave up. The same monitor now wraps directly-routed streams: repeat ratio, longest repeated
+  segment, zlib ratio and identical tool-call signatures are measured on client-visible text, and a
+  verdict cuts the stream with `response.failed` / code `degenerate_output`. A native turn has no second
+  row, so the failover is the client's retry; the verdict is also remembered per conversation
+  (`takeLaneDegenerateVerdict`), so a combo serving that conversation afterwards demotes the row the
+  loop came from.
+- **Attestation** (`src/lib/response-attestation.ts`) records three things that never raise an error:
+  the model the origin says it answered as (`response.model` / `openai-model`) against the one
+  requested, the service tier it reports against the configured one, and the safety-buffer headers
+  (`x-codex-safety-buffering-enabled` / `-faster-model`). Findings go to
+  `~/.opencodex/model-attestation.jsonl` (one JSON object per line) plus one warning per request. The
+  body is passed through byte for byte.
+- **`ocx-tiers`** (`tools/ocx-tiers.py`) reads `usage.jsonl` and that ledger: configured-versus-served
+  tier table, finding counts, streams cut for repetition, and `--findings` for the raw ledger.
+- Both guards are wired once, in the passthrough lane's initial send (`applyResponseGuards` in
+  `src/server/responses/passthrough-dispatch.ts`), and the degenerate half skips combo attempts, which
+  have their own guard.
+
 ## Credential note (why GitHub push protection complains)
 
 The file src/oauth/google-antigravity.ts ships the Antigravity desktop client public OAuth
