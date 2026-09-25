@@ -9,6 +9,7 @@ import { CODEX_RESPONSES_HTTP_URL, type PreparedCodexWsRequest } from "./codex-w
 import { CodexWsCorrelation } from "./codex-ws-correlation";
 import type { CodexWsSession } from "./codex-ws-session";
 import { codexWsCrossTurnFirstFrameMs, noteCodexWsCrossTurnResult } from "./codex-ws-pool";
+import { noteCodexWsLaneRefusal, noteCodexWsLaneSuccess } from "./codex-ws-lane";
 import { isOverloadVerdictText } from "../ws-thread-transport";
 import { UPGRADE_DEADLINE_MS, CODEX_WS_LIVENESS_PING_INTERVAL_MS, CODEX_WS_RESPONSE_PRELUDE_TIMEOUT_MS, MAX_CODEX_WS_FRAME_BYTES,
   MAX_CODEX_WS_QUEUE_BYTES, markCodexWsResponse, normalizeResponsesWsRelayEvent, closedBeforeTerminalMessage,
@@ -812,6 +813,8 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
         // The reused socket served this turn: it asked for a response and got a terminal answer,
         // and every relayed content event is proof it carried real output.
         crossTurnNote(type === "response.completed" || contentEvents > 0, "terminal:" + type);
+        // A real response also proves the LANE is healthy, which is what ends a lane hold early.
+        if (metadata && type === "response.completed") noteCodexWsLaneSuccess();
         terminal = true;
         cleanup();
         try { controller.close(); } catch { /* already closed */ }
@@ -839,7 +842,21 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
         resolve(sseFallback(url, init));
         return;
       }
-      if (sent && !terminal) failStream(closedBeforeTerminalMessage(event, failureStage()));
+      if (sent && !terminal) {
+        // Tell the lane breaker what this close looked like BEFORE settling: a control-only close
+        // with an abnormal code is the origin refusing the transport, not this turn failing.
+        if (metadata) {
+          const stage = failureStage();
+          noteCodexWsLaneRefusal({
+            closeCode,
+            relayedEvents,
+            upstreamFrames,
+            firstFrameMs: stage.firstFrameMs,
+            elapsedMs: stage.elapsedMs,
+          });
+        }
+        failStream(closedBeforeTerminalMessage(event, failureStage()));
+      }
     };
 
     const onError = () => {

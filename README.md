@@ -93,6 +93,12 @@ bun test/thread-affinity-selftest.ts
   verdicts change nothing. A full clean round releases the hold. Installed here as a 30-minute
   systemd timer; the first live round held the official lane for answering 29 to a question whose
   minimum is provably 21.
+- **A lane-level breaker for the official transport.** When the origin closes the Codex WebSocket
+  without answering (control frames only, close 1011), turns used to burn the full 5+12+25+45s
+  capacity ladder and still fail. The breaker counts that exact shape across conversations and
+  rides HTTP/SSE for 10 minutes, escalating to 30 and 60 on repeats, with evidence in
+  `~/.opencodex/ws-lane.jsonl`. `provider.openai.upstreamWebsocket = false` remains the manual
+  switch, and is what this deployment runs on right now.
 - **Health, fingerprint and restriction watchers.** `ocx-tiers --health` scores each provider from
   its error rate and p90 first-output time; `--fingerprints` lists client-fingerprint drift (a
   Codex update or a header-rewriting relay stops being invisible); and a verdict that is about the

@@ -22,6 +22,7 @@ import { CODEX_RESPONSES_HTTP_URL, CODEX_RESPONSES_WS_URL, prepareCodexHttpInit,
 import { codexWsExchange } from "./codex-ws-exchange";
 import { CodexWsSession } from "./codex-ws-session";
 import { codexWsPool, codexWsReuseIdentity } from "./codex-ws-pool";
+import { codexWsLaneDisabled } from "./codex-ws-lane";
 import { codexWsCreateFrameExceedsLimit } from "./codex-ws-wire";
 import { conversationKeyFromHeaders, threadTransportDemotedToHttp } from "../ws-thread-transport";
 import { normalizeLogConversationId } from "../request-log-conversation";
@@ -98,6 +99,10 @@ export function shouldUseCodexWsUpstream(
   // api.openai.com lane still requires the operator opt-in.
   if (url !== CODEX_RESPONSES_HTTP_URL
     && !(upstreamWebsocketConfigured && url === OPENAI_API_RESPONSES_URL)) return false;
+  // The lane-level breaker: the origin is closing every dial without answering, so stop spending a
+  // capacity ladder (5+12+25+45s) per turn on it and ride HTTP until the hold expires. See
+  // ./codex-ws-lane.ts for the measured shape this reacts to.
+  if (url === CODEX_RESPONSES_HTTP_URL && codexWsLaneDisabled()) return false;
   if ((init?.method ?? "GET").toUpperCase() !== "POST") return false;
   const body = init?.body;
   if (typeof body !== "string") return false;

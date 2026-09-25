@@ -265,6 +265,47 @@ blocked one.
 a ChatGPT login, `ocx account <sub>` manages the pool, and a second subscription should be its own
 provider row so quota, capacity and quality state stay per-subscription.
 
+### 11. When the origin closes the WebSocket lane itself (2026-09-26)
+
+**What happened.** At ~07:00 every canonical WebSocket dial started completing the upgrade,
+receiving exactly two control frames, and then being closed by the origin with **1011** and no
+response event:
+
+```
+codex websocket closed before a Responses terminal event (close 1011)
+  [cause=no-response-event request=2718111B sent=yes frames=2 control=2 relayed=0 first-frame=1054ms elapsed=1070ms]
+```
+
+It hit both of the operator's working conversations and a three-question probe on a fresh session
+identically, so it was account/lane-scoped rather than conversation-scoped. The cost is what made it
+look like a freeze: every turn spent the whole capacity ladder re-dialling (5+12+25+45s of waits)
+and then failed anyway -- 97-106s per turn, with the client retrying on top. Nothing in the logs said
+"the lane is refused"; each line was an ordinary replayable 502.
+
+**Why the existing protection did not catch it.** The capacity ladder treats a pre-content close as
+worth re-dialling, which it is for a shed turn. The per-thread demotion needs six OVERLOAD verdicts,
+and a 1011 close carries none of that text. So the lane was re-dialled forever.
+
+**What was done.**
+
+1. Immediate relief: `provider.openai.upstreamWebsocket = false` (a switch the code already
+   documents for exactly this) moves the first-party lane to HTTP/SSE. Verified live: turns went
+   from 502-after-100s to 200 in 13-17s, and a probe question answered in 6.5s.
+2. `src/server/responses/codex-ws-lane.ts`: a lane-level breaker. A close counts as a refusal when
+   it has an abnormal code (1011/1012/1013/1014), no relayed event, and at most three upstream
+   frames -- the control-only shape. Three refusals inside ten minutes (and no WS success in the
+   last five) put the lane on HTTP for 10 minutes; further trips escalate to 30 and 60 minutes, and
+   a real WS response clears the window and resets the escalation. The hold is persisted in
+   `~/.opencodex/ws-lane.json`, every trip writes `~/.opencodex/ws-lane.jsonl`, and
+   `clearCodexWsLaneHold()` is the operator override.
+3. The config switch stays `false` on this deployment: a breaker-managed return to WS would cost
+   one 100-second ladder per hold expiry until the origin recovers, which is worse than stable HTTP.
+   Flip it back once the lane answers again; the breaker then covers the next outage automatically.
+
+**Residual reading.** If HTTP ever starts refusing too, the account is the common factor and no
+transport switch will save the turn -- at that point the levers are waiting out the block or serving
+the turn from a second subscription (`ocx login codex`, one provider row per subscription).
+
 ## Credential note (why GitHub push protection complains)
 
 The file src/oauth/google-antigravity.ts ships the Antigravity desktop client public OAuth
