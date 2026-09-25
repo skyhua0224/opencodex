@@ -239,10 +239,14 @@ searches), calendar-friday (`datetime`: 2026-09-25 and 2026-12-25 are both Frida
 weeks), clock-7p5 (hour hand 97.5°, minute 90°) and code-55 (executed). Exact-digit matches need no
 judge; everything else is graded by a model on a DIFFERENT provider.
 
-**The timer.** `tools/ocx-probe.service` + `.timer` (installed here, every 30 min) run the bank with
-`--apply` over the official lane and the relay families. Dead channels cost one fast 403 and never
-trigger anything. Edit the model list with `systemctl --user edit ocx-probe.service`; a hold clears
-itself when a round comes back clean.
+**On demand, not on a loop.** The probe runs when asked, not every half hour. A 30-minute timer was
+tried and removed after a day's numbers: 112 rounds, 400 questions, of which 195 answered 403 (dead
+subscriptions) and 101 answered 502 (a broken lane) -- 74% of the traffic carried no information at
+all, and the rounds that did carry a verdict were asking channels whose state the operator can see
+from `ocx-tiers --quality` in one command. The units are kept in `tools/ocx-probe.{service,timer}`
+as opt-in templates for anyone who wants a schedule; here a round is one command
+(`systemctl --user start ocx-probe.service`, or the probe invocation directly), and holds expire on
+their own when nothing refreshes them.
 
 **Health score.** `ocx-tiers --health` blends, per provider, the error rate (healthy at 1%, dead at
 10%) and the p90 first-output time (fast at 1.5 s, stuck at 15 s) into one 0-100 score from

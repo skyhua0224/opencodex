@@ -90,9 +90,9 @@ bun test/thread-affinity-selftest.ts
   six questions whose answers were each verified independently (exhaustive searches, `datetime`,
   execution) and grades with a model on a different provider; a clear wrong answer holds that
   provider for 30 minutes and combos demote it, while transport errors, auth failures and unknown
-  verdicts change nothing. A full clean round releases the hold. Installed here as a 30-minute
-  systemd timer; the first live round held the official lane for answering 29 to a question whose
-  minimum is provably 21.
+  verdicts change nothing. A full clean round releases the hold. It runs on demand -- the first live
+  round held the official lane for answering 29 to a question whose minimum is provably 21 -- with
+  the units in `tools/` as opt-in templates for anyone who prefers a schedule.
 - **A lane-level breaker for the official transport.** When the origin closes the Codex WebSocket
   without answering (control frames only, close 1011), turns used to burn the full 5+12+25+45s
   capacity ladder and still fail. The breaker counts that exact shape across conversations and
