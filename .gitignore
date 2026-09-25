@@ -4,3 +4,7 @@ node_modules/
 .DS_Store
 thumbs.db
 package-lock.json
+
+# Python bytecode from the tooling in tools/
+__pycache__/
+*.pyc
