@@ -24,14 +24,21 @@
 - **原生会话也做复读守卫**。前 4KB 算重复片段率、最长重复片段、zlib 压缩比，跨轮还比对工具调用签名；命中就切断这趟流（发 `response.failed` + `degenerate_output`），不再继续为循环付钱。原生没有第二行可换，“换”交给客户端重试，同时把判定记在这个会话上——下次它走 combo 时，会降级那个真正在复读的行。
 - **模型、等级、安全缓冲全部留痕**。响应里报的模型与请求不一致、服务等级低于配置、官方声明安全缓冲会用更快的模型（例如 `gpt-6-luna`），都会写进 `~/.opencodex/model-attestation.jsonl` 并打一行日志；不报错，也不改写响应。
 - **控制台里的额度喂给路由**。面板型订阅、自定义窗口、秒级重置时间戳、`>= 100%` 就当耗尽。
-- **带标准答案的测智探针**：`tools/pelican-probe.py` 用 sub2api 那两道题（题面、交付约定、`high` 推理档位、
+- **答错的渠道现在会真的让位**：`tools/pelican-probe.py --kind bank --apply` 问六道答案各自独立验证过的题
+  （穷举、`datetime`、实际执行），判题交给另一家的模型；明确答错一次，该渠道被隔离 30 分钟、combo 里降一级；
+  超时、鉴权失败、判不出一律什么都不动。整轮全对才解除。本机已装成每 30 分钟的 systemd 定时器；首轮就把官方车道
+  隔离了——一道最小值可证为 21 的题它答了 29。
+- **健康分、指纹漂移、风控判定**：`ocx-tiers --health` 用错误率加 p90 首字给每家打分；`--fingerprints` 列出客户端
+  指纹漂移（Codex 升级、中转改头不再是无声的）；针对"说的是客户端而不是负载"的判定（例如 only allows Codex
+  official clients），第一次就重投该会话的路由身份，不再等负载阈值。- **带标准答案的测智探针**：`tools/pelican-probe.py` 用 sub2api 那两道题（题面、交付约定、`high` 推理档位、
   期望答案、判题规则全部照抄），通过本代理测任意渠道，判题交给**另一个渠道**的模型，结果写进
   `~/.opencodex/intelligence-probe.jsonl`。首轮结果：官方 `gpt-6-sol`/`luna`/`astra` 都把一道最小值为
   21 的题答成 29；`ciii-*` 返回 `Upstream authentication failed`；`lucen-*` 和 `portal` 全是
   `SUBSCRIPTION_NOT_FOUND`。
 - **一条命令看结果**：`ocx-tiers` 直接看等级有没有掉、有没有被换模型、有多少条流因为复读被切；
   再加 `--links`（这条链路到底见没见过边缘的亲和 cookie）、`--latency`（慢的一趟时间花在哪一段）
-  和 `--wsreuse`（fresh / 同轮重发 / 跨轮复用三条 WebSocket 车道并排：失败率和首帧中位数）。
+  和 `--wsreuse`（三条 WebSocket 车道并排）、`--health`（每家健康分）、`--quality`（测智轮次与隔离）、
+  `--fingerprints`（指纹漂移）。
 - **prelude 之后 socket 断掉也能重拨**：只要一个字节都没放给客户端，就结算成可重放的状态交给阶梯重新拨号；
   只有已经出过帧的情况才按“有歧义”处理。
 - **socket 池终于真的用上了**：有两个 bug 让它从来没接到过真实流量——客户端那个约 4KB、每次尝试都会换的

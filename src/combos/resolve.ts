@@ -1,5 +1,6 @@
 import type { OcxComboTarget, OcxConfig } from "../types";
 import { getCachedProviderRoutingQuota, panelProviderDegraded, panelProviderHopeless } from "../providers/quota-routing-cache";
+import { providerQualityHeld } from "../providers/quality-holds";
 import type { ProviderQuota } from "../providers/quota-types";
 import { sleepWithAbort } from "../lib/upstream-retry";
 import {
@@ -276,6 +277,12 @@ export function pickComboTarget(
     if (isComboTargetBreakerOpen(comboId, target, now)) return 2;
     const demoted = hold === "failures"
       || isComboTargetInCooldown(comboId, target, now)
+      // A quality hold is the one rank input that saw the CONTENT: a probe with a verified
+      // answer judged this provider's answers wrong (measured 2026-09-25: official gpt-6 answered
+      // 29 where the minimum is provably 21, five fresh sessions in a row). It demotes rather
+      // than excludes -- while any honest row exists this one steps aside, and a lane with
+      // nothing else left is still allowed to answer rather than to fail.
+      || providerQualityHeld(target.provider, now)
       || panelProviderHopeless(target.provider, now)
       || panelProviderDegraded(target.provider, now)
       || comboTargetDeferred(comboId, target, now)

@@ -86,6 +86,18 @@ bun test/thread-affinity-selftest.ts
   authentication failed` and every `lucen-*`/`portal` returned `SUBSCRIPTION_NOT_FOUND`.
 - **Model catalog and management surface** for the `gpt-6` family and the provider fields the
   hardening needs (`retryOnReset`, transient-5xx policy, reasoning efforts, context windows).
+- **A wrong answer now costs a channel its turn.** `tools/pelican-probe.py --kind bank --apply` asks
+  six questions whose answers were each verified independently (exhaustive searches, `datetime`,
+  execution) and grades with a model on a different provider; a clear wrong answer holds that
+  provider for 30 minutes and combos demote it, while transport errors, auth failures and unknown
+  verdicts change nothing. A full clean round releases the hold. Installed here as a 30-minute
+  systemd timer; the first live round held the official lane for answering 29 to a question whose
+  minimum is provably 21.
+- **Health, fingerprint and restriction watchers.** `ocx-tiers --health` scores each provider from
+  its error rate and p90 first-output time; `--fingerprints` lists client-fingerprint drift (a
+  Codex update or a header-rewriting relay stops being invisible); and a verdict that is about the
+  client rather than the load ("only allows Codex official clients") re-rolls that conversation's
+  routing identity immediately instead of waiting for a load threshold.
 
 ## License
 

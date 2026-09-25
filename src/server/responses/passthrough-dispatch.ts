@@ -142,6 +142,7 @@ import {
   failoverAccountSnapshot,
 } from "../../oauth/generic-account-failover";
 import { captureCodexAffinityDiagnostic } from "../../codex/affinity-debug";
+import { observeClientFingerprint } from "../../codex/client-fingerprint-guard";
 import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS } from "../../codex/catalog/native-models";
 import {
   attemptOpaqueBlobRecovery,
@@ -1506,6 +1507,9 @@ export async function preparePassthroughExchange(
         || captureAuthCtx.kind === "main-pool",
     ): void => {
       if (!isCanonicalOpenAiForwardProvider(route.provider)) return;
+      // Every canonical response is one free look at the fingerprint that reached the origin.
+      // Observation only; see codex/client-fingerprint-guard.ts for why this is never a rewrite.
+      observeClientFingerprint(req.headers, route.provider);
       captureCodexAffinityDiagnostic({
         inboundHeaders: req.headers,
         outboundHeaders: captureRequest.headers,

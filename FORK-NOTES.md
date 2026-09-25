@@ -213,6 +213,58 @@ cleanest composition (crest, helmet, red frame, hills), `sol` a decent coastal s
 thin noodles, and `luna` the weakest anatomy (body and legs melting into the bike frame). All three
 pass sub2api's automated HTML check, which is exactly why its showcase is human-reviewed.
 
+### 10. The quality gate, and the four watchers around it (2026-09-25)
+
+**The gate: a wrong answer now costs a channel its turn.** `src/providers/quality-holds.ts` reads
+`~/.opencodex/quality-holds.json`, written by `tools/pelican-probe.py --apply`, and
+`pickComboTarget` demotes a held provider (rank 1, "steps aside while an honest row exists") --
+never a hard exclusion, because "no targets" is worse than a wrong-but-alive lane. The policy is
+one-sided on purpose, and is the same one a quality gate has to be to be safe:
+
+- only a CLEAR wrong answer creates a hold (HTTP 200, a real answer, judge verdict `incorrect`);
+- transport errors, auth failures, unanswered requests and `unknown` change nothing -- neither a
+  hold nor a release;
+- a hold is released by the probe alone, after a round in which EVERY question on that provider
+  passed; hand-editing the file works too, and holds past 48 h are ignored as a safety bound.
+
+Live, 2026-09-25 16:20: the official `gpt-6-sol` answered `29个` to candy-21 (expected 21) and got
+both other questions right; the round summary read `asked=3 correct=2 wrong=1 -> held`, and
+`ocx-tiers --quality` showed `openai ... HELD 30min: candy-21: answered 29个, expected 21`. First
+round this deployment has where a quality verdict actually moved routing.
+
+**The bank.** `pelican-probe.py --kind bank` asks six questions whose answers were each verified
+independently before entering the file: candy-21 (exhaustive search over every hand: 9 round + 12
+star is minimal, and every other 21-split fails), socks-4 and balls-7 (exhaustive multiset
+searches), calendar-friday (`datetime`: 2026-09-25 and 2026-12-25 are both Fridays, 91 days = 13
+weeks), clock-7p5 (hour hand 97.5°, minute 90°) and code-55 (executed). Exact-digit matches need no
+judge; everything else is graded by a model on a DIFFERENT provider.
+
+**The timer.** `tools/ocx-probe.service` + `.timer` (installed here, every 30 min) run the bank with
+`--apply` over the official lane and the relay families. Dead channels cost one fast 403 and never
+trigger anything. Edit the model list with `systemctl --user edit ocx-probe.service`; a hold clears
+itself when a round comes back clean.
+
+**Health score.** `ocx-tiers --health` blends, per provider, the error rate (healthy at 1%, dead at
+10%) and the p90 first-output time (fast at 1.5 s, stuck at 15 s) into one 0-100 score from
+`usage.jsonl`. First reading: `deepseek 81, zai 76, openai 55` -- the official lane's score is
+carried by a 13.5 s p90, not by its 0.8% error rate.
+
+**Fingerprint drift.** `src/codex/client-fingerprint-guard.ts` watches the four headers upstream can
+grade service by (originator, user agent, installation id, subagent marker) and appends one row per
+CHANGE to `~/.opencodex/fingerprint-drift.jsonl` -- names, sizes and 12-char hashes only, never a
+value. A Codex update or a relay that rewrites headers now leaves a suspect list instead of silence.
+
+**Restriction verdicts.** `noteThreadRestrictionVerdict` recognises the texts that are about the
+CLIENT rather than the load ("This account only allows Codex official clients", policy/abuse blocks)
+and re-rolls that conversation's routing identity on the FIRST verdict with a 30-minute hold -- no
+six-verdict threshold to wait for, because the origin did not say "busy", it said "not you".
+`sessionVerdictSummary` reports both verdict kinds so a slow conversation can be told apart from a
+blocked one.
+
+**Adding an account** (the one lever that changes who actually serves you): `ocx login codex` adds
+a ChatGPT login, `ocx account <sub>` manages the pool, and a second subscription should be its own
+provider row so quota, capacity and quality state stay per-subscription.
+
 ## Credential note (why GitHub push protection complains)
 
 The file src/oauth/google-antigravity.ts ships the Antigravity desktop client public OAuth

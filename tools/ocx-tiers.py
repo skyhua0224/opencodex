@@ -25,6 +25,9 @@ FINDINGS = os.path.join(HOME, 'model-attestation.jsonl')
 LINKS = os.path.join(HOME, 'cookie-link.jsonl')
 LATENCY = os.path.join(HOME, 'latency.jsonl')
 WS_REUSE = os.path.join(HOME, 'ws-reuse.jsonl')
+QUALITY = os.path.join(HOME, 'intelligence-probe.jsonl')
+HOLDS = os.path.join(HOME, 'quality-holds.json')
+FINGERPRINT = os.path.join(HOME, 'fingerprint-drift.jsonl')
 RANK = {'flex': 0, 'auto': 1, 'default': 1, 'priority': 2, 'scale': 2, 'fast': 2}
 
 
@@ -141,6 +144,75 @@ def ws_lane_medians(bucket):
     return med('firstFrame'), med('firstOutput'), med('elapsed')
 
 
+def attempt_metric(row, field, ws_field):
+    """First non-null value of one latency metric across a row's attempts (WS stage included)."""
+    for attempt in row.get('attempts') or []:
+        value = attempt.get(field)
+        if isinstance(value, (int, float)):
+            return value
+        stage = attempt.get('codexWsStage')
+        if isinstance(stage, dict) and isinstance(stage.get(ws_field), (int, float)):
+            return stage[ws_field]
+    return None
+
+
+def percentile(values, fraction):
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, int(round(fraction * (len(ordered) - 1))))
+    return ordered[index]
+
+
+def health_rows(rows_):
+    """Per provider: error rate and p90 first output, blended into one 0-100 score.
+
+    Bands follow the two things an operator can act on: an error rate above 10% is a dead lane and
+    below 1% a healthy one; a p90 first output above 15s is the "stuck for half a minute" lane this
+    deployment actually has, below 1.5s the fast one. Both halves are worth half the score, the
+    same split a dashboard health score uses.
+    """
+    lanes = {}
+    for row in rows_:
+        provider = str(row.get('provider') or '?')
+        bucket = lanes.setdefault(provider, {'attempts': 0, 'failed': 0, 'first': []})
+        for attempt in row.get('attempts') or []:
+            bucket['attempts'] += 1
+            if attempt.get('status') != 200:
+                bucket['failed'] += 1
+        value = attempt_metric(row, 'firstOutputMs', 'firstFrameMs')
+        if isinstance(value, (int, float)):
+            bucket['first'].append(value)
+    out = {}
+    for provider, bucket in lanes.items():
+        error_pct = 100.0 * bucket['failed'] / bucket['attempts'] if bucket['attempts'] else 0.0
+        p90 = percentile(bucket['first'], 0.9)
+        error_score = 100.0 if error_pct <= 1 else (0.0 if error_pct >= 10 else (10 - error_pct) / 9 * 100)
+        ttft_score = 100.0 if p90 is None else (0.0 if p90 >= 15000 else (15000 - p90) / 13500 * 100)
+        out[provider] = {'attempts': bucket['attempts'], 'failed': bucket['failed'],
+                         'errorPct': round(error_pct, 1), 'p90FirstMs': p90,
+                         'score': int(0.5 * error_score + 0.5 * ttft_score)}
+    return out
+
+
+def quality_summary(hours):
+    entries = ledger(QUALITY, hours)
+    rounds = [e for e in entries if e.get('kind') == 'round-summary']
+    holds = {}
+    try:
+        with open(HOLDS) as handle:
+            payload = json.load(handle)
+        holds = payload.get('holds') or {}
+    except Exception:
+        holds = {}
+    by_provider = {}
+    for entry in rounds:
+        provider = entry.get('provider')
+        if provider:
+            by_provider[provider] = entry
+    return entries, rounds, by_provider, holds
+
+
 def main():
     ap = argparse.ArgumentParser(prog='ocx-tiers', description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -149,8 +221,48 @@ def main():
     ap.add_argument('--links', action='store_true', help='only summarise the link ledger')
     ap.add_argument('--latency', action='store_true', help='only summarise the latency ledger')
     ap.add_argument('--wsreuse', action='store_true', help='only report the WebSocket reuse lanes')
+    ap.add_argument('--health', action='store_true', help='only report the per-provider health score')
+    ap.add_argument('--quality', action='store_true', help='only report intelligence-probe rounds and holds')
+    ap.add_argument('--fingerprints', action='store_true', help='only list client fingerprint drift')
     args = ap.parse_args()
     found = ledger(FINDINGS, args.hours)
+
+    if args.health:
+        rows_ = rows(args.hours)
+        lanes = health_rows(rows_)
+        print('health: %d providers in the last %gh' % (len(lanes), args.hours))
+        print('%-24s %9s %7s %8s %12s %7s' % ('provider', 'attempts', 'failed', 'err%', 'p90 first', 'score'))
+        for provider, lane in sorted(lanes.items(), key=lambda item: item[1]['score']):
+            print('%-24s %9d %7d %7.1f%% %12s %7d' % (provider, lane['attempts'], lane['failed'],
+                  lane['errorPct'], (str(lane['p90FirstMs']) + 'ms') if lane['p90FirstMs'] is not None else '-',
+                  lane['score']))
+        return 0
+
+    if args.quality:
+        entries, rounds, by_provider, holds = quality_summary(args.hours)
+        now = time.time() * 1000
+        print('quality: %d probe rows, %d round summaries, %d active hold(s)' % (len(entries), len(rounds),
+              sum(1 for value in holds.values() if (value.get('until') or 0) > now)))
+        for provider in sorted(set(list(by_provider) + list(holds))):
+            summary = by_provider.get(provider) or {}
+            hold = holds.get(provider) or {}
+            active = (hold.get('until') or 0) > now
+            print('  %-22s last round: asked=%s correct=%s wrong=%s inconclusive=%s action=%s%s' % (
+                provider, summary.get('asked', '-'), summary.get('correct', '-'),
+                summary.get('incorrect', '-'), summary.get('inconclusive', '-'),
+                summary.get('action', 'never'),
+                ('   HELD %dmin: %s' % (round(((hold.get('until') or 0) - now) / 60000), (hold.get('reason') or '')[:70])) if active else ''))
+        return 0
+
+    if args.fingerprints:
+        entries = ledger(FINGERPRINT, args.hours)
+        print('fingerprints: %d drift rows in the last %gh' % (len(entries), args.hours))
+        for entry in entries[-15:]:
+            when = datetime.fromtimestamp((entry.get('at') or 0) / 1000).strftime('%m-%d %H:%M')
+            print('  %s  %-16s %s' % (when, entry.get('provider') or '-', ','.join(entry.get('changes') or [])))
+        if not entries:
+            print('  no drift rows in window')
+        return 0
 
     if args.wsreuse:
         entries, events, reused, failed, idle, age = ws_reuse_summary(args.hours)
@@ -247,6 +359,15 @@ def main():
           % (len(latch), latq, lath, latf, latt))
     ws_entries, ws_events, ws_reused, ws_failed, ws_idle, ws_age = ws_reuse_summary(args.hours)
     ws_lanes = ws_lane_rows(rows_)
+    lanes = health_rows(rows_)
+    worst = sorted(lanes.items(), key=lambda item: item[1]['score'])[:3]
+    print('health        %s' % ', '.join('%s=%d(%d attempts, p90 %sms)'
+          % (provider, lane['score'], lane['attempts'], lane['p90FirstMs']) for provider, lane in worst))
+    qentries, qrounds, qprovider, qholds = quality_summary(args.hours)
+    now = time.time() * 1000
+    active_holds = [name for name, value in qholds.items() if (value.get('until') or 0) > now]
+    print('quality       probe rows: %d, rounds: %d, active holds: %s' % (len(qentries), len(qrounds),
+          ', '.join(active_holds) if active_holds else 'none'))
     print('ws reuse     cross-turn: %d attempts, %d failed (events: %d reuse, %d ok, %d fail, %d breaker)'
           % (ws_lanes.get('cross-turn', {}).get('n', 0), ws_lanes.get('cross-turn', {}).get('fail', 0),
              ws_events.get('cross-turn-reuse', 0), ws_events.get('cross-turn-ok', 0),

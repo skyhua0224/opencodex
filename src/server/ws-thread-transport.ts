@@ -54,6 +54,12 @@ interface ThreadTransportEntry {
   /** Verdict timestamps inside the current window. */
   verdicts: number[];
   /**
+   * Restriction verdicts inside the current window: the origin answered about THIS conversation's
+   * identity (client not allowed, policy block), not about its load. Optional because every entry
+   * constructed before this field existed has none.
+   */
+  restrictionVerdicts?: number[];
+  /**
    * While now < this, the thread's outbound `x-codex-window-id` is dropped.
    *
    * The shed conversation is not merely shedding: it is served 2-3x slower than its sibling at
@@ -132,6 +138,20 @@ export function isOverloadVerdictText(message: string | undefined): boolean {
   // and the canonical backend answers "Our servers are currently overloaded". A word-boundary
   // pattern misses the underscore forms, which are exactly the ones a relay sends.
   return /currently overloaded|server_is_overloaded|overloaded|capacity/.test(text);
+}
+
+/**
+ * Messages that mean "this conversation's identity is the problem".
+ *
+ * Deliberately narrow: these are verdicts about the CLIENT, and misreading a load message as a
+ * restriction would re-roll a healthy conversation's routing identity for nothing. The canonical
+ * text is the backend's own ("This account only allows Codex official clients"); the rest covers
+ * the shapes relays use for policy and abuse blocks.
+ */
+export function isRestrictionVerdictText(message: string | undefined): boolean {
+  const text = (message ?? "").toLowerCase();
+  if (text.length === 0) return false;
+  return /only allows codex official clients|official clients only|cyber|policy_violation|content policy violation|abuse|unusual activity|flagged for review/.test(text);
 }
 
 function trim(threadId: string | undefined): string | undefined {
@@ -218,6 +238,59 @@ export function noteThreadOverloadVerdict(
     if (oldest === undefined) break;
     ledger.delete(oldest);
   }
+}
+
+/**
+ * Record a restriction verdict and re-roll this conversation's routing identity immediately.
+ *
+ * Unlike an overload verdict there is no threshold to wait for: the origin did not say "busy", it
+ * said "not you". The one action that has measurably moved such a conversation (2026-09-23:
+ * 14-22s -> 8.1-8.3s for the ten minutes after a re-roll) is asking the backend to place it
+ * afresh, so that happens on the first verdict, with a short hold because these blocks are
+ * typically local and short-lived (the same reason an operator's "静置再蹬" works).
+ */
+const RESTRICTION_RESET_HOLD_MS = 30 * 60_000;
+export function noteThreadRestrictionVerdict(
+  threadId: string | undefined,
+  message: string | undefined,
+  now = Date.now(),
+): void {
+  const key = trim(threadId);
+  if (!key || !isRestrictionVerdictText(message)) return;
+  const previous = ledger.get(key);
+  const entry: ThreadTransportEntry = previous
+    ? { ...previous, restrictionVerdicts: [...(previous.restrictionVerdicts ?? []), now] }
+    : { verdicts: [], rung: 0, httpOnlyUntil: 0, affinityResetUntil: 0, lastAt: now, restrictionVerdicts: [now] };
+  entry.restrictionVerdicts = (entry.restrictionVerdicts ?? []).filter(at => now - at < VERDICT_WINDOW_MS);
+  entry.lastAt = now;
+  const wasRolled = entry.affinityResetUntil > now;
+  entry.affinityResetUntil = Math.max(entry.affinityResetUntil, now + RESTRICTION_RESET_HOLD_MS);
+  ledger.delete(key);
+  ledger.set(key, entry);
+  persistAffinityState(now);
+  if (!wasRolled) {
+    console.warn(
+      "[opencodex] thread " + key.slice(0, 8) + ": origin answered about this client, not its load ("
+      + (message ?? "").slice(0, 70) + ") - re-rolling its routing identity for "
+      + Math.round(RESTRICTION_RESET_HOLD_MS / 60_000) + "min",
+    );
+  }
+}
+
+/** Recent verdict kinds for one conversation, for reports and tests. */
+export function sessionVerdictSummary(
+  threadId: string | undefined,
+  now = Date.now(),
+): { overload: number; restriction: number; affinityResetActive: boolean } | undefined {
+  const key = trim(threadId);
+  if (!key) return undefined;
+  const entry = ledger.get(key);
+  if (!entry) return undefined;
+  return {
+    overload: entry.verdicts.filter(at => now - at < VERDICT_WINDOW_MS).length,
+    restriction: (entry.restrictionVerdicts ?? []).filter(at => now - at < VERDICT_WINDOW_MS).length,
+    affinityResetActive: entry.affinityResetUntil > now,
+  };
 }
 
 /** True while this thread must use plain HTTP instead of the WebSocket lane. */
