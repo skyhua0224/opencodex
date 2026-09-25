@@ -169,6 +169,50 @@ session" that third-party gateways advertise.
   flag, so `ocx-tiers --wsreuse` reports the three WebSocket lanes side by side: fresh, resend inside a
   turn, and cross-turn, each with its failure rate and its first-frame / first-output medians.
 
+### 9. The intelligence probe, run with sub2api's parameters (2026-09-25)
+
+`tools/pelican-probe.py` asks the two questions ranxi2001/sub2api ships, with its prompt text, its
+answer contract, its reasoning effort (`high`), its expected answer and its grading rules, so the
+numbers are comparable with theirs:
+
+- **candy** -- the built-in text question (three flavours, two shapes, "least number of candies that
+  guarantees a differently-shaped apple and peach pair"), answer must be a bare integer, expected
+  **21**, graded by a judge model on a DIFFERENT channel with their default grading prompt and the
+  same JSON verdict contract (`correct|incorrect|unknown`);
+- **pelican** -- `SVG 绘制一个鹈鹕骑自行车的 2D 动画` plus their delivery contract; their automated
+  criterion is only "is there an HTML/SVG document", so the probe also saves the HTML, extracts the
+  SVG and rasterises a frame, because the real comparison is human.
+
+Each attempt appends one row to `~/.opencodex/intelligence-probe.jsonl` (status, verdict, reason,
+first-content time, total time, the answer text, and the channel), so a probe round can be lined up
+against capacity windows, tier attestations and latency rows.
+
+**First run, 2026-09-25 15:10-15:17.** The ground truth was verified independently first: an
+exhaustive check over every possible hand gives **21** (take 9 round and 12 star) as the minimum, and
+every other 21-split fails.
+
+| channel / model | candy (expected 21) | pelican |
+| --- | --- | --- |
+| `gpt-6-sol` (official) | **29** -- incorrect | valid HTML, 13.8 KB, first frame 79 s, total 249 s |
+| `gpt-6-luna` (official) | **29** -- incorrect | valid HTML, 12.7 KB, first frame 113 s, total 274 s |
+| `gpt-6-astra` (official) | **29** -- incorrect | valid HTML, 13.8 KB, first frame 25 s, total 104 s |
+| `combo/gpt-6-sol` | **29** -- incorrect (routed to the same lane) | not run |
+| `ciii-codex/*`, `ciii-codex-luke/*` | 502 `Upstream authentication failed` | not run |
+| `lucen-*` (006/008/dynamic/fast/012/014/017/025) | 403 `SUBSCRIPTION_NOT_FOUND` | not run |
+| `portal/*` | 403 `SUBSCRIPTION_NOT_FOUND` | not run |
+
+Three official models, one wrong answer each, on a question whose answer is verifiable: that is the
+kind of signal a quality gate acts on, and it is the first functional (not proxy-metric) evidence
+this fork has produced. It is also only ONE question -- a screen, not a verdict. The honest reading
+is "the official lane answered a discriminating question wrong today", not "the model is degraded by
+X%". A round worth trusting needs several questions with verified answers, repeats, and the results
+plotted against the capacity/tier timeline; the probe exists so that is a command, not a project.
+
+Visually the three pelican renders differ the way a quality gate would want to see: `astra` drew the
+cleanest composition (crest, helmet, red frame, hills), `sol` a decent coastal scene whose legs are
+thin noodles, and `luna` the weakest anatomy (body and legs melting into the bike frame). All three
+pass sub2api's automated HTML check, which is exactly why its showcase is human-reviewed.
+
 ## Credential note (why GitHub push protection complains)
 
 The file src/oauth/google-antigravity.ts ships the Antigravity desktop client public OAuth

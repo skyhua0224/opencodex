@@ -24,6 +24,11 @@
 - **原生会话也做复读守卫**。前 4KB 算重复片段率、最长重复片段、zlib 压缩比，跨轮还比对工具调用签名；命中就切断这趟流（发 `response.failed` + `degenerate_output`），不再继续为循环付钱。原生没有第二行可换，“换”交给客户端重试，同时把判定记在这个会话上——下次它走 combo 时，会降级那个真正在复读的行。
 - **模型、等级、安全缓冲全部留痕**。响应里报的模型与请求不一致、服务等级低于配置、官方声明安全缓冲会用更快的模型（例如 `gpt-6-luna`），都会写进 `~/.opencodex/model-attestation.jsonl` 并打一行日志；不报错，也不改写响应。
 - **控制台里的额度喂给路由**。面板型订阅、自定义窗口、秒级重置时间戳、`>= 100%` 就当耗尽。
+- **带标准答案的测智探针**：`tools/pelican-probe.py` 用 sub2api 那两道题（题面、交付约定、`high` 推理档位、
+  期望答案、判题规则全部照抄），通过本代理测任意渠道，判题交给**另一个渠道**的模型，结果写进
+  `~/.opencodex/intelligence-probe.jsonl`。首轮结果：官方 `gpt-6-sol`/`luna`/`astra` 都把一道最小值为
+  21 的题答成 29；`ciii-*` 返回 `Upstream authentication failed`；`lucen-*` 和 `portal` 全是
+  `SUBSCRIPTION_NOT_FOUND`。
 - **一条命令看结果**：`ocx-tiers` 直接看等级有没有掉、有没有被换模型、有多少条流因为复读被切；
   再加 `--links`（这条链路到底见没见过边缘的亲和 cookie）、`--latency`（慢的一趟时间花在哪一段）
   和 `--wsreuse`（fresh / 同轮重发 / 跨轮复用三条 WebSocket 车道并排：失败率和首帧中位数）。

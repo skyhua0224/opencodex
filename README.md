@@ -78,6 +78,12 @@ bun test/thread-affinity-selftest.ts
   origin costs more than it saves on days the origin answers in tens of seconds.
 - **Quota the panel knows and the API does not.** Panel-family subscriptions feed the router:
   custom windows, epoch-second reset stamps, and `>= 100%` means exhausted.
+- **An intelligence probe with a verifiable answer.** `tools/pelican-probe.py` runs the two questions
+  sub2api ships (its prompt text, contract, `high` effort, expected answer and grading rules) against
+  any channel through this proxy, grades with a judge on a different channel and writes
+  `~/.opencodex/intelligence-probe.jsonl`. First run: the official `gpt-6-sol`/`luna`/`astra` all
+  answered 29 to a question whose minimum is provably 21, while `ciii-*` returned `Upstream
+  authentication failed` and every `lucen-*`/`portal` returned `SUBSCRIPTION_NOT_FOUND`.
 - **Model catalog and management surface** for the `gpt-6` family and the provider fields the
   hardening needs (`retryOnReset`, transient-5xx policy, reasoning efforts, context windows).
 
