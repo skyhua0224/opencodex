@@ -9,8 +9,12 @@ Four questions, one command:
   * link/latency - whether this lane ever sees the edge's load-balancer affinity cookies,
                    and how a slow turn's time splits (our queue / origin headers / first
                    content / tail).
+  * ws reuse     - the WebSocket lanes side by side: one socket per turn, a resend inside one
+                   turn, and a socket reused for a later turn of the same conversation -- with
+                   the failure rate and first-frame latency of each.
 
-Sources: ~/.opencodex/usage.jsonl, model-attestation.jsonl, cookie-link.jsonl, latency.jsonl.
+Sources: ~/.opencodex/usage.jsonl, model-attestation.jsonl, cookie-link.jsonl, latency.jsonl,
+ws-reuse.jsonl.
 """
 import argparse, collections, json, os, statistics, time
 from datetime import datetime
@@ -20,6 +24,7 @@ USAGE = os.path.join(HOME, 'usage.jsonl')
 FINDINGS = os.path.join(HOME, 'model-attestation.jsonl')
 LINKS = os.path.join(HOME, 'cookie-link.jsonl')
 LATENCY = os.path.join(HOME, 'latency.jsonl')
+WS_REUSE = os.path.join(HOME, 'ws-reuse.jsonl')
 RANK = {'flex': 0, 'auto': 1, 'default': 1, 'priority': 2, 'scale': 2, 'fast': 2}
 
 
@@ -96,6 +101,46 @@ def latency_summary(hours):
     return entries, med('queueMs'), med('headersMs'), med('firstContentMs'), med('totalMs')
 
 
+def ws_reuse_summary(hours):
+    entries = ledger(WS_REUSE, hours)
+    events = collections.Counter(e.get('event') for e in entries)
+    reused = [e for e in entries if e.get('event') == 'cross-turn-reuse']
+    failed = [e for e in entries if e.get('event') == 'cross-turn-fail']
+
+    def med(key, rows=None):
+        vals = [e.get(key) for e in (reused if rows is None else rows) if isinstance(e.get(key), (int, float))]
+        return int(statistics.median(vals)) if vals else None
+    return entries, events, reused, failed, med('idleMs'), med('ageMs')
+
+
+def ws_lane_rows(rows_):
+    """Split the WebSocket lane three ways: fresh, resend inside one turn, cross-turn reuse."""
+    lanes = collections.defaultdict(lambda: {'n': 0, 'fail': 0, 'firstFrame': [], 'firstOutput': [], 'elapsed': []})
+    for row in rows_:
+        for attempt in row.get('attempts') or []:
+            stage = attempt.get('codexWsStage')
+            if not isinstance(stage, dict):
+                continue
+            lane = 'cross-turn' if stage.get('crossTurn') is True else (
+                'resend (same turn)' if stage.get('reused') is True else 'fresh')
+            bucket = lanes[lane]
+            bucket['n'] += 1
+            if attempt.get('status') != 200:
+                bucket['fail'] += 1
+            for field, key in (('firstFrameMs', 'firstFrame'), ('firstOutputMs', 'firstOutput'),
+                               ('elapsedMs', 'elapsed')):
+                value = stage.get(field) if field != 'firstOutputMs' else attempt.get(field)
+                if isinstance(value, (int, float)):
+                    bucket[key].append(value)
+    return lanes
+
+
+def ws_lane_medians(bucket):
+    def med(key):
+        return int(statistics.median(bucket[key])) if bucket[key] else None
+    return med('firstFrame'), med('firstOutput'), med('elapsed')
+
+
 def main():
     ap = argparse.ArgumentParser(prog='ocx-tiers', description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -103,8 +148,36 @@ def main():
     ap.add_argument('--findings', action='store_true', help='only list the attestation ledger')
     ap.add_argument('--links', action='store_true', help='only summarise the link ledger')
     ap.add_argument('--latency', action='store_true', help='only summarise the latency ledger')
+    ap.add_argument('--wsreuse', action='store_true', help='only report the WebSocket reuse lanes')
     args = ap.parse_args()
     found = ledger(FINDINGS, args.hours)
+
+    if args.wsreuse:
+        entries, events, reused, failed, idle, age = ws_reuse_summary(args.hours)
+        print('ws reuse: %d events   cross-turn reuses: %d   failed: %d   breaker opens: %d'
+              % (len(entries), len(reused), len(failed), events.get('cross-turn-breaker-open', 0)))
+        print('          reuse idle p50=%s   socket age p50=%s'
+              % ('%dms' % idle if idle is not None else '-', '%dms' % age if age is not None else '-'))
+        lanes = ws_lane_rows(rows(args.hours))
+        print()
+        print('%-20s %9s %7s %8s %14s %16s' % ('lane', 'attempts', 'failed', 'fail%', 'first frame p50', 'first output p50'))
+        for lane in ('fresh', 'resend (same turn)', 'cross-turn'):
+            bucket = lanes.get(lane)
+            if not bucket:
+                continue
+            first_frame, first_output, _ = ws_lane_medians(bucket)
+            print('%-20s %9d %7d %7.1f%% %14s %16s' % (
+                lane, bucket['n'], bucket['fail'], 100.0 * bucket['fail'] / bucket['n'],
+                str(first_frame) + 'ms' if first_frame is not None else '-',
+                str(first_output) + 'ms' if first_output is not None else '-'))
+        for entry in failed[-6:]:
+            when = datetime.fromtimestamp((entry.get('at') or 0) / 1000).strftime('%m-%d %H:%M')
+            print('  %s  %-22s firstFrame=%s elapsed=%s close=%s' % (
+                when, (entry.get('reason') or '?')[:22], entry.get('firstFrameMs'),
+                entry.get('elapsedMs'), entry.get('closeCode')))
+        if not entries and not lanes:
+            print('  no reuse rows in window')
+        return 0
 
     if args.links:
         entries, with_routing, client_sent, pairs = link_summary(args.hours)
@@ -172,6 +245,12 @@ def main():
         print('             lanes whose pair changed: %s' % ', '.join(sorted(unstable)))
     print('latency      slow turns: %d   median queue=%s headers=%s first=%s total=%s'
           % (len(latch), latq, lath, latf, latt))
+    ws_entries, ws_events, ws_reused, ws_failed, ws_idle, ws_age = ws_reuse_summary(args.hours)
+    ws_lanes = ws_lane_rows(rows_)
+    print('ws reuse     cross-turn: %d attempts, %d failed (events: %d reuse, %d ok, %d fail, %d breaker)'
+          % (ws_lanes.get('cross-turn', {}).get('n', 0), ws_lanes.get('cross-turn', {}).get('fail', 0),
+             ws_events.get('cross-turn-reuse', 0), ws_events.get('cross-turn-ok', 0),
+             ws_events.get('cross-turn-fail', 0), ws_events.get('cross-turn-breaker-open', 0)))
     if not found and not cuts and not link_entries and not latch:
         print('    nothing to report yet: no findings, no cut streams, no slow turns recorded')
     return 0
@@ -179,4 +258,3 @@ def main():
 
 if __name__ == '__main__':
     raise SystemExit(main())
-

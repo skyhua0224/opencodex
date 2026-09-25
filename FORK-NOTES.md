@@ -125,6 +125,50 @@ ocx setup               # then: ocx start
 - **`ocx-tiers`** gained `--links` and `--latency`, and its default view ends with a link/latency summary
   (including which lanes changed their affinity pair mid-conversation).
 
+### 8. Cross-turn socket reuse, and the two bugs that hid it (2026-09-25)
+
+The WebSocket lane has always pooled sockets, but the pool could only ever hand one back to a **resend
+inside the same turn**: the reuse identity hashed the turn id, so the next turn of a conversation keyed a
+different socket and the previous one just idled until it expired. Cross-turn reuse keys the same socket
+for the rest of the conversation instead, which is as close as this relay gets to the "one long-lived
+session" that third-party gateways advertise.
+
+- **What changed.** `codexWsReuseIdentity` (`src/server/responses/codex-ws-pool.ts`) drops the turn from
+  the scope and the key while cross-turn reuse is on, and emits a lease that says whether the socket came
+  from an earlier turn. Idle/max-age windows for such a socket are 60 s / 10 min instead of 30 s / 5 min.
+- **Two guards, because a reused socket is a new failure mode.** A reused socket that answers the new turn
+  with a verdict instead of a response settles a **replayable 502** (`codexWsReusedSocketFailure`) -- the
+  caller's capacity ladder then re-dials a fresh socket, which is the lifecycle this lane is proven with.
+  A reused socket that answers with **nothing** is abandoned inside 8 s (`CODEX_WS_CROSS_TURN_FIRST_FRAME_MS`)
+  rather than waiting out the shared 90 s prelude bound; a fresh socket keeps the old patience.
+- **A breaker on the experiment itself.** The last 8 reused-socket outcomes are tracked; 4 or more samples
+  with more than half failing pauses cross-turn reuse for 30 min and the lane silently returns to one
+  socket per turn. Cross-turn reuse is **off by default**: `OCX_WS_CROSS_TURN_REUSE=1` opts in, and
+  `OCX_WS_CROSS_TURN_FIRST_FRAME_MS` moves the deadline.
+- **Why it is off by default.** Measured the same day: while the official origin was taking 17-76 s to
+  produce its first content (queueMs ~20 ms -- our side was idle), the 8 s first-frame deadline could not
+  tell a socket the origin had retired from an origin that was merely slow, so it abandoned sockets that
+  would have answered and cost those turns 8 s + the ladder's first rung. Setting the deadline above the
+  origin's own latency would defeat its purpose, and the per-turn lifecycle never has to make the call.
+  The layer that pays off unconditionally is the same-turn half: a retry now reuses the socket the
+  previous attempt left behind.
+- **Measured, before and after.** Controlled turns on one conversation reused the socket across 15 s and
+  35 s of idle with a 327 ms / 252 ms first frame. Real Codex traffic did not reuse at all, and the two
+  reasons are worth recording:
+  1. The client's `x-oai-attestation` header is **~4170 bytes**, past the 4 KiB per-field bound the identity
+     inherited from the response-id validator -- so every real turn was refused and dialled a one-shot
+     socket. Long fields are now hashed into the key instead of rejected.
+  2. The same attestation is **refreshed per attempt**: two attempts of one turn, identical
+     `x-client-request-id`, and the attestation differed. A key that read it could never match twice, so
+     `x-oai-attestation` and `x-client-request-id` are now per-request headers the identity ignores.
+  After both fixes, real traffic reuses: a working conversation's retries went from a fresh dial each time
+  to 6 of 8 attempts landing on the retained socket, with the previous turn's socket still in hand.
+- **Evidence and switches.** `~/.opencodex/ws-reuse.jsonl` records every reuse, its idle/age, the outcome,
+  and (with `OCX_WS_REUSE_DEBUG=1`) the identity's inputs and the pool's retention decisions -- header
+  names only, values hashed, never raw. `usage.jsonl`'s per-attempt stage record gained a `crossTurn`
+  flag, so `ocx-tiers --wsreuse` reports the three WebSocket lanes side by side: fresh, resend inside a
+  turn, and cross-turn, each with its failure rate and its first-frame / first-output medians.
+
 ## Credential note (why GitHub push protection complains)
 
 The file src/oauth/google-antigravity.ts ships the Antigravity desktop client public OAuth

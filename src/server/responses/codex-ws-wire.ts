@@ -94,6 +94,12 @@ export type CodexWsStageRecord = Omit<CodexWsFailureStage, "requestBytes"> & {
   closeCode: number | null;
   /** True when the exchange ran on a pooled, previously used session. */
   reused: boolean;
+  /**
+   * True when that pooled session was opened by an EARLIER turn of the same conversation, i.e. the
+   * exchange ran on the cross-turn half of the pool. Persisted so the two halves of the lane can be
+   * compared on failures and first bytes instead of being argued about.
+   */
+  crossTurn: boolean;
   /** OpenCodex version that produced this record. */
   ocxVersion: string;
   /** Bun runtime version the exchange gated on. */
@@ -168,6 +174,27 @@ export function codexWsCapacityDeclineFailure(status: 502 | 503, message: string
   return new Response(JSON.stringify({
     error: { type: "server_error", code: "server_is_overloaded", message },
   }), { status, headers });
+}
+
+/** A socket that was reused for a later turn did not serve it. */
+export const CODEX_WS_REUSED_SOCKET_CODE = "reused_socket_declined";
+
+/**
+ * The settlement for a reused socket that answered the new turn with a verdict, or with nothing.
+ *
+ * Not the overload shape {@link codexWsCapacityDeclineFailure} carries: the socket, not the origin's
+ * capacity, is what failed here, and a decline that said nothing about capacity must not be counted
+ * as one. It IS replayable, exactly like the capacity decline -- the whole point of giving up on a
+ * reused socket is that the caller's ladder immediately re-dials a fresh one, which is the path
+ * that has always worked.
+ */
+export function codexWsReusedSocketFailure(message: string, prelude: Headers): Response {
+  const headers = new Headers(prelude);
+  headers.set("content-type", "application/json");
+  headers.set("cache-control", "no-store");
+  return new Response(JSON.stringify({
+    error: { type: "upstream_error", code: CODEX_WS_REUSED_SOCKET_CODE, message },
+  }), { status: 502, headers });
 }
 
 const CLOSED_BEFORE_TERMINAL = "codex websocket closed before a Responses terminal event";

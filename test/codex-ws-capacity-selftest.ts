@@ -11,8 +11,22 @@
  * Also checks that a decline stated as \`response.failed\` is recognised, which the older absorb
  * was not: that is why it never reached rung 2 in production (12 of 12 stops at rung 1).
  *
- * Run: bun ~/.opencodex/tools/codex-ws-capacity-selftest.ts
+ * Cases F-I cover cross-turn reuse: a socket handed to a LATER turn of the same conversation may
+ * not serve it, and that must never reach the client as an error. A reused socket that answers with
+ * a verdict settles a REPLAYABLE 502 (F); one that answers with nothing at all is abandoned inside
+ * its own deadline instead of the shared 90s bound (G); a fresh socket keeps the old behaviour (H).
+ *
+ * Run: bun test/codex-ws-capacity-selftest.ts
  */
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// Evidence rows must not land in the operator's real ledger, and the cross-turn first-frame
+// deadline is shortened so the silence case is a test, not a wait.
+process.env.OPENCODEX_HOME = mkdtempSync(join(tmpdir(), "ocx-ws-capacity-"));
+process.env.OCX_WS_CROSS_TURN_FIRST_FRAME_MS = "600";
+
 const PKG = new URL("../src", import.meta.url).pathname.replace(/\/$/, "");
 const { codexWsExchange } = await import(PKG + "/server/responses/codex-ws-exchange.ts");
 const { CODEX_RESPONSES_HTTP_URL } = await import(PKG + "/server/responses/codex-ws-request.ts");
@@ -50,7 +64,7 @@ function fakeSocket() {
   return socket;
 }
 
-function fakeSession(socket: ReturnType<typeof fakeSocket>) {
+function fakeSession(socket: ReturnType<typeof fakeSocket>, crossTurn = false) {
   return {
     socket,
     opened: true,
@@ -58,6 +72,7 @@ function fakeSession(socket: ReturnType<typeof fakeSocket>) {
     busy: true,
     retainable: false,
     reused: false,
+    crossTurnReuse: crossTurn,
     reserve: () => true,
     bindOwner: () => () => {},
     dispose() { socket.close(); },
@@ -77,10 +92,12 @@ const EVENT = {
   completed: (id: string) => text({ type: "response.completed", response: { id, status: "completed", output: [] } }),
 };
 
-async function run(script: (socket: ReturnType<typeof fakeSocket>) => void | Promise<void>) {
+/** Start one exchange against a fake socket without waiting for it to settle. */
+function started(crossTurn = false) {
   const socket = fakeSocket();
+  let settled = false;
   const pending = codexWsExchange({
-    session: fakeSession(socket) as never,
+    session: fakeSession(socket, crossTurn) as never,
     url: CODEX_RESPONSES_HTTP_URL,
     init: { method: "POST" },
     prepared: {
@@ -92,6 +109,12 @@ async function run(script: (socket: ReturnType<typeof fakeSocket>) => void | Pro
     sseFallback: (async () => new Response("fallback", { status: 500 })) as never,
     bunVersion: "1.4.0-selftest",
   });
+  void pending.then(() => { settled = true; }, () => { settled = true; });
+  return { socket, pending, settled: () => settled };
+}
+
+async function run(script: (socket: ReturnType<typeof fakeSocket>) => void | Promise<void>, crossTurn = false) {
+  const { socket, pending } = started(crossTurn);
   const scriptDone = Promise.resolve(script(socket));
   const response = await pending;
   let relayed = "";
@@ -171,6 +194,35 @@ const e = await run((socket) => {
 check("E: a pre-content close settles as 502", e.status === 502, "status=" + e.status);
 check("E: that 502 is REPLAYABLE (the ladder may re-dial)", e.nonReplayable === false);
 check("E: the client saw nothing", e.relayed === "");
+
+// F: a socket reused for a LATER turn refuses this one -> replayable 502, and the refusal never
+// reaches the client. On a fresh socket the same frame is forwarded (case C above) because there
+// the verdict is the turn's own answer; here it means the socket will not serve the turn at all.
+const f = await run((socket) => {
+  socket.emit("message", { data: EVENT.created("resp_1") });
+  socket.emit("message", { data: EVENT.otherError });
+}, true);
+check("F: a reused socket that refuses settles a 502", f.status === 502, "status=" + f.status);
+check("F: that 502 is REPLAYABLE (the ladder may re-dial a fresh socket)", f.nonReplayable === false);
+check("F: the refusal never reaches the client", f.relayed === "");
+
+// G: a reused socket that answers with NOTHING is given up on inside its own deadline, not the
+// shared 90s bound. Nothing was relayed, so the settle is replayable.
+const g = await run(() => { /* the socket says nothing at all */ }, true);
+check("G: a silent reused socket settles a 502", g.status === 502, "status=" + g.status);
+check("G: that 502 is REPLAYABLE", g.nonReplayable === false);
+check("G: the client saw nothing", g.relayed === "");
+
+// H: the same silence on a FRESH socket keeps the old patience -- the deadline belongs to reused
+// sockets only, and a slow origin must not be cut off by it.
+const h = started(false);
+await sleep(1200);
+check("H: a fresh socket is not abandoned on the cross-turn deadline", h.settled() === false);
+h.socket.emit("message", { data: EVENT.created("resp_1") });
+h.socket.emit("message", { data: EVENT.delta });
+h.socket.emit("message", { data: EVENT.completed("resp_1") });
+const hResponse = await h.pending;
+check("H: and it still completes normally", hResponse.status === 200, "status=" + hResponse.status);
 
 console.log(failures === 0 ? "ALL CODEX-WS CAPACITY CHECKS PASSED" : failures + " CHECK(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

@@ -60,13 +60,22 @@ bun test/thread-affinity-selftest.ts
 - **`ocx-tiers`**, one command over `usage.jsonl` plus those ledgers: did the tier drop, was a model
   substituted, how many streams were cut for repetition, whether this lane ever sees the edge affinity
   cookies, and how a slow turn splits between our queue, the origin headers, the first content frame and
-  the tail (`--links`, `--latency`).
+  the tail (`--links`, `--latency`). `--wsreuse` puts the three WebSocket lanes side by side -- fresh,
+  resend inside a turn, cross-turn -- with failures and first-frame medians for each.
 - **Latency and link ledgers.** `~/.opencodex/cookie-link.jsonl` records every guarded request's cookie
   shape (names, counts and a hash of the affinity pair -- never a value), and `latency.jsonl` records
   turns at or above 20s with the segment split, so "the proxy feels slow" becomes attributable.
 - **A pre-content socket close is replayable.** When the WebSocket lane dies before any frame has been
   relayed, the failure is settled as a resendable status instead of the non-replayable one, so the
   capacity ladder re-dials a fresh socket. The ambiguous marker now only applies once frames are out.
+- **The socket pool actually reaches the origin.** Two bugs kept the WebSocket pool from ever seeing a real
+  turn: the client's ~4 KiB rotating `x-oai-attestation` exceeded the per-field bound the identity inherited
+  from the response-id validator, and per-request headers (attestation, client request id) were part of the
+  socket key, so no two attempts could agree on one socket. Long fields are hashed into the key and the
+  per-request headers are ignored; a conversation's retries now land on the socket the previous attempt left
+  behind. Reusing that socket for the *next* turn is available and **off by default**
+  (`OCX_WS_CROSS_TURN_REUSE=1`), because a deadline that cannot distinguish a retired socket from a slow
+  origin costs more than it saves on days the origin answers in tens of seconds.
 - **Quota the panel knows and the API does not.** Panel-family subscriptions feed the router:
   custom windows, epoch-second reset stamps, and `>= 100%` means exhausted.
 - **Model catalog and management surface** for the `gpt-6` family and the provider fields the

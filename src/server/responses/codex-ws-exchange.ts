@@ -8,11 +8,12 @@ import { CodexWsMetadata, type CodexWsQuotaObserver } from "./codex-ws-metadata"
 import { CODEX_RESPONSES_HTTP_URL, type PreparedCodexWsRequest } from "./codex-ws-request";
 import { CodexWsCorrelation } from "./codex-ws-correlation";
 import type { CodexWsSession } from "./codex-ws-session";
+import { codexWsCrossTurnFirstFrameMs, noteCodexWsCrossTurnResult } from "./codex-ws-pool";
 import { isOverloadVerdictText } from "../ws-thread-transport";
 import { UPGRADE_DEADLINE_MS, CODEX_WS_LIVENESS_PING_INTERVAL_MS, CODEX_WS_RESPONSE_PRELUDE_TIMEOUT_MS, MAX_CODEX_WS_FRAME_BYTES,
   MAX_CODEX_WS_QUEUE_BYTES, markCodexWsResponse, normalizeResponsesWsRelayEvent, closedBeforeTerminalMessage,
   codexWsCreateFrameExceedsLimit, codexWsFailureDetail, codexWsPreResponseFailure, markCodexWsStage, codexWsOcxVersion,
-  codexWsCapacityDeclineFailure,
+  codexWsCapacityDeclineFailure, codexWsReusedSocketFailure,
   type CodexWsFailureStage, type CodexWsStageRecord } from "./codex-ws-wire";
 
 interface ExchangeOptions {
@@ -180,6 +181,8 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
     let absorbTimer: ReturnType<typeof setTimeout> | undefined;
     const heldPrelude: Uint8Array[] = [];
     let preludeHoldTimer: ReturnType<typeof setTimeout> | undefined;
+    /** Deadline for the FIRST inbound frame on a socket that was reused for a later turn. */
+    let firstFrameTimer: ReturnType<typeof setTimeout> | undefined;
     let sentAt: number | null = null;
     let firstFrameAt: number | null = null;
     // Numeric close code for the durable stage record; the reason string stays
@@ -189,6 +192,11 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
     const encoder = new TextEncoder();
     const metadata = url === CODEX_RESPONSES_HTTP_URL ? new CodexWsMetadata(onQuota) : null;
     const correlation = session.retainable ? new CodexWsCorrelation(session.reused, id => session.hasCompleted(id)) : null;
+    // The cross-turn half of the pool: this socket already served an earlier turn of the same
+    // conversation. Everything it adds is bounded by what the per-turn lifecycle already does --
+    // the only new failure mode is a socket the origin has retired but not closed, and that one is
+    // answered with a deadline (below) plus a REPLAYABLE settle, never with a stalled turn.
+    const crossTurn = session.crossTurnReuse === true;
     let detachOwner = () => {};
     let detachSteering = () => {};
     let continuationBase: Record<string, unknown> | undefined;
@@ -216,6 +224,7 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
       clearTimeout(pingTimer);
       clearTimeout(absorbTimer);
       clearTimeout(preludeHoldTimer);
+      clearTimeout(firstFrameTimer);
       signal?.removeEventListener("abort", onAbort);
       metadata?.finish();
       correlation?.finish();
@@ -263,9 +272,21 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
       pongs,
       closeCode,
       reused: session.reused,
+      crossTurn,
       ocxVersion: codexWsOcxVersion(),
       bunVersion: bunVersion ?? "unknown",
     });
+
+    /** Attribution for the cross-turn experiment: durations, a reason, a close code. No ids. */
+    const crossTurnNote = (ok: boolean, reason: string): void => {
+      if (!crossTurn) return;
+      noteCodexWsCrossTurnResult(ok, {
+        reason,
+        firstFrameMs: sentAt !== null && firstFrameAt !== null ? Math.max(0, firstFrameAt - sentAt) : null,
+        elapsedMs: sentAt !== null ? Math.max(0, Date.now() - sentAt) : null,
+        closeCode,
+      });
+    };
 
     const commitResponse = () => {
       if (responseCommitted) return;
@@ -339,6 +360,9 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
         const failureResponse = replayable
           ? codexWsCapacityDeclineFailure(502, message, prelude)
           : codexWsPreResponseFailure(status, message, prelude);
+        // A reused socket that died before it said anything is the cross-turn experiment failing,
+        // not the lane: one sample for the breaker, and the ladder below re-dials a fresh socket.
+        if (!signal?.aborted) crossTurnNote(false, "pre-content-failure");
         if (replayable) {
           console.warn(
             "[codex-ws] socket closed before any frame was relayed - settling a replayable "
@@ -361,6 +385,50 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
       if (committedResponse) {
         markCodexWsStage(committedResponse, stageRecord(Buffer.byteLength(frameText, "utf8")));
       }
+    };
+
+    /**
+     * Give up on a socket that was reused for this turn, before anything reached the client.
+     *
+     * Two shapes land here: a reused socket that answered with a verdict instead of a response, and
+     * one that answered with nothing at all within {@link codexWsCrossTurnFirstFrameMs}. Both mean
+     * the same thing to the caller -- this socket will not serve this turn -- and both are settled
+     * the same way, as a REPLAYABLE 502, because the held prelude proves not one byte was relayed.
+     * The caller's capacity ladder then re-dials a FRESH socket, which is the lifecycle the lane is
+     * proven with. Nothing about the turn itself is decided here.
+     */
+    const abandonReusedSocket = (reason: string, verdict: string): void => {
+      if (terminal || responseCommitted || !metadata) return;
+      terminal = true;
+      crossTurnNote(false, reason);
+      cleanup();
+      try { controller?.close(); } catch { /* unused stream already closed */ }
+      session.dispose();
+      const message = "codex websocket reused socket did not serve this turn (" + reason + ")"
+        + (verdict ? ": " + verdict : "");
+      console.warn(
+        "[codex-ws] " + message.slice(0, 160)
+        + " - settling a replayable 502 so the ladder re-dials a fresh socket",
+      );
+      const failureResponse = codexWsReusedSocketFailure(message, metadata.snapshot());
+      markCodexWsStage(failureResponse, stageRecord(Buffer.byteLength(frameText, "utf8")));
+      resolve(failureResponse);
+    };
+
+    /**
+     * A reused socket has to prove it is alive, not merely writable: the failure this deadline
+     * exists for is a socket the origin retired without closing, which accepts the frame and then
+     * says nothing. On a socket that was already open this is a cheap question (fresh-socket
+     * first-frame p50 is ~1.2s), and giving up early costs one ladder rung instead of a turn.
+     */
+    const armFirstFrameDeadline = () => {
+      if (!crossTurn || !metadata) return;
+      clearTimeout(firstFrameTimer);
+      firstFrameTimer = setTimeout(() => {
+        firstFrameTimer = undefined;
+        if (terminal || received || responseCommitted) return;
+        abandonReusedSocket("no frame within " + codexWsCrossTurnFirstFrameMs() + "ms", "");
+      }, codexWsCrossTurnFirstFrameMs());
     };
 
     /** (Re)start the silence bound; every inbound frame or pong is proof of life. */
@@ -541,12 +609,15 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
       else if (!responseCommitted && !terminal) {
         armSilence();
         schedulePing();
+        armFirstFrameDeadline();
       }
     };
 
     const onMessage = (event: MessageEvent) => {
       if (!controller || terminal) return;
       received = true;
+      clearTimeout(firstFrameTimer);
+      firstFrameTimer = undefined;
       if (!responseCommitted) armSilence();
       upstreamFrames += 1;
       if (firstFrameAt === null) firstFrameAt = Date.now();
@@ -604,6 +675,7 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
             catch (error) { failStream(error); return; }
             if (rejection) {
               terminal = true;
+              crossTurnNote(true, "refused-create-4xx");
               cleanup();
               try { controller.close(); } catch { /* unused stream already closed */ }
               session.dispose();
@@ -611,6 +683,18 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
               return;
             }
           }
+        }
+        // A reused socket that answers the new turn with a verdict instead of a response is not
+        // serving that turn. Whatever the verdict means upstream, the client-visible answer is the
+        // replayable one: nothing has been relayed, and the ladder's next rung is a FRESH socket --
+        // the lifecycle this lane is proven with. The verdict's own words stay in the message, so a
+        // genuine overload is still recognisable as one.
+        const reusedSocketVerdict = crossTurn && metadata != null && sent && !responseCommitted
+          && contentEvents === 0 && !nativeControl
+          && (type === "error" || CONTENT_FREE_TERMINALS.has(type));
+        if (reusedSocketVerdict) {
+          abandonReusedSocket("pre-content " + type, errorVerdictText(normalized.payload).trim().slice(0, 120));
+          return;
         }
         // A decline the backend stated outright, before anything was relayed: settle it as a
         // REPLAYABLE 503 instead of dragging it into the client's stream.
@@ -725,6 +809,9 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
         && !CONTENT_FREE_TERMINALS.has(type)) contentEvents += 1;
       if (nativeControl ? steeringEnded : (type === "response.completed" || type === "response.failed" || type === "response.incomplete" || type === "error")) {
         const completedId = correlation?.completed(normalized.payload) ?? null;
+        // The reused socket served this turn: it asked for a response and got a terminal answer,
+        // and every relayed content event is proof it carried real output.
+        crossTurnNote(type === "response.completed" || contentEvents > 0, "terminal:" + type);
         terminal = true;
         cleanup();
         try { controller.close(); } catch { /* already closed */ }

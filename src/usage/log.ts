@@ -761,6 +761,9 @@ function normalizeCodexWsStageRecord(value: unknown): CodexWsStageRecord | undef
     return undefined;
   }
   if (typeof stage.sent !== "boolean" || typeof stage.reused !== "boolean") return undefined;
+  // Written by every build from 2.63.0-skyhua.2 on; absent means the row predates cross-turn
+  // reuse, which is the same thing as `false`. A present non-boolean drops the record.
+  if (stage.crossTurn !== undefined && typeof stage.crossTurn !== "boolean") return undefined;
   if (typeof stage.ocxVersion !== "string" || !stage.ocxVersion || stage.ocxVersion.length > 32) return undefined;
   if (typeof stage.bunVersion !== "string" || !stage.bunVersion || stage.bunVersion.length > 32) return undefined;
   return {
@@ -775,6 +778,7 @@ function normalizeCodexWsStageRecord(value: unknown): CodexWsStageRecord | undef
     pongs: stage.pongs as number,
     closeCode: stage.closeCode as number | null,
     reused: stage.reused,
+    crossTurn: stage.crossTurn === true,
     ocxVersion: stage.ocxVersion,
     bunVersion: stage.bunVersion,
   };
