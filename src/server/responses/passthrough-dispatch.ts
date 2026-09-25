@@ -195,6 +195,9 @@ function applyResponseGuards(
     model: string;
     configuredTier: string | undefined;
     comboAttempt: boolean;
+    /** Marks for the latency ledger, and whether the client sent a Cookie header. */
+    timing?: { dispatchStartedAt: number; sendStartedAt: number } | undefined;
+    clientSentCookie?: boolean | undefined;
     logCtx: { upstreamError?: string };
   },
 ): Response {
@@ -208,6 +211,9 @@ function applyResponseGuards(
     });
   }
   return withResponseAttestation(guarded, {
+    transport: isCodexWsUpstreamResponse(guarded) ? "ws" : "http",
+    timing: ctx.timing,
+    clientSentCookie: ctx.clientSentCookie,
     requestedModel: ctx.model,
     configuredTier: ctx.configuredTier,
     provider: ctx.provider,
@@ -281,6 +287,8 @@ export async function preparePassthroughExchange(
   >,
 ) {
   const { config, logCtx, options, req } = requestContext;
+  /** Marks for the latency ledger: entry, then just before the upstream send. */
+  const dispatchStartedAt = Date.now();
   const {
     route,
     toolBridgeMaps,
@@ -918,6 +926,7 @@ export async function preparePassthroughExchange(
       // Transient-5xx pre-stream retry (devlog/_plan/260716_claudecode_hardening/010):
       // the ChatGPT backend emits transient 502/520s that an immediate retry absorbs.
       // Body is a replayable string; nothing has streamed to the client yet.
+      const sendStartedAt = Date.now();
       upstreamResponse = await fetchWithTransientRetry(
         recovery => {
           // The pool-wide recovery window measures recovery traffic against observed demand,
@@ -969,6 +978,8 @@ export async function preparePassthroughExchange(
         },
       );
       upstreamResponse = applyResponseGuards(upstreamResponse, {
+        clientSentCookie: req.headers.has("cookie"),
+        timing: { dispatchStartedAt, sendStartedAt },
         lane: conversationKeyFromHeaders(req.headers),
         provider: route.providerName,
         model: route.modelId,

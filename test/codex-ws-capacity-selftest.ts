@@ -161,5 +161,16 @@ const d = await run((socket) => {
 check("D: prelude + content both reach the client", d.relayed.includes("response.created") && d.relayed.includes("hello"));
 check("D: stream carries the terminal event", d.relayed.includes("response.completed"));
 
+
+// E: the socket dies after the prelude but before anything was relayed -> the settle is
+// REPLAYABLE, so the caller's ladder re-dials instead of the client seeing a failed turn.
+const e = await run((socket) => {
+  socket.emit("message", { data: EVENT.created("resp_1") });
+  socket.emit("close", { code: 1006, reason: "Connection ended" });
+});
+check("E: a pre-content close settles as 502", e.status === 502, "status=" + e.status);
+check("E: that 502 is REPLAYABLE (the ladder may re-dial)", e.nonReplayable === false);
+check("E: the client saw nothing", e.relayed === "");
+
 console.log(failures === 0 ? "ALL CODEX-WS CAPACITY CHECKS PASSED" : failures + " CHECK(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

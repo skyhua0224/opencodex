@@ -57,8 +57,16 @@ bun test/thread-affinity-selftest.ts
   one requested, answers on a lower service tier than the one configured, or announces a safety
   buffer that can serve the turn on a faster model, that lands in `~/.opencodex/model-attestation.jsonl`
   and on the log. Nothing is rewritten and nothing errors.
-- **`ocx-tiers`**, one command over `usage.jsonl` plus that ledger: did the tier drop, was a model
-  substituted, how many streams were cut for repetition.
+- **`ocx-tiers`**, one command over `usage.jsonl` plus those ledgers: did the tier drop, was a model
+  substituted, how many streams were cut for repetition, whether this lane ever sees the edge affinity
+  cookies, and how a slow turn splits between our queue, the origin headers, the first content frame and
+  the tail (`--links`, `--latency`).
+- **Latency and link ledgers.** `~/.opencodex/cookie-link.jsonl` records every guarded request's cookie
+  shape (names, counts and a hash of the affinity pair -- never a value), and `latency.jsonl` records
+  turns at or above 20s with the segment split, so "the proxy feels slow" becomes attributable.
+- **A pre-content socket close is replayable.** When the WebSocket lane dies before any frame has been
+  relayed, the failure is settled as a resendable status instead of the non-replayable one, so the
+  capacity ladder re-dials a fresh socket. The ambiguous marker now only applies once frames are out.
 - **Quota the panel knows and the API does not.** Panel-family subscriptions feed the router:
   custom windows, epoch-second reset stamps, and `>= 100%` means exhausted.
 - **Model catalog and management surface** for the `gpt-6` family and the provider fields the

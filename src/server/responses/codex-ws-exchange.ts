@@ -318,7 +318,33 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
         try { controller?.close(); } catch { /* unused stream already closed */ }
         session.dispose();
         const message = error instanceof Error ? error.message : String(error);
-        const failureResponse = codexWsPreResponseFailure(status, message, prelude);
+        /**
+         * A socket that died before ANYTHING was relayed is a resendable failure, not an ambiguous
+         * one: the prelude is still held, so the client has not even been told the response started,
+         * and the caller's capacity ladder can re-dial a fresh socket (5s/12s/25s/45s) exactly as it
+         * does for a decline. Only once frames have gone out does a dead socket become the ambiguous
+         * case the non-replayable marker exists for.
+         *
+         * This closes the last class of client-visible capacity failures: measured 2026-09-24/25,
+         * "codex websocket closed before a Responses terminal event (close 1006)" arrived after a
+         * prelude that never reached the client, and the turn was reported as failed instead of
+         * retried.
+         */
+        // responseCommitted === false IS the proof that nothing reached the client: every
+        // content-shaped frame flushes the held prelude and commits first, so an uncommitted
+        // response can only carry frames the client has never seen. Steering sessions keep the
+        // conservative marker -- their frames are continuations whose replay rules belong to the
+        // steering channel, not to this one.
+        const replayable = !nativeControl;
+        const failureResponse = replayable
+          ? codexWsCapacityDeclineFailure(502, message, prelude)
+          : codexWsPreResponseFailure(status, message, prelude);
+        if (replayable) {
+          console.warn(
+            "[codex-ws] socket closed before any frame was relayed - settling a replayable "
+            + status + " so the retry ladder re-dials (" + message.slice(0, 80) + ")",
+          );
+        }
         markCodexWsStage(failureResponse, stageRecord(Buffer.byteLength(frameText, "utf8")));
         resolve(failureResponse);
         return;

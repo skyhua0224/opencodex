@@ -106,6 +106,25 @@ ocx setup               # then: ocx start
   `src/server/responses/passthrough-dispatch.ts`), and the degenerate half skips combo attempts, which
   have their own guard.
 
+### 7. Link, latency and the pre-content close (2026-09-25)
+
+- **A pre-content socket close is now replayable.** `failStream` in `src/server/responses/codex-ws-exchange.ts`
+  used to settle every post-send pre-commit failure with the non-replayable marker, which meant a socket that
+  died after the prelude but before any frame reached the client reported a failed turn. Because the prelude
+  hold guarantees that an uncommitted response carries nothing the client has seen, that case now settles a
+  resendable 502 and the capacity ladder re-dials. Steering sessions keep the conservative marker.
+- **Cookie link.** `observeCookieLink` (`src/lib/response-attestation.ts`) writes one row per guarded request to
+  `~/.opencodex/cookie-link.jsonl`: transport, whether the client sent a Cookie header, how many Set-Cookie
+  headers came back, their names, and a 12-char hash of the load-balancer affinity pair when present. Values are
+  never written. Measured on this deployment: 46 requests, **0 with the affinity pair, 0 where the client sent
+  one, 0 Set-Cookie headers at all** -- so the cookie-routing lever some third-party gateways use is not
+  available on this lane, and node placement stays with the load balancer.
+- **Latency split.** `recordSlowTurn` writes turns at or above 20s to `~/.opencodex/latency.jsonl` with
+  queueMs (our prep/admission before the send), headersMs (send -> upstream response), firstContentMs
+  (send -> first content frame) and totalMs, plus one `[latency]` warning line.
+- **`ocx-tiers`** gained `--links` and `--latency`, and its default view ends with a link/latency summary
+  (including which lanes changed their affinity pair mid-conversation).
+
 ## Credential note (why GitHub push protection complains)
 
 The file src/oauth/google-antigravity.ts ships the Antigravity desktop client public OAuth

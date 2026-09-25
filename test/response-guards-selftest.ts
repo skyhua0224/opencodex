@@ -15,7 +15,7 @@ import { join } from "node:path";
 process.env.OPENCODEX_HOME = mkdtempSync(join(tmpdir(), "ocx-guards-selftest-"));
 const PKG = new URL("../src", import.meta.url).pathname.replace(/\/$/, "");
 const { guardNativeDegenerateOutput } = await import(PKG + "/server/responses/combo-degenerate-output.ts");
-const { withResponseAttestation, attestationLedgerPath } = await import(PKG + "/lib/response-attestation.ts");
+const { withResponseAttestation, attestationLedgerPath, cookieLinkLedgerPath, latencyLedgerPathForTests } = await import(PKG + "/lib/response-attestation.ts");
 
 let failures = 0;
 function check(label: string, ok: boolean, detail = "") {
@@ -114,6 +114,38 @@ const healthyOut = await readAll(withResponseAttestation(
 ));
 check("healthy: nothing recorded", ledger().length === before, "entries=" + (ledger().length - before));
 check("healthy: body intact", healthyOut.includes("hello") && healthyOut.includes("response.completed"));
+
+
+// 6. The link ledger records the affinity pair by NAME and hash, never by value.
+const linkResponse = streamResponse([created("gpt-6-sol"), completed("gpt-6-sol")], {
+  "set-cookie": "__cf" + "lb=AAA-secret-value; Path=/; HttpOnly",
+});
+linkResponse.headers.append("set-cookie", "__oai" + "lb=BBB-secret-value; Path=/");
+linkResponse.headers.append("set-cookie", "not-a-routing-cookie=1");
+await readAll(withResponseAttestation(linkResponse, {
+  requestedModel: "gpt-6-sol", provider: "openai", lane: "lane-link", clientSentCookie: true,
+}));
+const linkText = readFileSync(cookieLinkLedgerPath(), "utf8").trim();
+const link = JSON.parse(linkText.split("\n").pop()!);
+check("link: affinity pair names recorded", Array.isArray(link.routingNames) && link.routingNames.length === 2, JSON.stringify(link.routingNames));
+check("link: a stable pair tag is recorded", typeof link.pairTag === "string" && link.pairTag.length === 12, String(link.pairTag));
+check("link: the client's own Cookie header is recorded", link.clientSentCookie === true);
+check("link: cookie VALUES never reach the ledger", !linkText.includes("secret-value"));
+
+// 7. A slow turn leaves a latency line with the caller's own marks.
+const now = Date.now();
+await readAll(withResponseAttestation(
+  streamResponse([created("gpt-6-sol"), delta("hello"), completed("gpt-6-sol")]),
+  {
+    requestedModel: "gpt-6-sol", provider: "openai", lane: "lane-slow", slowTurnMs: 1_000,
+    timing: { dispatchStartedAt: now - 30_000, sendStartedAt: now - 20_000 },
+  },
+));
+const latency = JSON.parse(readFileSync(latencyLedgerPathForTests(), "utf8").trim().split("\n").pop()!);
+check("latency: queue segment measured", latency.queueMs >= 9_000 && latency.queueMs <= 11_000, "queue=" + latency.queueMs);
+check("latency: headers segment measured", latency.headersMs >= 19_000, "headers=" + latency.headersMs);
+check("latency: first content marked", typeof latency.firstContentMs === "number");
+check("latency: outcome recorded", latency.outcome === "completed", String(latency.outcome));
 
 console.log(failures === 0 ? "ALL RESPONSE GUARD CHECKS PASSED" : failures + " CHECK(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);
