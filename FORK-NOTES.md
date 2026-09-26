@@ -133,7 +133,18 @@ different socket and the previous one just idled until it expired. Cross-turn re
 for the rest of the conversation instead, which is as close as this relay gets to the "one long-lived
 session" that third-party gateways advertise.
 
-- **What changed.** `codexWsReuseIdentity` (`src/server/responses/codex-ws-pool.ts`) drops the turn from
+- **The root cause, found by the wiring test.** The wrapper was DEAD CODE for the case it exists for.
+\`fetchWithTransientRetry\`'s loop opens with \`if (res.ok || ... ) return res;\`, so a 200 -- the only
+shape a decline-inside-a-body can have -- returned before the wrapper call at the bottom of the
+function was ever reached. The wrapper's own self-test passed because it called the wrapper directly;
+nothing tested that the real helper ever called it. That is why the log held no line from this path
+in its entire history: not a mis-recognised frame, an uncalled function. The wrapper now runs at the
+early return as well (\`wrapSseDeclineRetry\`), and
+\`test/upstream-retry-sse-wiring-selftest.ts\` drives the real helper with a stubbed fetch to keep it
+that way: the canonical opt-in path must turn one 200 refusal into two sends, and a caller without
+the opt-in must still get one send and the refusal unchanged.
+
+**What changed.** `codexWsReuseIdentity` (`src/server/responses/codex-ws-pool.ts`) drops the turn from
   the scope and the key while cross-turn reuse is on, and emits a lease that says whether the socket came
   from an earlier turn. Idle/max-age windows for such a socket are 60 s / 10 min instead of 30 s / 5 min.
 - **Two guards, because a reused socket is a new failure mode.** A reused socket that answers the new turn

@@ -767,6 +767,32 @@ export async function fetchWithTransientRetry(
   let sent = 0;
   /** Set once the opt-in extra send for a SLOW capacity verdict has been spent. */
   let slowCapacityRetryUsed = false;
+  /**
+   * Wrap a response whose 200 body may turn out to BE the decline.
+   *
+   * This has to run at every return point that can hand an ok response back, not only at the end
+   * of the transient loop. The loop's first statement returns immediately on `res.ok`, so for a
+   * year the wrapper below it was unreachable in exactly the case it was written for: measured
+   * 2026-09-26 09:28/09:38, two native turns carried `Our servers are currently overloaded` inside
+   * a 200 and the wrapper never logged a line because it was never called.
+   */
+  const wrapSseDeclineRetry = (candidate: Response): Response => {
+    if (opts.retrySsePreludeDecline !== true || capacityDelays.length === 0
+      || !candidate.ok || !candidate.body) return candidate;
+    return withSsePreludeDeclineRetry(candidate, {
+      delaysMs: capacityDelays,
+      label: opts.label,
+      signal: opts.abortSignal,
+      // The caller opted in because it knows this endpoint speaks the Responses event protocol, so a
+      // decline that arrives with a wrong or missing content-type must still be caught.
+      acceptAnyContentType: true,
+      resend: async () => {
+        // One more physical send, counted exactly like every send this helper owns.
+        opts.onSendsConsumed?.(1);
+        return await fetchWithResetRetry(countedFetch, innerResetOptions(1), "transient-5xx");
+      },
+    });
+  };
   const countedFetch: ReplayableFetch = (recovery) => {
     // Incremented BEFORE the await so a rejected send still consumes budget; counting only
     // successes would let a reset storm loop without bound.
@@ -799,7 +825,9 @@ export async function fetchWithTransientRetry(
   for (let attempt = 0; sent < totalBudget; attempt++) {
     // A non-replayable gateway status was settled after the request body had already left
     // for the origin; retrying it here is the automatic resend the marker exists to forbid.
-    if (res.ok || !isTransientUpstreamStatus(res.status) || isNonReplayableResponse(res)) return res;
+    if (res.ok || !isTransientUpstreamStatus(res.status) || isNonReplayableResponse(res)) {
+      return wrapSseDeclineRetry(res);
+    }
     // Checked before cancelResponseBodyBestEffort so an already-aborted caller never receives
     // a response whose body we just cancelled.
     if (opts.abortSignal?.aborted) return res;
@@ -883,28 +911,9 @@ export async function fetchWithTransientRetry(
       throw new UpstreamRetryEvidenceError(transientStatuses, err);
     }
   }
-  // A 200 whose body never produces content can still be a decline: the SSE lane has no status to
-  // react to, so the wrapper holds its prelude and splices a fresh attempt in when the backend says
-  // "overloaded" before any content. Only when the caller opted in and a ladder was supplied.
-  if (opts.retrySsePreludeDecline === true && capacityDelays.length > 0 && res.ok && res.body) {
-    return withSsePreludeDeclineRetry(res, {
-      delaysMs: capacityDelays,
-      label: opts.label,
-      signal: opts.abortSignal,
-      // The caller opted in because it knows this endpoint speaks the Responses event protocol, so a
-      // decline that arrives with a wrong or missing content-type must still be caught. Measured
-      // 2026-09-26 09:28/09:38: two native gpt-6-sol turns were shed and the wrapper never saw a
-      // frame -- it had bailed on the content-type check while the relay still parsed the body.
-      acceptAnyContentType: true,
-      resend: async () => {
-        // One more physical send, counted exactly like every send this helper owns.
-        opts.onSendsConsumed?.(1);
-        return await fetchWithResetRetry(countedFetch, innerResetOptions(1), "transient-5xx");
-      },
-    });
-  }
-  // Budget exhausted: the last response is returned with its body intact.
-  return res;
+  // Any remaining ok response goes through the same wrapper as the early return above (the helper
+  // is idempotent about the gate); a budget-exhausted 5xx is returned with its body intact.
+  return wrapSseDeclineRetry(res);
   } finally {
     opts.onSendsConsumed?.(sent);
   }
