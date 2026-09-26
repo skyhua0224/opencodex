@@ -379,6 +379,15 @@ capacity ladder only sees statuses, of which there were none -- the decline arri
   widening the content-type gate would otherwise have turned "wrapped a body that is not a stream" into
   a dropped answer (caught by the J case in the self-test, not in production).
 
+**Second catch, same day (10:01:04).** With the wrapper finally in the path it fired and refused:
+\`sse decline seen but not retried (content already delivered)\`. The turn had delivered no text
+(\`firstOutputMs\` null) -- what it had delivered was a STRUCTURAL frame, \`response.output_item.added\`,
+which the first version counted as content. Structural frames are now held alongside the prelude and
+only frames that carry something the user can see (any \`.delta\`/\`.done\`, the terminal events, and
+anything this module cannot classify) stop the retry. A healthy turn is unchanged apart from the
+ordering delay; a decline after \`output_item.added\` is now re-dialable, and the discarded attempt's
+item never reaches the client (self-test case K, with K2 pinning that delivered text still blocks).
+
 **Identity.** The 6-hour routing re-roll for that conversation was already armed by the 09:28 verdict
 (the persisted state proved the verdict path works for this shape); it did not stop the 09:38 shed, so
 the operator arm was written for the same key as an additional, immediate lever.

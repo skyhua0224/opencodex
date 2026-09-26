@@ -45,6 +45,30 @@ export interface SsePreludeDeclineRetryOptions {
 
 const PRELUDE_TYPES: ReadonlySet<string> = new Set(["response.created", "response.in_progress"]);
 
+/**
+ * Whether a frame carries something the user can see, which is what makes a resend impossible.
+ *
+ * The first version counted every non-prelude frame, so a shed that arrived after
+ * `response.output_item.added` was refused with "content already delivered" even though the client
+ * had no text at all: measured 2026-09-26 10:01:04, a 24.5s turn ended 503 with no first output and
+ * the wrapper logged exactly that. Structural frames are now HELD like the prelude, so a decline
+ * that follows them is still pre-delivery and the attempt can be re-dialled; the held frames are
+ * flushed in order the moment real content arrives, so a healthy turn is unchanged apart from a few
+ * milliseconds of ordering.
+ *
+ * Anything unrecognised counts as content: a frame this module cannot classify must never be
+ * thrown away on a guess.
+ */
+function isContentFrame(frameText: string, type: string | undefined): boolean {
+  if (type === undefined) return true;
+  if (type.endsWith(".delta") || type.endsWith(".done")) return true;
+  if (type === "response.completed" || type === "response.failed" || type === "response.incomplete") return true;
+  if (type === "error") return true;
+  // Structural frames (output_item.added, content_part.added, reasoning part markers, ...) are
+  // holdable; everything else in the response.* namespace is treated as payload-bearing.
+  return !(type.startsWith("response.") || type.startsWith("codex."));
+}
+
 function decodeFrame(frame: Uint8Array): string {
   return new TextDecoder().decode(frame);
 }
@@ -214,7 +238,10 @@ export function withSsePreludeDeclineRetry(
             buffer = buffer.slice(frameBytes.byteLength);
             const type = frameType(frameText);
             const decline = isDeclineFrame(frameText, type);
-            const prelude = type === undefined || PRELUDE_TYPES.has(type) || type.startsWith("codex.");
+            // Holdable = nothing the user can see yet: the prelude, the backend's codex.* control
+            // frames, and the structural frames that only describe a response being built.
+            const prelude = type !== undefined
+              && (PRELUDE_TYPES.has(type) || type.startsWith("codex.") || !isContentFrame(frameText, type));
             if (decline && (!(!contentSeen) || rung >= options.delaysMs.length)) {
               console.warn(
                 "[upstream-retry] sse decline seen but not retried ("

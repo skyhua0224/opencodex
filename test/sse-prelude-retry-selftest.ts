@@ -213,5 +213,35 @@ const j2Text = await readAll(j2);
 check("J2: an explicit JSON refusal is retried", resends === 1, "resends=" + resends);
 check("J2: and the client gets the recovered answer", j2Text.includes("recovered"));
 
+// K: the shape that reached production on 2026-09-26 10:01:04 -- a STRUCTURAL frame
+// (response.output_item.added) arrives first, then the capacity decline. Nothing the user can see
+// was delivered, so the attempt must still be re-dialled, and the discarded attempt's structural
+// frame must never be shown.
+resends = 0;
+const structural = frame({ type: "response.output_item.added", output_index: 0,
+  item: { id: "msg_1", type: "message", status: "in_progress", content: [] } });
+const k = withSsePreludeDeclineRetry(
+  sseResponse([created("r1"), structural, overloadEvent]),
+  {
+    delaysMs: [20],
+    resend: async () => { resends += 1; return sseResponse([created("r2"), delta("recovered"), completed("r2")]); },
+  },
+);
+const kText = await readAll(k);
+check("K: a decline after a structural frame is still retried", resends === 1, "resends=" + resends);
+check("K: the overload never reaches the client", !kText.includes("overloaded"));
+check("K: the discarded attempt's item is not shown", !kText.includes("output_item.added"));
+check("K: the second attempt's content arrives", kText.includes("recovered"));
+
+// K2: but once a TEXT delta has gone out, the rule still refuses to resend.
+resends = 0;
+const k2 = withSsePreludeDeclineRetry(
+  sseResponse([created("r1"), structural, delta("partial answer"), overloadEvent]),
+  { delaysMs: [20], resend: async () => { resends += 1; return sseResponse([delta("nope")]); } },
+);
+const k2Text = await readAll(k2);
+check("K2: text already delivered still blocks the resend", resends === 0, "resends=" + resends);
+check("K2: and the partial answer is delivered", k2Text.includes("partial answer"));
+
 console.log(failures === 0 ? "ALL SSE PRELUDE RETRY CHECKS PASSED" : failures + " CHECK(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);
