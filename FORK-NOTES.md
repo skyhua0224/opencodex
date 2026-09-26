@@ -388,6 +388,15 @@ anything this module cannot classify) stop the retry. A healthy turn is unchange
 ordering delay; a decline after \`output_item.added\` is now re-dialable, and the discarded attempt's
 item never reaches the client (self-test case K, with K2 pinning that delivered text still blocks).
 
+**Third catch, same evening (20:15:28 and 20:33:54).** After the structural-frame rule, two more
+503s arrived with \`firstOutputMs\` null -- and \`firstOutputFromParsed\` counts exactly three deltas
+(\`output_text\`, \`reasoning_summary_text\`, \`reasoning_text\`), so the client had received no text of
+any kind while the wrapper refused with "content already delivered". The frame that set that flag was
+an EMPTY \`response.output_item.done\` -- an item closed without text, arguments or a refusal. A \`.done\`
+frame now counts as content only when it carries payload (unparsable => assume payload); the refusal
+warning also names the frame that first counted, so the next refusal is self-documenting instead of
+requiring an investigation. Selftest cases L and L2 pin both directions.
+
 **Identity.** The 6-hour routing re-roll for that conversation was already armed by the 09:28 verdict
 (the persisted state proved the verdict path works for this shape); it did not stop the 09:38 shed, so
 the operator arm was written for the same key as an additional, immediate lever.

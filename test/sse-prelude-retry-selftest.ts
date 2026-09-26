@@ -243,5 +243,34 @@ const k2Text = await readAll(k2);
 check("K2: text already delivered still blocks the resend", resends === 0, "resends=" + resends);
 check("K2: and the partial answer is delivered", k2Text.includes("partial answer"));
 
+// L: the shape behind the 2026-09-26 20:15/20:33 failures -- the origin closes an item with an
+// EMPTY response.output_item.done, then sheds. No delta of any kind had arrived (the row's
+// firstOutputMs was null), so nothing was delivered and the attempt must be re-dialled.
+resends = 0;
+const emptyDone = frame({ type: "response.output_item.done", output_index: 0,
+  item: { id: "rs_1", type: "reasoning", status: "completed", content: [] } });
+const l = withSsePreludeDeclineRetry(
+  sseResponse([created("r1"), emptyDone, overloadEvent]),
+  {
+    delaysMs: [20],
+    resend: async () => { resends += 1; return sseResponse([created("r2"), delta("recovered"), completed("r2")]); },
+  },
+);
+const lText = await readAll(l);
+check("L: a decline after an EMPTY .done is retried", resends === 1, "resends=" + resends);
+check("L: the overload never reaches the client", !lText.includes("overloaded"));
+check("L: the second attempt answers", lText.includes("recovered"));
+
+// L2: a .done that DOES carry text still blocks the resend.
+resends = 0;
+const textDone = frame({ type: "response.output_text.done", output_index: 0, text: "already visible" });
+const l2 = withSsePreludeDeclineRetry(
+  sseResponse([created("r1"), textDone, overloadEvent]),
+  { delaysMs: [20], resend: async () => { resends += 1; return sseResponse([delta("nope")]); } },
+);
+const l2Text = await readAll(l2);
+check("L2: a payload-bearing .done still blocks the resend", resends === 0, "resends=" + resends);
+check("L2: and its text is delivered", l2Text.includes("already visible"));
+
 console.log(failures === 0 ? "ALL SSE PRELUDE RETRY CHECKS PASSED" : failures + " CHECK(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

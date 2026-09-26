@@ -61,7 +61,13 @@ const PRELUDE_TYPES: ReadonlySet<string> = new Set(["response.created", "respons
  */
 function isContentFrame(frameText: string, type: string | undefined): boolean {
   if (type === undefined) return true;
-  if (type.endsWith(".delta") || type.endsWith(".done")) return true;
+  if (type.endsWith(".delta")) return true;
+  // A .done frame is only content when it actually carries payload. An item that produced no
+  // deltas closes with an empty .done, and counting that as delivered content is what refused the
+  // retry on two turns whose client had received nothing at all: measured 2026-09-26 20:15:28 and
+  // 20:33:54, both 503 with firstOutputMs null, while the only .delta types that set that field
+  // (output_text, reasoning_summary_text, reasoning_text) had never arrived.
+  if (type.endsWith(".done")) return doneFrameCarriesPayload(frameText);
   if (type === "response.completed" || type === "response.failed" || type === "response.incomplete") return true;
   if (type === "error") return true;
   // Structural frames (output_item.added, content_part.added, reasoning part markers, ...) are
@@ -88,6 +94,48 @@ function frameType(text: string): string | undefined {
 function isCapacityDecline(text: string): boolean {
   const lower = text.toLowerCase();
   return lower.includes("overloaded") || lower.includes("capacity") || lower.includes("server_is_overloaded");
+}
+
+/**
+ * Whether a `*.done` frame carries any payload worth keeping.
+ *
+ * Read conservatively: an unparsable frame, or one this function does not understand, counts as
+ * payload-bearing, so the only frames it clears are the ones that provably describe nothing --
+ * an output item closed without text, arguments or a refusal.
+ */
+function doneFrameCarriesPayload(frameText: string): boolean {
+  const dataLine = frameText.split("\n").filter(line => line.startsWith("data:")).pop();
+  if (!dataLine) return true;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(dataLine.slice(5).trim());
+  } catch {
+    return true;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return true;
+  const event = parsed as Record<string, unknown>;
+  for (const key of ["text", "arguments", "delta", "output_text", "refusal"]) {
+    const value = event[key];
+    if (typeof value === "string" && value.length > 0) return true;
+  }
+  const item = event.item;
+  if (item && typeof item === "object" && !Array.isArray(item)) {
+    const record = item as Record<string, unknown>;
+    if (typeof record.arguments === "string" && record.arguments.length > 0) return true;
+    if (typeof record.text === "string" && record.text.length > 0) return true;
+    const content = record.content;
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        if (!part || typeof part !== "object" || Array.isArray(part)) continue;
+        const partRecord = part as Record<string, unknown>;
+        for (const key of ["text", "arguments", "refusal"]) {
+          const value = partRecord[key];
+          if (typeof value === "string" && value.length > 0) return true;
+        }
+      }
+    }
+  }
+  return false;
 }
 
 /**
@@ -144,6 +192,8 @@ export function withSsePreludeDeclineRetry(
       const held: Uint8Array[] = [];
       let released = false;
       let contentSeen = false;
+      /** Which frame first counted as delivered content: the evidence a refused retry needs. */
+      let firstContentType: string | undefined;
       let rung = 0;
       const emit = (frame: Uint8Array) => {
         try { controller.enqueue(frame); } catch { /* the client is gone */ }
@@ -245,7 +295,7 @@ export function withSsePreludeDeclineRetry(
             if (decline && (!(!contentSeen) || rung >= options.delaysMs.length)) {
               console.warn(
                 "[upstream-retry] sse decline seen but not retried ("
-                + (contentSeen ? "content already delivered" : "no rung left")
+                + (contentSeen ? "content already delivered: " + (firstContentType ?? "unparsed") : "no rung left")
                 + (options.label ? ", " + options.label : "") + ")",
               );
             }
@@ -258,7 +308,10 @@ export function withSsePreludeDeclineRetry(
               flushTimer ??= setTimeout(flushHeld, holdMs);
               continue;
             }
-            if (!contentSeen && !prelude) contentSeen = true;
+            if (!contentSeen && !prelude) {
+              contentSeen = true;
+              firstContentType ??= type ?? "unparsed";
+            }
             if (!released && held.length > 0) flushHeld();
             emit(frameBytes);
           }
