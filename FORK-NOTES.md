@@ -310,6 +310,30 @@ and a 1011 close carries none of that text. So the lane was re-dialled forever.
 transport switch will save the turn -- at that point the levers are waiting out the block or serving
 the turn from a second subscription (`ocx login codex`, one provider row per subscription).
 
+### 12. Cutting a release
+
+The fork tags as `v<upstream version>-skyhua.<n>`, so a reader can tell which upstream its patches
+apply to. The current cut is **v2.63.0-skyhua.2**, cut from `855f636`; the first was
+`v2.63.0-skyhua.1` from `ab845fe`.
+
+The mechanics, in order:
+
+```bash
+git tag -a v2.63.0-skyhua.3 -m "skyhua hardening fork, based on opencodex 2.63.0 -- <what changed>"
+git push origin v2.63.0-skyhua.3      # gitea-lan
+git push github v2.63.0-skyhua.3      # github
+gh release create v2.63.0-skyhua.3 -R skyhua0224/opencodex --latest   --title "..." --notes-file /tmp/notes.md
+```
+
+The notes are written from the commit log plus FORK-NOTES sections added since the previous tag, and
+they lead with what was MEASURED (numbers, the shape of the failure) rather than with the diff.
+Rewrite them for a reader who has not seen the sessions.
+
+One asymmetry to remember: GitHub releases are scriptable through `gh`, and the tag alone reaches
+Gitea over SSH, but the Gitea instance answers its API with "Only signed in user is allowed to call
+APIs" -- its release object needs an admin token (`curl -H "Authorization: token <token>" ...` on
+`/api/v1/repos/skyhua/opencodex/releases`) or a couple of clicks in its web UI from the tag page.
+
 ## Credential note (why GitHub push protection complains)
 
 The file src/oauth/google-antigravity.ts ships the Antigravity desktop client public OAuth
