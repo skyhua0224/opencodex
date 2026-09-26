@@ -12,6 +12,13 @@
  * The guard keeps a per-installation baseline in memory and appends one row per CHANGE to
  * ~/.opencodex/fingerprint-drift.jsonl -- names, sizes and short hashes only, never a value that
  * could identify an installation to a reader of the ledger.
+ *
+ * Two boundaries are load-bearing, both found the hard way on 2026-09-25/26:
+ *  - a request with NEITHER an originator nor an installation id is not a Codex client (the
+ *    operator's own probes arrive that way), so it is not an observation at all -- otherwise every
+ *    probe looks like the app-server changing its user agent;
+ *  - the provider argument is a NAME. A config object reaching this function produced 51 rows whose
+ *    provider field was an entire provider config snapshot and a log line reading "[object Object]".
  */
 import { appendFileSync, mkdirSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -82,7 +89,11 @@ function ledgerPath(): string {
  */
 export function observeClientFingerprint(headers: Headers, provider: string, now = Date.now()): string[] {
   const fingerprint = read(headers);
-  const key = provider + "|" + (tag(fingerprint.installation) ?? "no-installation");
+  // Never fail the call site, and never let a non-name reach the ledger.
+  const label = typeof provider === "string" && provider.trim().length > 0 ? provider.trim() : "unknown";
+  // Not a Codex client: nothing to baseline, nothing to compare.
+  if (fingerprint.originator === null && fingerprint.installation === null) return [];
+  const key = label + "|" + (tag(fingerprint.installation) ?? "no-installation");
   const entry = baselines.get(key);
   const signature = JSON.stringify(describe(fingerprint));
   if (!entry) {
@@ -96,7 +107,7 @@ export function observeClientFingerprint(headers: Headers, provider: string, now
     return [];
   }
   baselines.set(key, { fingerprint, lastDriftAt: now, lastSignature: signature });
-  const row = { at: now, provider, changes: drift, from: describe(entry.fingerprint), to: describe(fingerprint) };
+  const row = { at: now, provider: label, changes: drift, from: describe(entry.fingerprint), to: describe(fingerprint) };
   try {
     const path = ledgerPath();
     mkdirSync(dirname(path), { recursive: true });
@@ -105,7 +116,7 @@ export function observeClientFingerprint(headers: Headers, provider: string, now
     /* evidence, not correctness: a full disk must never break a turn */
   }
   const detail = drift.join(", ");
-  console.warn("[opencodex] client fingerprint drifted on " + provider + ": " + detail);
+  console.warn("[opencodex] client fingerprint drifted on " + label + ": " + detail);
   return drift;
 }
 

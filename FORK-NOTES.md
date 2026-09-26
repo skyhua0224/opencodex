@@ -334,6 +334,50 @@ Gitea over SSH, but the Gitea instance answers its API with "Only signed in user
 APIs" -- its release object needs an admin token (`curl -H "Authorization: token <token>" ...` on
 `/api/v1/repos/skyhua/opencodex/releases`) or a couple of clicks in its web UI from the tag page.
 
+### 13. In-body capacity declines on the SSE lane (2026-09-26, second pass)
+
+**The failure.** 09:28:44 and 09:38:26, the same conversation twice in ten minutes: the origin answered
+`Our servers are currently overloaded. Please try again later.`, the client got 503, `sendCount: 1`,
+`transportPhase: terminal_sse`, `failureStage: protocol-prelude`. Nothing retried it: the WS lane's hold
+does not apply (this deployment rides HTTP), `withSsePreludeDeclineRetry` never logged a line, and the
+capacity ladder only sees statuses, of which there were none -- the decline arrived inside a 200.
+
+**Why the wrapper missed it.** Two reasons, one certain and one latent:
+
+- it bailed on the content-type check (`text/event-stream`), returning the response untouched, while the
+  relay went on to parse the body and record the terminal error -- which is exactly the "no log line"
+  signature in the evidence;
+- its frame loop only inspects text terminated by `
+
+`/`
+
+`, and at end-of-body it released
+  the held prelude without ever looking at the trailing bytes, so a body that is one JSON object (or a
+  final frame with no separator) was invisible to the decline check.
+
+**What changed.**
+
+- `acceptAnyContentType` (opt-in, passed by `upstream-retry` for the canonical lane) widens the gate:
+  the caller knows the endpoint speaks the Responses event protocol, so a wrong or missing content-type
+  must not hide a decline.
+- `isDeclineFrame` recognises `error`/`response.failed` on the capacity text, a `response.completed`
+  whose `response.status` is `failed`, and -- for bodies with no framing at all -- only an EXPLICIT
+  refusal (`server_is_overloaded`, `"type":"error"`, `"status":"failed"`). A successful answer that
+  merely mentions the words is delivered (the operator's own answers do), and that case is a test.
+- The trailing bytes are examined before release, and when they are not a decline they are EMITTED:
+  widening the content-type gate would otherwise have turned "wrapped a body that is not a stream" into
+  a dropped answer (caught by the J case in the self-test, not in production).
+
+**Identity.** The 6-hour routing re-roll for that conversation was already armed by the 09:28 verdict
+(the persisted state proved the verdict path works for this shape); it did not stop the 09:38 shed, so
+the operator arm was written for the same key as an additional, immediate lever.
+
+**Fingerprint hygiene.** The guard's `provider` argument is a name; a config object reaching it had
+written 52 rows carrying a provider config snapshot and a log line reading `[object Object]`. The call
+site passes `route.providerName`, the module coerces anything else to `unknown`, requests with neither
+an originator nor an installation id are not observations at all (the operator's probes arrive that
+way), and the existing ledger was rewritten.
+
 ## Credential note (why GitHub push protection complains)
 
 The file src/oauth/google-antigravity.ts ships the Antigravity desktop client public OAuth

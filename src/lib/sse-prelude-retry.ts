@@ -30,10 +30,20 @@ export interface SsePreludeDeclineRetryOptions {
   label?: string;
   /** Abort while waiting between resends. */
   signal?: AbortSignal;
+  /**
+   * Wrap a body whose content-type is not `text/event-stream`.
+   *
+   * The caller opts in when it knows this endpoint speaks the Responses event protocol, because a
+   * decline that arrives with a wrong or missing content-type is the one shape this wrapper used to
+   * pass straight through: measured 2026-09-26 09:28/09:38, two native gpt-6-sol turns were shed
+   * with "Our servers are currently overloaded", recorded `terminal_sse` + `sendCount: 1`, and
+   * this wrapper never logged a line -- it had returned the response unchanged on the content-type
+   * check. Only content-free frames are ever held, so widening the check cannot hide an answer.
+   */
+  acceptAnyContentType?: boolean;
 }
 
 const PRELUDE_TYPES: ReadonlySet<string> = new Set(["response.created", "response.in_progress"]);
-const DECLINE_TYPES: ReadonlySet<string> = new Set(["error", "response.failed"]);
 
 function decodeFrame(frame: Uint8Array): string {
   return new TextDecoder().decode(frame);
@@ -56,6 +66,34 @@ function isCapacityDecline(text: string): boolean {
   return lower.includes("overloaded") || lower.includes("capacity") || lower.includes("server_is_overloaded");
 }
 
+/**
+ * Whether one frame is a capacity decline about THIS turn rather than an answer that quotes it.
+ *
+ * The difference matters: a successful completion carries the assistant's own text, and this very
+ * investigation's answers contain the word "overloaded". So a completed frame only counts when the
+ * response it reports actually FAILED; error-shaped frames and unparsable frames count on the
+ * capacity text alone, which is the shape the backend uses when it declines a turn.
+ */
+function isDeclineFrame(frameText: string, type: string | undefined): boolean {
+  if (!isCapacityDecline(frameText)) return false;
+  // A body with no event framing can be a whole JSON answer rather than a stream, and an answer is
+  // allowed to contain these words (this investigation's own replies do). Without a frame type the
+  // verdict must therefore be explicit, not merely mentioned.
+  if (type === undefined) {
+    return /"server_is_overloaded"|"type"\s*:\s*"error"|"status"\s*:\s*"failed"|"code"\s*:\s*"(?:server_is_overloaded|capacity)"/.test(frameText);
+  }
+  if (type === "error" || type === "response.failed") return true;
+  if (type !== "response.completed") return false;
+  const dataLine = frameText.split("\n").filter(line => line.startsWith("data:")).pop();
+  if (!dataLine) return false;
+  try {
+    const parsed = JSON.parse(dataLine.slice(5).trim()) as { response?: { status?: unknown } };
+    return parsed?.response?.status === "failed";
+  } catch {
+    return false;
+  }
+}
+
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   if (ms <= 0) return Promise.resolve();
   return new Promise((resolve, reject) => {
@@ -71,7 +109,8 @@ export function withSsePreludeDeclineRetry(
   options: SsePreludeDeclineRetryOptions,
 ): Response {
   const contentType = response.headers.get("content-type") ?? "";
-  if (!response.body || !contentType.includes("text/event-stream")) return response;
+  if (!response.body) return response;
+  if (!contentType.includes("text/event-stream") && options.acceptAnyContentType !== true) return response;
   const holdMs = options.holdMs ?? DEFAULT_HOLD_MS;
   let reader = response.body.getReader();
   let flushTimer: ReturnType<typeof setTimeout> | undefined;
@@ -91,10 +130,67 @@ export function withSsePreludeDeclineRetry(
         for (const frame of held.splice(0, held.length)) emit(frame);
       };
       const release = () => { clearTimeout(flushTimer); flushTimer = undefined; try { controller.close(); } catch { /* already closed */ } };
+      /**
+       * Throw this attempt away and splice the next one in. Returns true when a stream replaced
+       * the reader, so the caller re-reads; false when the decline has to be handed over instead.
+       */
+      const retryDecline = async (declinedFrame: Uint8Array | null): Promise<boolean> => {
+        if (contentSeen || rung >= options.delaysMs.length) return false;
+        const waitMs = options.delaysMs[rung]!;
+        rung += 1;
+        held.length = 0;
+        console.warn(
+          "[upstream-retry] sse prelude declined before any content"
+          + (options.label ? " (" + options.label + ")" : "")
+          + " - resending in " + waitMs + "ms (" + rung + "/" + options.delaysMs.length + ")",
+        );
+        try { await reader.cancel(); } catch { /* the declined body is going away anyway */ }
+        try {
+          await sleep(waitMs, options.signal);
+          const next = await options.resend(rung);
+          const nextType = next?.headers.get("content-type") ?? "";
+          // Only another STREAM may be spliced in: a non-ok answer (a refusal, a budget error)
+          // has no frames to give the client, and its JSON body would land inside an event stream.
+          if (!next?.body || !next.ok
+            || (!nextType.includes("text/event-stream") && options.acceptAnyContentType !== true)) {
+            throw new Error("no further stream attempt available");
+          }
+          reader = next.body.getReader();
+          buffer = new Uint8Array(0);
+          return true;
+        } catch (error) {
+          // No rung left or the wait was aborted: hand the client the decline it was going to get
+          // anyway rather than a broken stream.
+          if (!released) flushHeld();
+          if (declinedFrame) emit(declinedFrame);
+          console.warn("[upstream-retry] sse prelude decline could not be retried: " + String(error));
+          release();
+          return false;
+        }
+      };
       try {
         for (;;) {
           const { value, done } = await reader.read();
           if (done) {
+            // The decline may also be the LAST bytes: a frame with no trailing separator, or a
+            // body that is one JSON object rather than an SSE stream. Without this check the
+            // turn's overload verdict sat in the buffer and was released to the client unretried.
+            if (!contentSeen && buffer.byteLength > 0) {
+              const trailing = decodeFrame(buffer);
+              if (isDeclineFrame(trailing, frameType(trailing))) {
+                buffer = new Uint8Array(0);
+                if (await retryDecline(null)) continue;
+                return;
+              }
+              // Not a decline: this is the whole body (a non-streaming answer) or the tail of one,
+              // and it has never been emitted because only frame-terminated text is. Dropping it
+              // would turn "wrapped a body that is not an SSE stream" into a lost answer.
+              buffer = new Uint8Array(0);
+              if (!released && held.length > 0) flushHeld();
+              emit(new TextEncoder().encode(trailing));
+              release();
+              return;
+            }
             if (!released && held.length > 0) flushHeld();
             release();
             return;
@@ -117,7 +213,7 @@ export function withSsePreludeDeclineRetry(
             const frameBytes = new TextEncoder().encode(frameText);
             buffer = buffer.slice(frameBytes.byteLength);
             const type = frameType(frameText);
-            const decline = type !== undefined && DECLINE_TYPES.has(type) && isCapacityDecline(frameText);
+            const decline = isDeclineFrame(frameText, type);
             const prelude = type === undefined || PRELUDE_TYPES.has(type) || type.startsWith("codex.");
             if (decline && (!(!contentSeen) || rung >= options.delaysMs.length)) {
               console.warn(
@@ -127,37 +223,8 @@ export function withSsePreludeDeclineRetry(
               );
             }
             if (!contentSeen && decline && rung < options.delaysMs.length) {
-              const waitMs = options.delaysMs[rung]!;
-              rung += 1;
-              held.length = 0;
-              console.warn(
-                "[upstream-retry] sse prelude declined before any content"
-                + (options.label ? " (" + options.label + ")" : "")
-                + " - resending in " + waitMs + "ms (" + rung + "/" + options.delaysMs.length + ")",
-              );
-              try { await reader.cancel(); } catch { /* the declined body is going away anyway */ }
-              try {
-                await sleep(waitMs, options.signal);
-                const next = await options.resend(rung);
-                // Only another STREAM may be spliced in: a non-ok answer (a refusal, a budget
-                // error) has no frames to give the client, and its JSON body would land inside an
-                // event stream. Fall back to the decline instead.
-                const nextType = next?.headers.get("content-type") ?? "";
-                if (!next?.body || !next.ok || !nextType.includes("text/event-stream")) {
-                  throw new Error("no further stream attempt available");
-                }
-                reader = next.body.getReader();
-                buffer = new Uint8Array(0);
-              } catch (error) {
-                // No rung left or the wait was aborted: hand the client the decline it was going to
-                // get anyway rather than a broken stream.
-                if (!released) flushHeld();
-                emit(frameBytes);
-                console.warn("[upstream-retry] sse prelude decline could not be retried: " + String(error));
-                release();
-                return;
-              }
-              break;   // re-read from the new attempt
+              if (await retryDecline(frameBytes)) break;   // re-read from the new attempt
+              return;
             }
             if (!contentSeen && prelude && !released) {
               held.push(frameBytes);

@@ -1509,7 +1509,7 @@ export async function preparePassthroughExchange(
       if (!isCanonicalOpenAiForwardProvider(route.provider)) return;
       // Every canonical response is one free look at the fingerprint that reached the origin.
       // Observation only; see codex/client-fingerprint-guard.ts for why this is never a rewrite.
-      observeClientFingerprint(req.headers, route.provider);
+      observeClientFingerprint(req.headers, route.providerName);
       captureCodexAffinityDiagnostic({
         inboundHeaders: req.headers,
         outboundHeaders: captureRequest.headers,

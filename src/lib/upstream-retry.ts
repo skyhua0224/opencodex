@@ -891,6 +891,11 @@ export async function fetchWithTransientRetry(
       delaysMs: capacityDelays,
       label: opts.label,
       signal: opts.abortSignal,
+      // The caller opted in because it knows this endpoint speaks the Responses event protocol, so a
+      // decline that arrives with a wrong or missing content-type must still be caught. Measured
+      // 2026-09-26 09:28/09:38: two native gpt-6-sol turns were shed and the wrapper never saw a
+      // frame -- it had bailed on the content-type check while the relay still parsed the body.
+      acceptAnyContentType: true,
       resend: async () => {
         // One more physical send, counted exactly like every send this helper owns.
         opts.onSendsConsumed?.(1);

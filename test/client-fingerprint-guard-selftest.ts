@@ -62,5 +62,27 @@ const second = fingerprintGuardSnapshot("openai");
 check("a second installation is its own baseline",
   JSON.stringify(second).split("|").length >= 1 && Object.keys(second ?? {}).length === 4);
 
+// Two boundaries found on 2026-09-25/26: the operator's own probes have neither an originator nor
+// an installation id, and a caller once passed the provider CONFIG OBJECT instead of its name (51
+// rows carried a config snapshot and the log said "[object Object]").
+clearClientFingerprintGuardForTests();
+check("a request with no Codex fingerprint at all is not an observation",
+  observeClientFingerprint(headers({ "user-agent": "python-urllib/3.14" }), "openai", 1_000).length === 0);
+check("and it did not create a baseline",
+  observeClientFingerprint(headers({ "user-agent": "python-urllib/3.14" }), "openai", 2_000).length === 0);
+check("a Codex request still is",
+  observeClientFingerprint(headers(base), "openai", 3_000).length === 0
+  && fingerprintGuardSnapshot("openai") !== undefined);
+observeClientFingerprint(headers(base), { name: "openai", apiKey: "secret" } as never, 4_000);
+const asObject = observeClientFingerprint(
+  headers({ ...base, "user-agent": "codex 9.9.9" }), { name: "openai", apiKey: "secret" } as never, 5_000);
+check("a non-name provider cannot reach the ledger", asObject.join(",") === "user-agent-changed", asObject.join(","));
+check("and the caller still sees a name", fingerprintGuardSnapshot("unknown") !== undefined);
+const objectRow = readFileSync(join(home, "fingerprint-drift.jsonl"), "utf8").trim().split("\n")
+  .map(line => JSON.parse(line)).at(-1);
+check("the row it wrote names the provider as a string",
+  objectRow.provider === "unknown" && !JSON.stringify(objectRow).includes("secret"),
+  JSON.stringify(objectRow.provider));
+
 console.log(failures === 0 ? "ALL FINGERPRINT GUARD CHECKS PASSED" : failures + " CHECK(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

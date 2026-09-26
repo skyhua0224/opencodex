@@ -127,5 +127,91 @@ check("F: a CRLF-framed decline is retried", resends === 1, "resends=" + resends
 check("F: the CRLF decline never reaches the client", !fText.includes("overloaded"));
 check("F: the retried attempt's content arrives", fText.includes("hello"));
 
+// G: the decline arrived with a NON-SSE content-type. measured 2026-09-26 09:28/09:38: two native
+// gpt-6-sol turns were shed, recorded terminal_sse + sendCount 1, and this wrapper never logged a
+// line because it had bailed on the content-type check while the relay still parsed the body.
+resends = 0;
+const g = withSsePreludeDeclineRetry(
+  new Response(streamOf([created("r1"), overloadEvent]), { status: 200, headers: { "content-type": "application/json" } }),
+  {
+    delaysMs: [20],
+    acceptAnyContentType: true,
+    resend: async () => { resends += 1; return sseResponse([created("r2"), delta("recovered"), completed("r2")]); },
+  },
+);
+const gText = await readAll(g);
+check("G: a decline with a wrong content-type is still retried", resends === 1, "resends=" + resends);
+check("G: and the overload never reaches the client", !gText.includes("overloaded"));
+check("G: the spliced attempt's content arrives", gText.includes("recovered"));
+
+// G2: the same body WITHOUT the opt-in keeps the old behaviour (a caller that did not ask for it).
+resends = 0;
+const g2 = withSsePreludeDeclineRetry(
+  new Response(streamOf([created("r1"), overloadEvent]), { status: 200, headers: { "content-type": "application/json" } }),
+  { delaysMs: [20], resend: async () => { resends += 1; return sseResponse([delta("nope")]); } },
+);
+await readAll(g2);
+check("G2: the opt-out is respected", resends === 0, "resends=" + resends);
+
+// H: the decline is the LAST bytes, with no trailing frame separator at all.
+resends = 0;
+const h = withSsePreludeDeclineRetry(
+  new Response(streamOf(['{"type":"response.failed","response":{"status":"failed","error":{"message":"Our servers are currently overloaded."}}}']),
+    { status: 200, headers: SSE_HEADERS }),
+  {
+    delaysMs: [20],
+    resend: async () => { resends += 1; return sseResponse([created("r2"), delta("second try"), completed("r2")]); },
+  },
+);
+const hText = await readAll(h);
+check("H: an unsplit trailing decline is retried", resends === 1, "resends=" + resends);
+check("H: and its text never reaches the client", !hText.includes("overloaded"));
+check("H: the second attempt answers", hText.includes("second try"));
+
+// I: the safety case -- a SUCCESSFUL completion whose answer quotes the word "overloaded" must be
+// delivered, never mistaken for a decline (this investigation's own answers contain that word).
+resends = 0;
+const quoted = frame({ type: "response.completed", response: { id: "r1", status: "completed",
+  output: [{ type: "message", content: [{ type: "output_text", text: "the origin answered overloaded twice" }] }] } });
+const i = withSsePreludeDeclineRetry(
+  sseResponse([created("r1"), quoted]),
+  { delaysMs: [20], resend: async () => { resends += 1; return sseResponse([delta("nope")]); } },
+);
+const iText = await readAll(i);
+check("I: a successful answer quoting the decline word is delivered",
+  iText.includes("overloaded twice") && resends === 0,
+  "resends=" + resends);
+
+// J: a whole JSON body (no event framing) that merely MENTIONS capacity is an answer, not a
+// decline. Delivered as-is, nothing re-sent.
+resends = 0;
+const plainAnswer = '{"id":"r1","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"说明：上游此时报了 capacity，所以重试了三次。"}]}]}';
+const j = withSsePreludeDeclineRetry(
+  new Response(streamOf([plainAnswer]), { status: 200, headers: { "content-type": "application/json" } }),
+  {
+    delaysMs: [20],
+    acceptAnyContentType: true,
+    resend: async () => { resends += 1; return sseResponse([delta("nope")]); },
+  },
+);
+const jText = await readAll(j);
+check("J: a plain JSON answer mentioning capacity is delivered", jText.includes("capacity") && resends === 0,
+  "resends=" + resends);
+
+// J2: but a whole JSON body that IS an explicit refusal is retried.
+resends = 0;
+const plainDecline = '{"error":{"type":"server_error","code":"server_is_overloaded","message":"Our servers are currently overloaded."}}';
+const j2 = withSsePreludeDeclineRetry(
+  new Response(streamOf([plainDecline]), { status: 200, headers: { "content-type": "application/json" } }),
+  {
+    delaysMs: [20],
+    acceptAnyContentType: true,
+    resend: async () => { resends += 1; return sseResponse([created("r2"), delta("recovered"), completed("r2")]); },
+  },
+);
+const j2Text = await readAll(j2);
+check("J2: an explicit JSON refusal is retried", resends === 1, "resends=" + resends);
+check("J2: and the client gets the recovered answer", j2Text.includes("recovered"));
+
 console.log(failures === 0 ? "ALL SSE PRELUDE RETRY CHECKS PASSED" : failures + " CHECK(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);
