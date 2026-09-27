@@ -213,6 +213,29 @@ def quality_summary(hours):
     return entries, rounds, by_provider, holds
 
 
+def loop_summary(hours, logs_path=None):
+    """Degenerate-output cuts: when the guard refused to keep paying for a repeating stream.
+
+    Two sources on purpose: the usage ledger carries the per-turn verdict (provider, conversation,
+    time), and the service log carries the guard's own signature line, which is the only place the
+    REPEATED thing is named (for example "exec(...) x3 with identical results").
+    """
+    rows_ = [r for r in rows(hours) if 'degenerate' in str(r.get('upstreamError') or '').lower()]
+    by_day = collections.Counter()
+    for row in rows_:
+        by_day[time.strftime('%m-%d', time.localtime((row.get('timestamp') or 0) / 1000))] += 1
+    signatures = []
+    path = logs_path or os.path.join(HOME, 'service.log')
+    try:
+        with open(path, errors='replace') as handle:
+            for line in handle:
+                if 'no-progress tool loop' in line:
+                    signatures.append(line.strip())
+    except OSError:
+        pass
+    return rows_, by_day, signatures
+
+
 def main():
     ap = argparse.ArgumentParser(prog='ocx-tiers', description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -224,6 +247,7 @@ def main():
     ap.add_argument('--health', action='store_true', help='only report the per-provider health score')
     ap.add_argument('--quality', action='store_true', help='only report intelligence-probe rounds and holds')
     ap.add_argument('--fingerprints', action='store_true', help='only list client fingerprint drift')
+    ap.add_argument('--loops', action='store_true', help='only report degenerate-output cuts (no-progress loops)')
     args = ap.parse_args()
     found = ledger(FINDINGS, args.hours)
 
@@ -252,6 +276,22 @@ def main():
                 summary.get('incorrect', '-'), summary.get('inconclusive', '-'),
                 summary.get('action', 'never'),
                 ('   HELD %dmin: %s' % (round(((hold.get('until') or 0) - now) / 60000), (hold.get('reason') or '')[:70])) if active else ''))
+        return 0
+
+    if args.loops:
+        cuts, by_day, signatures = loop_summary(args.hours)
+        print('loops: %d cut turn(s) in the last %gh   guard lines in the log: %d'
+              % (len(cuts), args.hours, len(signatures)))
+        for day in sorted(by_day):
+            print('  %s  %d' % (day, by_day[day]))
+        for row in cuts[-8:]:
+            when = datetime.fromtimestamp((row.get('timestamp') or 0) / 1000).strftime('%m-%d %H:%M')
+            print('  %s  %-8s %-16s %s' % (when, (row.get('conversationId') or '')[:8],
+                  row.get('provider') or '-', str(row.get('upstreamError'))[:90]))
+        for line in signatures[-4:]:
+            print('  log: %s' % line[:170])
+        if not cuts and not signatures:
+            print('  nothing caught in window')
         return 0
 
     if args.fingerprints:

@@ -141,6 +141,10 @@ QUESTIONS = {
     "calendar-friday": {"prompt": "已知 2026 年 9 月 25 日是星期五。请问 2026 年 12 月 25 日是星期几？", "expected": "星期五"},
     "clock-7p5": {"prompt": "时钟指向 3 点 15 分，时针与分针之间较小的夹角是多少度？", "expected": "7.5"},
     "code-55": {"prompt": "以下 Python 代码的输出是多少？\nx = 0\nfor i in range(1, 6):\n    x += i * i\nprint(x)", "expected": "55"},
+    # Instruction adherence, checked literally: the contract says three characters, so anything
+    # else (an explanation, punctuation, quotes around it) is a failure of the instruction, not of
+    # the puzzle. "exact" bypasses the digit normalisation the numeric questions use.
+    "instr-xyz": {"prompt": "只输出 XYZ 这三个字符，不要任何解释、标点或换行。", "expected": "XYZ", "exact": True},
 }
 
 
@@ -234,7 +238,9 @@ def run_bank(models, question_ids, effort, judge_model, timeout, out, session_sc
                 model, question["prompt"] + "\n\n" + ANSWER_CONTRACT, effort, timeout, session)
             verdict = "incorrect"
             reason = "no answer"
-            if normalize(answer) == normalize(question["expected"]):
+            matched = (answer.strip() == question["expected"]
+                       if question.get("exact") else normalize(answer) == normalize(question["expected"]))
+            if matched:
                 verdict, reason = "correct", "exact match"
             elif answer.strip():
                 if judge_model and judge_model != model:
