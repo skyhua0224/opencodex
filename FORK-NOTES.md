@@ -397,6 +397,18 @@ frame now counts as content only when it carries payload (unparsable => assume p
 warning also names the frame that first counted, so the next refusal is self-documenting instead of
 requiring an investigation. Selftest cases L and L2 pin both directions.
 
+**Fourth catch, 2026-09-27 (keepalives and the eight-minute wait).** The evidence line added above
+named the frame this time: \`content already delivered: keepalive\`. The backend sends
+\`{"type":"keepalive"}\` while it produces nothing, and the rule "anything outside response.*/codex.* is
+payload" counted that as delivered content -- so a turn that sat on keepalives for EIGHT MINUTES and
+then took the decline was not retryable, and the client waited all of it. Keepalives, heartbeats,
+ping/pong and SSE comments are now payload-free by definition, and a stream that produces no
+content-bearing frame for four minutes (\`DEFAULT_STALL_MS\`, \`OCX_SSE_STALL_MS\` to override; four, not
+two, because legitimate first content has been measured at 141s) is re-dialled ONCE rather than held
+until the origin decides to shed. The same lines also caught a genuine boundary --
+\`content already delivered: response.reasoning_summary_text.delta\` -- where the client had already seen
+reasoning text, which stays unretryable by design. Selftest cases M, N and N2.
+
 **Identity.** The 6-hour routing re-roll for that conversation was already armed by the 09:28 verdict
 (the persisted state proved the verdict path works for this shape); it did not stop the 09:38 shed, so
 the operator arm was written for the same key as an additional, immediate lever.

@@ -272,5 +272,51 @@ const l2Text = await readAll(l2);
 check("L2: a payload-bearing .done still blocks the resend", resends === 0, "resends=" + resends);
 check("L2: and its text is delivered", l2Text.includes("already visible"));
 
+// M: the shape behind the 2026-09-27 "8 minutes then capacity" report -- upstream keepalives while
+// nothing is produced. A keepalive is proof of life, not of output, so a decline that follows it must
+// still be retried.
+resends = 0;
+const keepalive = frame({ type: "keepalive" });
+const commentFrame = ": opencodex keepalive" + String.fromCharCode(10) + String.fromCharCode(10);
+const m = withSsePreludeDeclineRetry(
+  sseResponse([created("r1"), commentFrame, keepalive, keepalive, overloadEvent]),
+  {
+    delaysMs: [20],
+    resend: async () => { resends += 1; return sseResponse([created("r2"), delta("recovered"), completed("r2")]); },
+  },
+);
+const mText = await readAll(m);
+check("M: keepalives do not count as delivered content", resends === 1, "resends=" + resends);
+check("M: the overload never reaches the client", !mText.includes("overloaded"));
+check("M: the second attempt answers", mText.includes("recovered"));
+
+// N: a stream that produces nothing but keepalives is re-dialled once, instead of holding the turn
+// open until the origin decides to shed it (measured: eight minutes).
+resends = 0;
+const n = withSsePreludeDeclineRetry(
+  sseResponse([created("r1"), keepalive], { delayMs: 40, neverEnd: true }),
+  {
+    delaysMs: [20],
+    stallMs: 250,
+    resend: async () => { resends += 1; return sseResponse([created("r2"), delta("after stall"), completed("r2")]); },
+  },
+);
+const nText = await readAll(n, 4000);
+check("N: a stalled stream is re-dialled once", resends === 1, "resends=" + resends);
+check("N: and the fresh attempt's content arrives", nText.includes("after stall"));
+
+// N2: the stall bounce is spent after one use -- a second stall does not loop.
+resends = 0;
+const n2 = withSsePreludeDeclineRetry(
+  sseResponse([created("r1")], { neverEnd: true }),
+  {
+    delaysMs: [20],
+    stallMs: 150,
+    resend: async () => { resends += 1; return sseResponse([created("r2")], { neverEnd: true }); },
+  },
+);
+await readAll(n2, 1200);
+check("N2: a second stall does not re-dial again", resends === 1, "resends=" + resends);
+
 console.log(failures === 0 ? "ALL SSE PRELUDE RETRY CHECKS PASSED" : failures + " CHECK(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

@@ -41,9 +41,40 @@ export interface SsePreludeDeclineRetryOptions {
    * check. Only content-free frames are ever held, so widening the check cannot hide an answer.
    */
   acceptAnyContentType?: boolean;
+  /**
+   * How long a stream may produce nothing content-bearing before this attempt is re-dialled ONCE.
+   *
+   * The SSE lane had no such bound: measured 2026-09-27, a turn sat on upstream keepalives for eight
+   * minutes and then took the decline, and the client waited all of it. Zero disables the bound.
+   */
+  stallMs?: number;
+}
+
+/** The stall bound, overridable with OCX_SSE_STALL_MS (0 .. 10min, zero = off). */
+function stallMsFromEnv(): number {
+  const parsed = Number(process.env.OCX_SSE_STALL_MS);
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 600_000) return DEFAULT_STALL_MS;
+  return Math.floor(parsed);
 }
 
 const PRELUDE_TYPES: ReadonlySet<string> = new Set(["response.created", "response.in_progress"]);
+/**
+ * Payload-free control frames the backend may interleave.
+ *
+ * Measured 2026-09-27: a long turn sent \`{"type":"keepalive"}\` while it produced nothing, that frame
+ * counted as delivered content (it is outside the \`response.*\`/\`codex.*\` namespaces this module knew),
+ * and the shed that followed eight minutes later was therefore not retryable. A keepalive is proof of
+ * life, not of output.
+ */
+const CONTROL_TYPES: ReadonlySet<string> = new Set(["keepalive", "heartbeat", "ping", "pong", "noop"]);
+/**
+ * How long a stream may produce no content-bearing frame before the attempt is re-dialled once.
+ *
+ * Four minutes, not two: legitimate first content on this lane has been measured at 141s, so a
+ * tighter bound would throw away work that was about to arrive. The pathology it exists for was
+ * eight minutes of keepalives followed by a decline (2026-09-27). One re-dial, never a loop.
+ */
+const DEFAULT_STALL_MS = 240_000;
 
 /**
  * Whether a frame carries something the user can see, which is what makes a resend impossible.
@@ -60,7 +91,9 @@ const PRELUDE_TYPES: ReadonlySet<string> = new Set(["response.created", "respons
  * thrown away on a guess.
  */
 function isContentFrame(frameText: string, type: string | undefined): boolean {
-  if (type === undefined) return true;
+  // A frame with no data line at all is an SSE comment: a keepalive by definition.
+  if (type === undefined) return frameText.split("\n").some(line => line.startsWith("data:"));
+  if (CONTROL_TYPES.has(type)) return false;
   if (type.endsWith(".delta")) return true;
   // A .done frame is only content when it actually carries payload. An item that produced no
   // deltas closes with an empty .done, and counting that as delivered content is what refused the
@@ -195,6 +228,10 @@ export function withSsePreludeDeclineRetry(
       /** Which frame first counted as delivered content: the evidence a refused retry needs. */
       let firstContentType: string | undefined;
       let rung = 0;
+      const stallMs = options.stallMs ?? stallMsFromEnv();
+      let stallTimer: ReturnType<typeof setTimeout> | undefined;
+      let stallFired = false;
+      let stallBounces = 0;
       const emit = (frame: Uint8Array) => {
         try { controller.enqueue(frame); } catch { /* the client is gone */ }
       };
@@ -203,10 +240,39 @@ export function withSsePreludeDeclineRetry(
         released = true;
         for (const frame of held.splice(0, held.length)) emit(frame);
       };
-      const release = () => { clearTimeout(flushTimer); flushTimer = undefined; try { controller.close(); } catch { /* already closed */ } };
+      const clearStall = () => { clearTimeout(stallTimer); stallTimer = undefined; };
+      const release = () => {
+        clearStall();
+        clearTimeout(flushTimer); flushTimer = undefined;
+        try { controller.close(); } catch { /* already closed */ }
+      };
       /**
-       * Throw this attempt away and splice the next one in. Returns true when a stream replaced
-       * the reader, so the caller re-reads; false when the decline has to be handed over instead.
+       * Swap in the next physical attempt. False when no stream could be obtained, in which case the
+       * caller decides whether the current body can still be delivered.
+       */
+      const spliceNextAttempt = async (): Promise<boolean> => {
+        clearStall();
+        try { await reader.cancel(); } catch { /* the declined body is going away anyway */ }
+        try {
+          const next = await options.resend(rung);
+          const nextType = next?.headers.get("content-type") ?? "";
+          // Only another STREAM may be spliced in: a non-ok answer (a refusal, a budget error) has no
+          // frames to give the client, and its JSON body would land inside an event stream.
+          if (!next?.body || !next.ok
+            || (!nextType.includes("text/event-stream") && options.acceptAnyContentType !== true)) {
+            throw new Error("no further stream attempt available");
+          }
+          reader = next.body.getReader();
+          buffer = new Uint8Array(0);
+          return true;
+        } catch (error) {
+          console.warn("[upstream-retry] sse prelude decline could not be retried: " + String(error));
+          return false;
+        }
+      };
+      /**
+       * Throw this attempt away and splice the next one in. True when the caller should re-read;
+       * false when the decline has to be handed over instead.
        */
       const retryDecline = async (declinedFrame: Uint8Array | null): Promise<boolean> => {
         if (contentSeen || rung >= options.delaysMs.length) return false;
@@ -218,37 +284,50 @@ export function withSsePreludeDeclineRetry(
           + (options.label ? " (" + options.label + ")" : "")
           + " - resending in " + waitMs + "ms (" + rung + "/" + options.delaysMs.length + ")",
         );
-        try { await reader.cancel(); } catch { /* the declined body is going away anyway */ }
         try {
           await sleep(waitMs, options.signal);
-          const next = await options.resend(rung);
-          const nextType = next?.headers.get("content-type") ?? "";
-          // Only another STREAM may be spliced in: a non-ok answer (a refusal, a budget error)
-          // has no frames to give the client, and its JSON body would land inside an event stream.
-          if (!next?.body || !next.ok
-            || (!nextType.includes("text/event-stream") && options.acceptAnyContentType !== true)) {
-            throw new Error("no further stream attempt available");
-          }
-          reader = next.body.getReader();
-          buffer = new Uint8Array(0);
-          return true;
         } catch (error) {
-          // No rung left or the wait was aborted: hand the client the decline it was going to get
-          // anyway rather than a broken stream.
           if (!released) flushHeld();
           if (declinedFrame) emit(declinedFrame);
           console.warn("[upstream-retry] sse prelude decline could not be retried: " + String(error));
           release();
           return false;
         }
+        if (await spliceNextAttempt()) return true;
+        if (!released) flushHeld();
+        if (declinedFrame) emit(declinedFrame);
+        release();
+        return false;
       };
       try {
         for (;;) {
+          // A stream that produces nothing for the stall window is re-dialled once: keepalives keep
+          // the socket alive without proving any work, which is how a turn could sit for minutes and
+          // then take the decline (2026-09-27).
+          if (stallMs > 0 && !contentSeen && !released && stallBounces < 1) {
+            clearTimeout(stallTimer);
+            stallTimer = setTimeout(() => {
+              stallFired = true;
+              try { void reader.cancel(new Error("opencodex sse stall")); } catch { /* already gone */ }
+            }, stallMs);
+          }
           const { value, done } = await reader.read();
+          clearStall();
           if (done) {
-            // The decline may also be the LAST bytes: a frame with no trailing separator, or a
-            // body that is one JSON object rather than an SSE stream. Without this check the
-            // turn's overload verdict sat in the buffer and was released to the client unretried.
+            if (stallFired && !contentSeen && stallBounces < 1) {
+              stallBounces += 1;
+              stallFired = false;
+              console.warn(
+                "[upstream-retry] sse stream produced no content for " + (stallMs < 1000 ? stallMs + "ms" : Math.round(stallMs / 1000) + "s")
+                + " - re-dialling once" + (options.label ? " (" + options.label + ")" : ""),
+              );
+              if (await spliceNextAttempt()) continue;
+              release();
+              return;
+            }
+            // The decline may also be the LAST bytes: a frame with no trailing separator, or a body
+            // that is one JSON object rather than an SSE stream. Without this check the turn's
+            // overload verdict sat in the buffer and was released to the client unretried.
             if (!contentSeen && buffer.byteLength > 0) {
               const trailing = decodeFrame(buffer);
               if (isDeclineFrame(trailing, frameType(trailing))) {
@@ -269,7 +348,7 @@ export function withSsePreludeDeclineRetry(
             release();
             return;
           }
-          if (!value) continue;
+          if (!value) { stallFired = false; continue; }
           const merged = new Uint8Array(buffer.byteLength + value.byteLength);
           merged.set(buffer); merged.set(value, buffer.byteLength);
           buffer = merged;
@@ -289,9 +368,12 @@ export function withSsePreludeDeclineRetry(
             const type = frameType(frameText);
             const decline = isDeclineFrame(frameText, type);
             // Holdable = nothing the user can see yet: the prelude, the backend's codex.* control
-            // frames, and the structural frames that only describe a response being built.
-            const prelude = type !== undefined
-              && (PRELUDE_TYPES.has(type) || type.startsWith("codex.") || !isContentFrame(frameText, type));
+            // frames, payload-free keepalives, and the structural frames that describe a response
+            // that is still being built.
+            // A frame with no event framing can still be holdable: an SSE comment is a keepalive,
+            // and isContentFrame is what distinguishes it from a payload the module cannot classify.
+            const prelude = !isContentFrame(frameText, type)
+              || (type !== undefined && (PRELUDE_TYPES.has(type) || type.startsWith("codex.")));
             if (decline && (!(!contentSeen) || rung >= options.delaysMs.length)) {
               console.warn(
                 "[upstream-retry] sse decline seen but not retried ("
@@ -311,6 +393,7 @@ export function withSsePreludeDeclineRetry(
             if (!contentSeen && !prelude) {
               contentSeen = true;
               firstContentType ??= type ?? "unparsed";
+              clearStall();
             }
             if (!released && held.length > 0) flushHeld();
             emit(frameBytes);
@@ -318,6 +401,7 @@ export function withSsePreludeDeclineRetry(
         }
       } catch (error) {
         if (!released && held.length > 0) flushHeld();
+        clearStall();
         try { controller.error(error); } catch { /* already closed */ }
       }
     },
