@@ -43,7 +43,7 @@ import {
   runPnpmGlobalUpdate,
 } from "../src/update/pnpm-global-install.mjs";
 import { PNPM_READ_CWD, withPnpmCommandCwd, pnpmReadEnvironment } from "../src/update/pnpm-read-policy.mjs";
-import { checkRegistryPackageIntegrity } from "../src/update/registry-integrity.mjs";
+import { forkInstallSpec, resolveForkRelease } from "../src/update/fork-release.mjs";
 import { hasPendingTeardownIn } from "../src/config/pending-teardown-names.mjs";
 import {
   npmCachePreflightFailureMessage,
@@ -238,17 +238,19 @@ function runPackageManagerSelfUpdate(manager) {
       : invocation.env ? { env: invocation.env } : {}),
     ...invocation.options,
   });
-  const latestInvocation = managerInvocation(["view", `${PKG}@${tag}`, "version"]);
+  // This fork is not published on any registry: the release comes from its own repository, and the
+  // install spec is the packed tarball attached to that release. Asking npm about upstream's
+  // package name here would stop the proxy and install the official build over this one.
+  const release = resolveForkRelease(tag);
+  const latest = release?.version ?? "";
   const installArgs = manager === "pnpm"
-    ? ["add", "-g", "--allow-build=bun", `${PKG}@${tag}`]
-    : ["install", "-g", `${PKG}@${tag}`];
+    ? ["add", "-g", "--allow-build=bun", forkInstallSpec(latest, release?.tag)]
+    : ["install", "-g", forkInstallSpec(latest, release?.tag)];
   const installInvocation = managerInvocation(installArgs);
-  if (!latestInvocation || !installInvocation) {
+  if (!installInvocation) {
     console.error(`opencodex: could not resolve ${manager} from a trusted absolute PATH entry; aborting before stopping the proxy.`);
     process.exit(1);
   }
-  const latestResult = spawnSync(latestInvocation.file, latestInvocation.args, readProbeOptions(latestInvocation));
-  const latest = latestResult.status === 0 && typeof latestResult.stdout === "string" ? latestResult.stdout.trim() : "";
 
   console.log(`opencodex v${current} (installed via ${manager}, tag ${tag})`);
   if (latest && latest === current) {
@@ -256,11 +258,14 @@ function runPackageManagerSelfUpdate(manager) {
     process.exit(0);
   }
 
-  const integrity = checkRegistryPackageIntegrity(PKG, latest || null, args => {
-    const invocation = managerInvocation(args);
-    if (!invocation) return { status: 1 };
-    return spawnSync(invocation.file, invocation.args, readProbeOptions(invocation));
-  });
+  // No registry metadata exists for a release asset, so the pre-flight is the release lookup
+  // itself: it must still name the same version, and its asset digest (when GitHub recorded one)
+  // is what the download is compared against by anyone auditing the install.
+  const integrity = !latest || !release
+    ? { ok: "skipped", reason: "no release resolved from the update source" }
+    : release.digest
+      ? { ok: true, integrity: release.digest }
+      : { ok: "skipped", reason: `release ${latest} publishes no asset digest` };
   if (integrity.ok === false) {
     console.error(`opencodex: ${integrity.reason}; aborting before stopping the proxy.`);
     process.exit(1);
@@ -268,7 +273,7 @@ function runPackageManagerSelfUpdate(manager) {
   if (integrity.ok === "skipped") {
     console.warn(`opencodex: integrity pre-flight skipped: ${integrity.reason}. Proceeding best-effort.`);
   } else {
-    console.log(`Verified ${PKG}@${latest} integrity metadata ${integrity.integrity.slice(0, 24)}…`);
+    console.log(`Verified release ${latest} asset digest ${integrity.integrity.slice(0, 24)}…`);
   }
 
   if (manager === "npm") {

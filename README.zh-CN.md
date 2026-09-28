@@ -83,7 +83,7 @@ ocx-tiers --findings       # 只列逐条记录
 
 ## 几件要注意的
 
-- 这份锁在 **2.63.0**。**别跑 `ocx update`**，一跑就把官方版装回来、改动全没了。要跟新版本就照 [FORK-NOTES.md](FORK-NOTES.md) 里那段，用 `patches/` 里的补丁在干净的新版本上重打一遍。
+- 版本线是 **2.69.0-skyhua.N**，更新走本仓库自己的 release：`ocx update` 取的是这里发布、带打包 tarball 的版本，不会再装回官方版。要换源（比如以后发到自己的 npm scope）在环境里设 `OCX_UPDATE_SPEC` 即可；自己从 clone 装的话，`git pull` 后重跑 `npm install -g .`。
 - `src/oauth/google-antigravity.ts` 里那两个 Google 标识是上游自带的（文件注释里写明是 Antigravity 桌面客户端的公开标识，可用环境变量覆盖）。想用自己的就设 `GOOGLE_ANTIGRAVITY_CLIENT_ID` / `GOOGLE_ANTIGRAVITY_CLIENT_SECRET`。仓库里没别的凭据。
 - prelude 暂存最长让首包晚 25 秒，但只在后端迟迟不出字的时候；一出内容立刻放行。
 - 复读守卫的阈值（重复率 0.6、同一 40 字符片段 3 次、压缩比 8、同一工具调用 3 次）刻意保守：正常输出里的表格、测试清单不会命中。

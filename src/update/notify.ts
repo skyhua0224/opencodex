@@ -15,11 +15,12 @@ import {
   updateCommandStr,
   updateTag,
 } from "./index";
+import { forkReleaseNotesUrl as forkNotesUrl } from "./fork-release.mjs";
 
 const VERSION_FILENAME = "version.json";
 export const REFRESH_INTERVAL_MS = 20 * 60 * 60 * 1000; // 20h, matching codex-rs
 export const CACHE_MAX_AGE_MS = 40 * 60 * 60 * 1000;
-const RELEASE_NOTES_URL = "https://github.com/lidge-jun/opencodex/releases/latest";
+const RELEASE_NOTES_URL = forkNotesUrl();
 
 export interface VersionCache {
   latest_version: string;
@@ -86,6 +87,20 @@ function parsePreview(v: string): [number, number, number, number] | null {
   return [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])];
 }
 
+/**
+ * `x.y.z-skyhua.N`: this fork's own release line.
+ *
+ * Upstream's two shapes do not cover it, and without this the updater would answer "no update" to
+ * every fork release forever — the exact silent failure this fork's source change has to avoid.
+ * The upstream base is compared first, so a fork cut from a newer upstream always wins over one
+ * cut from an older base.
+ */
+function parseFork(v: string): [number, number, number, number] | null {
+  const m = /^(\d+)\.(\d+)\.(\d+)-skyhua\.(\d+)$/.exec(v.trim());
+  if (!m) return null;
+  return [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])];
+}
+
 function gt(a: number[], b: number[]): boolean {
   for (let i = 0; i < Math.max(a.length, b.length); i++) {
     const av = a[i] ?? 0;
@@ -108,6 +123,24 @@ function gt(a: number[], b: number[]): boolean {
  *   stable release with the same base as the current preview does not.
  */
 export function isNewer(latest: string, current: string, channel: Channel): boolean {
+  const lFork = parseFork(latest);
+  const cFork = parseFork(current);
+  if (lFork && cFork) return gt(lFork, cFork);
+  if (lFork) {
+    // The fork's base is the upstream release its patches were replayed onto: equal base means
+    // this IS the fork of the build the operator already runs, so it is offered; a lower base is
+    // not (that would be a downgrade nag).
+    const base = parseStable(current) ?? parsePreview(current)?.slice(0, 3) ?? null;
+    if (!base) return true;
+    const forkBase = [lFork[0], lFork[1], lFork[2]];
+    return gt(forkBase, base) || !gt(base, forkBase);
+  }
+  if (cFork) {
+    // Running the fork, and the source answered with an upstream-shaped version: offer it only
+    // when its base is strictly ahead — an upstream release this fork has not been cut from yet.
+    const upstream = parseStable(latest) ?? parsePreview(latest)?.slice(0, 3) ?? null;
+    return upstream ? gt(upstream, [cFork[0], cFork[1], cFork[2]]) : false;
+  }
   if (channel === "latest") {
     const l = parseStable(latest);
     const c = parseStable(current) ?? parsePreview(current)?.slice(0, 3);

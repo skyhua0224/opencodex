@@ -42,6 +42,7 @@ import { withoutSiblingMarker } from "../codex/sibling-start";
 import { packageVersion } from "../lib/package-version";
 import { selfLaunchArgv } from "../lib/self-launch-argv";
 import { PNPM_READ_CWD, withPnpmCommandCwd, pnpmReadEnvironment } from "./pnpm-read-policy.mjs";
+import { forkInstallSpec, resolveForkRelease } from "./fork-release.mjs";
 
 /**
  * A `codex-history-backup-*.json` surviving a stop means the native-history restore was
@@ -289,6 +290,14 @@ export function latestVersion(
   owner?: PnpmGlobalOwner,
   spawn: typeof spawnSync = spawnSync,
 ): string | null {
+  // This fork is not on the public registry: the newest release comes from its own repository,
+  // where every release carries the packed tarball the updater installs. See fork-release.mjs
+  // for why asking npm about upstream's package name would install the wrong build entirely.
+  // A registry source can still be configured through OCX_UPDATE_SPEC, in which case the
+  // package-manager query below is the right one.
+  if (!process.env.OCX_UPDATE_SPEC?.trim()) {
+    return resolveForkRelease(tag, { spawn })?.version ?? null;
+  }
   const resolvedOwner = installer === "pnpm" ? selectedPnpmOwner(owner) : undefined;
   if (installer === "pnpm" && !resolvedOwner) return null;
   const manager = registrySpawnTarget(installer, ["view", `${PKG}@${tag}`, "version"], resolvedOwner);
@@ -311,15 +320,19 @@ export function updateCommand(installer: Installer, tag: Channel, resolvedVersio
   if (installer === "mise") {
     throw new Error("mise-owned installations must be upgraded through mise");
   }
-  // Immutable target: when the registry resolved a concrete version, install exactly
-  // that version — the dist-tag can move between resolution and install (TOCTOU).
-  const target = resolvedVersion || tag;
-  if (installer === "bun") return { bin: "bun", args: ["add", "-g", `${PKG}@${target}`] };
+  // Immutable target: when the lookup resolved a concrete version, install exactly that version —
+  // the "latest" release can move between resolution and install (TOCTOU). Without a resolved
+  // version the label is a placeholder: the callers refuse to install an unresolved target.
+  const version = resolvedVersion && !/^(latest|preview)$/.test(resolvedVersion) ? resolvedVersion : null;
+  const spec = version
+    ? forkInstallSpec(version, version.startsWith("v") ? version : `v${version}`)
+    : forkInstallSpec("<version>", "v<version>");
+  if (installer === "bun") return { bin: "bun", args: ["add", "-g", spec] };
   if (installer === "pnpm") {
-    return { bin: "pnpm", args: ["add", "-g", "--allow-build=bun", `${PKG}@${target}`] };
+    return { bin: "pnpm", args: ["add", "-g", "--allow-build=bun", spec] };
   }
   const bin = "npm";
-  const args = ["install", "-g", `${PKG}@${target}`];
+  const args = ["install", "-g", spec];
   return { bin, args };
 }
 
@@ -344,6 +357,21 @@ export function checkUpdatePackageIntegrity(
   installer: Installer = detectInstall(),
   owner?: PnpmGlobalOwner,
 ): { ok: true; integrity: string } | { ok: false; reason: string } | { ok: "skipped"; reason: string } {
+  if (!process.env.OCX_UPDATE_SPEC?.trim()) {
+    // The fork's source is a GitHub release, and its tarball has no registry SRI to read. What it
+    // does have is the asset digest GitHub records for the upload: verify the SAME release the
+    // install spec points at, so a release that vanished between resolution and install still
+    // fails closed before the proxy is stopped.
+    if (!version) return { ok: "skipped", reason: "no resolved release (release lookup unavailable)" };
+    const release = resolveForkRelease("preview", { spawn });
+    if (!release || release.version !== version) {
+      return { ok: false, reason: `release ${version} is not readable from the update source` };
+    }
+    if (!release.digest) {
+      return { ok: "skipped", reason: `release ${version} publishes no asset digest` };
+    }
+    return { ok: true, integrity: release.digest };
+  }
   const resolvedOwner = installer === "pnpm" ? selectedPnpmOwner(owner) : undefined;
   if (installer === "pnpm" && !resolvedOwner) {
     return { ok: false, reason: "could not identify pnpm's owning global installation" };

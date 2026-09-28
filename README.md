@@ -497,7 +497,7 @@ ocx provider <...>             # manage providers (list/add/edit/test/remove)
 ocx account <...>              # manage ChatGPT accounts & API-key pools
 ocx combo <...>                # manage failover / round-robin combos
 ocx v2 <...>                   # multi-agent v1/v2 surface controls
-ocx update [--tag preview]     # update opencodex
+ocx update [--tag preview]     # update from this fork's own releases
 ```
 
 A start whose preferred port is busy stops and names the holder instead of moving to another port,

@@ -3,6 +3,7 @@ import { unprivilegedOwnershipMutationEnvironment } from "../service/ownership-m
 import { PKG, registrySpawnTarget, type Channel, type Installer } from "./index";
 import type { PnpmGlobalOwner } from "./pnpm-global-install.mjs";
 import { PNPM_READ_CWD, pnpmReadEnvironment } from "./pnpm-read-policy.mjs";
+import { forkReleaseWorkerArgs } from "./fork-release.mjs";
 
 export const REGISTRY_DEADLINE_MS = 12_000;
 export const REGISTRY_OUTPUT_LIMIT = 4_096;
@@ -52,6 +53,53 @@ export async function latestVersionAsync(
   deps: AsyncLookupDeps = defaultDeps,
 ): Promise<string | null> {
   if (installer === "source" || installer === "mise") return null;
+  if (!process.env.OCX_UPDATE_SPEC?.trim()) {
+    // Same source as the synchronous lookup (fork-release.mjs), only awaited instead of blocked
+    // on: the background check must not hold a turn open, and a failed lookup stays silent.
+    return new Promise(resolve => {
+      let child: ChildProcessWithoutNullStreams;
+      try {
+        child = deps.spawnFn(process.execPath, forkReleaseWorkerArgs(channel), {
+          stdio: ["pipe", "pipe", "pipe"],
+          windowsHide: true,
+        }) as ChildProcessWithoutNullStreams;
+      } catch {
+        resolve(null);
+        return;
+      }
+      child.stdin.end();
+      let done = false;
+      let stdout = "";
+      const finish = (version: string | null) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(version);
+      };
+      const timer = setTimeout(() => {
+        try { child.kill(); } catch { /* already gone */ }
+        finish(null);
+      }, deps.deadlineMs ?? REGISTRY_DEADLINE_MS);
+      child.stdout.on("data", (chunk: Buffer) => {
+        if (stdout.length + chunk.length > REGISTRY_OUTPUT_LIMIT) {
+          finish(null);
+          return;
+        }
+        stdout += chunk.toString("utf8");
+      });
+      child.on("error", () => finish(null));
+      child.on("close", () => {
+        const text = stdout.trim();
+        if (!text) { finish(null); return; }
+        try {
+          const parsed = JSON.parse(text) as { version?: unknown };
+          finish(typeof parsed.version === "string" && parsed.version.length > 0 ? parsed.version : null);
+        } catch {
+          finish(null);
+        }
+      });
+    });
+  }
   let owner: PnpmGlobalOwner | null | undefined;
   try { owner = installer === "pnpm" ? await deps.ownerFn() : undefined; }
   catch { return null; }

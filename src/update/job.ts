@@ -63,8 +63,10 @@ import {
 import { guiUpdateWorkerCommand } from "./worker-launch";
 import { withoutSiblingMarker } from "../codex/sibling-start";
 import type { WorkerLaunchContext } from "./worker-launch";
+import { forkReleaseNotesUrl } from "./fork-release.mjs";
 
-const RELEASE_NOTES_URL = "https://github.com/lidge-jun/opencodex/releases/latest";
+// This fork ships its own releases; upstream's notes page describes a build this package is not.
+const RELEASE_NOTES_URL = forkReleaseNotesUrl();
 const UPDATE_JOB_FILENAME = "update-job.json";
 const UPDATE_TIMEOUT_MS = 180_000;
 const RESTART_TIMEOUT_MS = 60_000;
