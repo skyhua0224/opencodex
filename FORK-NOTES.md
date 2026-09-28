@@ -358,8 +358,16 @@ The mechanics, in order:
 git tag -a v2.69.0-skyhua.2 -m "skyhua hardening fork, based on opencodex 2.69.0 -- <what changed>"
 git push origin v2.69.0-skyhua.2      # gitea-lan
 git push github v2.69.0-skyhua.2      # github
-gh release create v2.69.0-skyhua.2 -R skyhua0224/opencodex --latest --title "..." --notes-file /tmp/notes.md
+PATH=... npm pack --pack-destination /tmp/ocx-pack
+mv /tmp/ocx-pack/bitkyc08-opencodex-<version>.tgz /tmp/ocx-pack/opencodex-<version>.tgz
+gh release create v2.69.0-skyhua.2 -R skyhua0224/opencodex --latest \
+  --title "..." --notes-file /tmp/notes.md /tmp/ocx-pack/opencodex-<version>.tgz
 ```
+
+The attached tarball is what `ocx update` installs and what the integrity pre-flight reads the
+digest from, so a release without it leaves every installed copy on its current version. Publish
+a cut as a NORMAL release (no --prerelease): the *latest* channel skips prereleases, and the
+*preview* channel takes them.
 
 The notes are written from the commit log plus FORK-NOTES sections added since the previous tag, and
 they lead with what was MEASURED (numbers, the shape of the failure) rather than with the diff.
