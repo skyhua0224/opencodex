@@ -19,6 +19,9 @@ const PRE_OUTPUT_CONTROL_EVENTS = new Set([
   "response.in_progress",
   "response.queued",
   "response.heartbeat",
+  "response.metadata",
+  "codex.rate_limits",
+  "codex.response.metadata",
 ]);
 
 const TERMINAL_EVENTS = new Set([
@@ -247,7 +250,23 @@ export async function preflightComboStreamResponse(
   response: Response,
   logCtx: RequestLogContext,
   retryableTerminal: (payload: unknown) => boolean = retryableZeroOutputTerminal,
-  options?: { allowMissingContentType?: boolean; replayReadErrors?: boolean },
+  options?: {
+    allowMissingContentType?: boolean;
+    replayReadErrors?: boolean;
+    /**
+     * Absolute time by which the child has to produce a client-visible event.
+     *
+     * The per-attempt first-byte deadline in the combo ladder is spent as soon as the response
+     * OBJECT arrives, and a relay that answers with SSE headers and then nothing settles that
+     * promise immediately: the ladder would then wait on this preflight for as long as the relay
+     * keeps the socket quiet. That silence is what makes a combo look frozen and lets one target
+     * eat the whole ladder budget. Expiring here abandons the attempt while nothing has been
+     * relayed, so the failure is still replayable on the next target.
+     */
+    zeroOutputDeadlineAt?: number;
+    /** Failure response handed back when {@link zeroOutputDeadlineAt} expires. */
+    onZeroOutputDeadline?: () => Response;
+  },
 ): Promise<ComboStreamPreflightResult> {
   const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
   const isEventStream = contentType.includes("text/event-stream")
@@ -284,11 +303,26 @@ export async function preflightComboStreamResponse(
     onTerminal: status => { terminalStatus = status; },
   });
 
+  // Armed only while no output has been committed: the loop below returns `accepted` the moment a
+  // client-visible event lands, so this timer can never cut a target that already produced text.
+  let zeroOutputTimer: ReturnType<typeof setTimeout> | undefined;
+  const zeroOutputDeadlineAt = options?.zeroOutputDeadlineAt;
+  const zeroOutputDeadline = typeof zeroOutputDeadlineAt === "number"
+      && Number.isFinite(zeroOutputDeadlineAt)
+    ? new Promise<"zero-output-deadline">(resolve => {
+      zeroOutputTimer = setTimeout(
+        () => resolve("zero-output-deadline"),
+        Math.max(0, zeroOutputDeadlineAt - Date.now()),
+      );
+    })
+    : undefined;
+
   try {
     for (;;) {
-      let next: Awaited<ReturnType<typeof reader.read>>;
+      let next: Awaited<ReturnType<typeof reader.read>> | "zero-output-deadline";
       try {
-        next = await reader.read();
+        const read = reader.read();
+        next = zeroOutputDeadline ? await Promise.race([read, zeroOutputDeadline]) : await read;
       } catch (error) {
         if (!options?.replayReadErrors) throw error;
         // The native relay still owns post-header transport failures. Preserve
@@ -297,6 +331,15 @@ export async function preflightComboStreamResponse(
         const replay = replayBufferedResponse(response, reader, buffered);
         const stage = observedResponsesStage({ outputCommitted, terminalStatus, responseCreated });
         return { kind: "read-error", response: replay, error, stage };
+      }
+      if (next === "zero-output-deadline") {
+        // Nothing reached the client, so this attempt is still replayable: report the target as
+        // failed (the caller cools it down and hops) instead of holding the ladder hostage.
+        await reader.cancel("combo zero-output deadline").catch(() => undefined);
+        return {
+          kind: "failed",
+          response: options?.onZeroOutputDeadline?.() ?? new Response(null, { status: 504 }),
+        };
       }
       if (next.done) {
         inspector.finish();
@@ -331,6 +374,7 @@ export async function preflightComboStreamResponse(
       }
     }
   } finally {
+    if (zeroOutputTimer !== undefined) clearTimeout(zeroOutputTimer);
     inspector.dispose();
   }
 }

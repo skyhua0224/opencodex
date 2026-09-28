@@ -1,6 +1,119 @@
-<p align="center">
-  <img src="assets/banner.png" alt="opencodex — universal provider proxy for Codex, Claude Code, Claude Desktop and Grok Build" width="100%">
-</p>
+**English** | [简体中文](README.zh-CN.md)
+
+# opencodex — skyhua's hardening fork
+
+Fork of **opencodex 2.69.0** (MIT). Upstream: <https://github.com/lidge-jun/opencodex>.
+Mirrors: [GitHub](https://github.com/skyhua0224/opencodex) · [Gitea](https://gitea.sky-hua.xyz:24443/skyhua/opencodex).
+
+This fork carries a hardening patch set written against how the ChatGPT Codex backend actually
+behaves: capacity verdicts that arrive *after* a request has been accepted, combo ladders that
+used to fail a whole turn on one row's answer, relay quotas that only exist in a web panel, and
+WebSocket lanes that degrade quietly per conversation. The full inventory, the measurements behind
+each threshold, and how to rebase it onto a newer upstream release live in
+**[FORK-NOTES.md](FORK-NOTES.md)**.
+
+## Install
+
+```bash
+git clone https://github.com/skyhua0224/opencodex.git
+cd opencodex
+npm install -g .        # or: bun install -g .
+ocx setup               # then: ocx start
+```
+
+Self-tests for the new paths (bun):
+
+```bash
+bun test/codex-ws-capacity-selftest.ts
+bun test/sse-prelude-retry-selftest.ts
+bun test/capacity-absorb-selftest.ts
+bun test/thread-affinity-selftest.ts
+```
+
+## What this fork adds, in one screen
+
+- **Capacity verdicts never reach the client on the official lane.** Four layers, cheapest first:
+  an in-socket resend after a declined create, a WebSocket prelude hold, a replayable 503 that lets
+  the caller re-dial, and a paced 5s/12s/25s/45s ladder. The SSE lane gets the same treatment: a
+  decline that arrives inside an already-200 body is swallowed and a fresh attempt is spliced in
+  (`src/lib/sse-prelude-retry.ts`). A decline after content is passed through, because resending
+  there would generate a second answer for the same turn.
+- **Combo ladders that keep walking.** One row's replay refusal no longer stops the ladder;
+  quota-exhausted sites are skipped rather than treated as walls; the official row alone escalates
+  onto the 10m → 1h → 3h → 6h → 12h → 24h capacity hold; an exhausted fleet answers
+  `503 combo_unavailable` with `Retry-After` instead of a bare 429 the Codex client refuses to
+  retry; and degenerate output (repeated segments, a repeated tool signature) parks that row for
+  two minutes instead of disabling the channel.
+- **Per-conversation transport.** A conversation that keeps collecting overload verdicts steps off
+  the WebSocket lane for a while and has its routing identity re-rolled (the client's
+  `x-codex-window-id` and the server's `x-codex-turn-state` are dropped for that conversation, and
+  the hold survives restarts).
+- **Native sessions get the repetition guard too.** The metrics combos have used (repeat ratio,
+  longest repeated segment, zlib ratio, identical tool-call signature) now watch directly-routed
+  streams as well: a channel that starts repeating is cut with `response.failed`/`degenerate_output`
+  instead of being relayed to the end, and the verdict is remembered for that conversation, so a
+  combo serving it later demotes the row that looped.
+- **Model, tier and safety-buffer attestation.** When the origin reports a different model than the
+  one requested, answers on a lower service tier than the one configured, or announces a safety
+  buffer that can serve the turn on a faster model, that lands in `~/.opencodex/model-attestation.jsonl`
+  and on the log. Nothing is rewritten and nothing errors.
+- **`ocx-tiers`**, one command over `usage.jsonl` plus those ledgers: did the tier drop, was a model
+  substituted, how many streams were cut for repetition, whether this lane ever sees the edge affinity
+  cookies, and how a slow turn splits between our queue, the origin headers, the first content frame and
+  the tail (`--links`, `--latency`). `--wsreuse` puts the three WebSocket lanes side by side -- fresh,
+  resend inside a turn, cross-turn -- with failures and first-frame medians for each.
+- **Latency and link ledgers.** `~/.opencodex/cookie-link.jsonl` records every guarded request's cookie
+  shape (names, counts and a hash of the affinity pair -- never a value), and `latency.jsonl` records
+  turns at or above 20s with the segment split, so "the proxy feels slow" becomes attributable.
+- **A pre-content socket close is replayable.** When the WebSocket lane dies before any frame has been
+  relayed, the failure is settled as a resendable status instead of the non-replayable one, so the
+  capacity ladder re-dials a fresh socket. The ambiguous marker now only applies once frames are out.
+- **The socket pool actually reaches the origin.** Two bugs kept the WebSocket pool from ever seeing a real
+  turn: the client's ~4 KiB rotating `x-oai-attestation` exceeded the per-field bound the identity inherited
+  from the response-id validator, and per-request headers (attestation, client request id) were part of the
+  socket key, so no two attempts could agree on one socket. Long fields are hashed into the key and the
+  per-request headers are ignored; a conversation's retries now land on the socket the previous attempt left
+  behind. Reusing that socket for the *next* turn is available and **off by default**
+  (`OCX_WS_CROSS_TURN_REUSE=1`), because a deadline that cannot distinguish a retired socket from a slow
+  origin costs more than it saves on days the origin answers in tens of seconds.
+- **Quota the panel knows and the API does not.** Panel-family subscriptions feed the router:
+  custom windows, epoch-second reset stamps, and `>= 100%` means exhausted.
+- **An intelligence probe with a verifiable answer.** `tools/pelican-probe.py` runs the two questions
+  sub2api ships (its prompt text, contract, `high` effort, expected answer and grading rules) against
+  any channel through this proxy, grades with a judge on a different channel and writes
+  `~/.opencodex/intelligence-probe.jsonl`. First run: the official `gpt-6-sol`/`luna`/`astra` all
+  answered 29 to a question whose minimum is provably 21, while `ciii-*` returned `Upstream
+  authentication failed` and every `lucen-*`/`portal` returned `SUBSCRIPTION_NOT_FOUND`.
+- **Model catalog and management surface** for the `gpt-6` family and the provider fields the
+  hardening needs (`retryOnReset`, transient-5xx policy, reasoning efforts, context windows).
+- **A wrong answer now costs a channel its turn.** `tools/pelican-probe.py --kind bank --apply` asks
+  six questions whose answers were each verified independently (exhaustive searches, `datetime`,
+  execution) and grades with a model on a different provider; a clear wrong answer holds that
+  provider for 30 minutes and combos demote it, while transport errors, auth failures and unknown
+  verdicts change nothing. A full clean round releases the hold. It runs on demand -- the first live
+  round held the official lane for answering 29 to a question whose minimum is provably 21 -- with
+  the units in `tools/` as opt-in templates for anyone who prefers a schedule.
+- **A lane-level breaker for the official transport.** When the origin closes the Codex WebSocket
+  without answering (control frames only, close 1011), turns used to burn the full 5+12+25+45s
+  capacity ladder and still fail. The breaker counts that exact shape across conversations and
+  rides HTTP/SSE for 10 minutes, escalating to 30 and 60 on repeats, with evidence in
+  `~/.opencodex/ws-lane.jsonl`. `provider.openai.upstreamWebsocket = false` remains the manual
+  switch, and is what this deployment runs on right now.
+- **Health, fingerprint and restriction watchers.** `ocx-tiers --health` scores each provider from
+  its error rate and p90 first-output time; `--fingerprints` lists client-fingerprint drift (a
+  Codex update or a header-rewriting relay stops being invisible); and a verdict that is about the
+  client rather than the load ("only allows Codex official clients") re-rolls that conversation's
+  routing identity immediately instead of waiting for a load threshold.
+
+## License
+
+MIT, unchanged, with upstream's copyright notice — see [LICENSE](LICENSE). Upstream is not
+affiliated with this fork; issues about the hardening work belong here, anything about opencodex
+itself belongs upstream.
+
+---
+
+## Upstream README
 
 <h3 align="center">make codex open!</h3>
 <p align="center"><b>Universal provider proxy for OpenAI Codex, Claude Code, Claude Desktop &amp; Grok Build</b><br>

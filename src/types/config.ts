@@ -1274,6 +1274,15 @@ export interface OcxComboTarget {
    * see `OcxComboConfig.cooldownWaitPolicy` (#5691).
    */
   lastResort?: boolean;
+  /**
+   * Per-target override for the combo's first-byte deadline.
+   *
+   * A rung the operator KNOWS to be slow (a congested relay whose own status page reports a 45 s
+   * response time) must not be paid the full ladder deadline before the ladder moves on: with the
+   * budget spent on three slow rungs, the healthy tail of the ladder is never reached. Range
+   * 1000..600000; unset inherits the combo's `firstByteTimeoutMs`.
+   */
+  firstByteTimeoutMs?: number;
 }
 
 export interface OcxComboConfig {
@@ -1302,6 +1311,16 @@ export interface OcxComboConfig {
    * fallback into an outage.
    */
   cooldownWaitPolicy?: OcxComboCooldownWaitPolicy;
+  /** Per-target first-byte deadline override; unset inherits the combo value. */
+  firstByteTimeoutMs?: number;
+  /** Total time one request may spend walking this combo's ladder before the last real failure. */
+  ladderBudgetMs?: number;
+  /** Consecutive failures that open this combo's circuit breaker. */
+  breakerFailureThreshold?: number;
+  /** Consecutive successes after a trial that close it again. */
+  breakerSuccessThreshold?: number;
+  /** How long an open circuit is held before a trial. */
+  breakerOpenMs?: number;
   /** Used as a fallback when the client omits reasoning.effort, or as an override in `force` mode. null/omitted leaves the target default unchanged. */
   defaultEffort?: OcxComboDefaultEffort | null;
   /** `force` makes the combo default override a valid client effort. Omitted / `fallback` preserves client precedence. */

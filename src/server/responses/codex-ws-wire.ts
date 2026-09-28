@@ -67,6 +67,26 @@ export function markCodexWsResponse(response: Response, observed: boolean): void
 }
 
 /**
+ * Carry this response's WebSocket identity onto the one that replaces it.
+ *
+ * Every entry here answers a question the status cannot: whether the body came from a socket
+ * (never an HTTP fallback), whether its quota was already observed, which stage counters the
+ * exchange reached, and whether the send is replaceable after a socket death. A layer that
+ * rebuilds the Response -- an observation wrapper, a stream guard -- hands the result to callers
+ * that key on these, so the markers have to travel with it.
+ */
+export function carryCodexWsMarkers(source: Response, rewrapped: Response): void {
+  if (codexWsUpstreamResponses.has(source)) {
+    codexWsUpstreamResponses.add(rewrapped);
+    if (quotaObservedResponses.has(source)) quotaObservedResponses.add(rewrapped);
+  }
+  const stage = codexWsStageByResponse.get(source);
+  if (stage) codexWsStageByResponse.set(rewrapped, stage);
+  const death = socketDeathStages.get(source);
+  if (death) socketDeathStages.set(rewrapped, death);
+}
+
+/**
  * The proxy's own version, stamped onto every stage record so a field report
  * can be tied to the exact build that produced it (#4191). Computed locally
  * with the same package.json IIFE management-api.ts / gui-static.ts use —
@@ -94,6 +114,12 @@ export type CodexWsStageRecord = Omit<CodexWsFailureStage, "requestBytes"> & {
   closeCode: number | null;
   /** True when the exchange ran on a pooled, previously used session. */
   reused: boolean;
+  /**
+   * True when that pooled session was opened by an EARLIER turn of the same conversation, i.e. the
+   * exchange ran on the cross-turn half of the pool. Persisted so the two halves of the lane can be
+   * compared on failures and first bytes instead of being argued about.
+   */
+  crossTurn: boolean;
   /** OpenCodex version that produced this record. */
   ocxVersion: string;
   /** Bun runtime version the exchange gated on. */
@@ -146,6 +172,49 @@ export function codexWsPreResponseFailure(status: 502 | 504, message: string, pr
   const response = new Response(JSON.stringify({ error: { type: "upstream_error", code, message } }), { status, headers });
   markResponseNonReplayable(response);
   return response;
+}
+
+/**
+ * A capacity decline the origin stated outright, settled so the caller MAY send the turn again.
+ *
+ * {@link codexWsPreResponseFailure} is deliberately non-replayable: a socket that died mid-send is
+ * ambiguous and the turn may be running. A DECLINE is not ambiguous -- the backend answered "not
+ * now" before producing anything -- and the difference is the whole reason this helper exists.
+ * Measured 2026-09-23/24: every shed that reached the client arrived as a decline after the
+ * prelude, was absorbed once by an in-socket resend, and then settled as a failure anyway (12 of 12
+ * absorbs in the log stopped at rung 1), because the second decline is not always an \`error\` frame
+ * and the socket is not always still open. Returning a replayable 503 instead lets the caller's
+ * capacity ladder re-dial a FRESH socket with its own pacing, which is the path that has been
+ * proven to work end to end.
+ */
+export function codexWsCapacityDeclineFailure(status: 502 | 503 | 504, message: string, prelude: Headers): Response {
+  const headers = new Headers(prelude);
+  headers.set("content-type", "application/json");
+  headers.set("cache-control", "no-store");
+  return new Response(JSON.stringify({
+    error: { type: "server_error", code: "server_is_overloaded", message },
+  }), { status, headers });
+}
+
+/** A socket that was reused for a later turn did not serve it. */
+export const CODEX_WS_REUSED_SOCKET_CODE = "reused_socket_declined";
+
+/**
+ * The settlement for a reused socket that answered the new turn with a verdict, or with nothing.
+ *
+ * Not the overload shape {@link codexWsCapacityDeclineFailure} carries: the socket, not the origin's
+ * capacity, is what failed here, and a decline that said nothing about capacity must not be counted
+ * as one. It IS replayable, exactly like the capacity decline -- the whole point of giving up on a
+ * reused socket is that the caller's ladder immediately re-dials a fresh one, which is the path
+ * that has always worked.
+ */
+export function codexWsReusedSocketFailure(message: string, prelude: Headers): Response {
+  const headers = new Headers(prelude);
+  headers.set("content-type", "application/json");
+  headers.set("cache-control", "no-store");
+  return new Response(JSON.stringify({
+    error: { type: "upstream_error", code: CODEX_WS_REUSED_SOCKET_CODE, message },
+  }), { status: 502, headers });
 }
 
 const CLOSED_BEFORE_TERMINAL = "codex websocket closed before a Responses terminal event";

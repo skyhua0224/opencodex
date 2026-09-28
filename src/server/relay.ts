@@ -34,9 +34,8 @@ import { replaceSseDataPayload, sseDataPayload } from "./sse-payload-rewrite";
 import { createBoundedResponseLogBody } from "./response-log-body";
 import { clientWireLogOf } from "./inference/client-wire";
 import { recordClientWireRequestLog } from "./inference/client-wire-log";
+import { isNativePassthroughSseResponse } from "./sse-response-markers";
 
-const nativePassthroughSseResponses = new WeakSet<Response>();
-const eagerRelaySseResponses = new WeakSet<Response>();
 
 export const MAX_INSPECTION_SSE_FRAME_BYTES = MAX_CLIENT_SSE_FRAME_BYTES;
 export const MAX_COMPLETED_OUTPUT_ITEMS = 256;
@@ -885,24 +884,14 @@ export function responseWithDeferredRequestLog(
   });
 }
 
-export function markNativePassthroughSseResponse(response: Response): Response {
-  nativePassthroughSseResponses.add(response);
-  return response;
-}
-
-export function isNativePassthroughSseResponse(response: Response): boolean {
-  return nativePassthroughSseResponses.has(response);
-}
-
-export function markEagerRelaySseResponse(response: Response): Response {
-  eagerRelaySseResponses.add(response);
-  return response;
-}
-
-/** Test-only path identity seam; runtime behavior must not branch on this marker. */
-export function isEagerRelaySseResponse(response: Response): boolean {
-  return eagerRelaySseResponses.has(response);
-}
+// The markers themselves live in sse-response-markers.ts: they are read and restated by layers
+// that must not pull the relay (and its request-log import) into their own import cycle.
+export {
+  markNativePassthroughSseResponse,
+  isNativePassthroughSseResponse,
+  markEagerRelaySseResponse,
+  isEagerRelaySseResponse,
+} from "./sse-response-markers";
 
 export function relaySseWithHeartbeat(
   body: ReadableStream<Uint8Array> | null,

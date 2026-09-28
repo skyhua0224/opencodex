@@ -281,6 +281,8 @@ export function createWebsocketHandler(
 
         const turnAdmissionLease = tryAdmitTurn(ws.data.sessionLaneId);
         if (!turnAdmissionLease) {
+          // This refusal creates no usage row; keep the active-turn cause visible in the service log.
+          console.warn(`[admission] refused turn on lane ${ws.data.sessionLaneId ?? "?"} (another turn is still running)`);
           sendJsonFrame(ws, buildWsErrorFrame(503, {
             type: "server_error",
             code: "server_busy",

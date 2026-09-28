@@ -1,0 +1,11 @@
+[Unit]
+Description=OpenCodex intelligence probe (quality gate)
+After=network-online.target opencodex-proxy.service
+
+[Service]
+Type=oneshot
+# One round of verified questions. A clear wrong answer holds the provider for 30 minutes
+# (combos demote it); a full clean round releases an existing hold. Transport errors, auth
+# failures and unknown verdicts never change anything. Edit the model list with:
+#   systemctl --user edit ocx-probe.service
+ExecStart=/usr/bin/python3 /home/skyhua/.opencodex/tools/pelican-probe.py --kind bank --apply --timeout 240 --judge-model deepseek/deepseek-flash --questions candy-21,socks-4,code-55 --models gpt-6-sol,ciii-codex/gpt-5.6-sol,portal/gpt-5.6-sol,lucen-codex-006/gpt-5.6-sol

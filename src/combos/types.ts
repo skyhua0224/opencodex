@@ -16,26 +16,26 @@ const COMBO_ALIAS_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}(?:\/[A-Za-z0-9][A-
 /** Bare aliases in this family require the explicit `nativeAlias` opt-in below. */
 const NATIVE_OPENAI_FAMILY_PATTERN = /^(?:gpt-|o1-|o3-|o4-|codex-)/;
 
+/**
+ * A combo target after normalization: identity plus the weight the picker needs. Kept as an
+ * explicit shape so optional per-target tuning fields stay optional after normalization.
+ */
+export type NormalizedComboTarget = OcxComboTarget & { weight: number };
+
 export interface ComboValidationIssue {
   path: Array<string | number>;
   message: string;
-}
-
-export interface NormalizedComboTarget {
-  provider: string;
-  model: string;
-  weight: number;
-  /** Emergency-only target, deferred under `cooldownWaitPolicy` (#5691). */
-  lastResort: boolean;
-  reasoningEfforts?: OcxComboDefaultEffort[];
-  /** Optional JEV decision description. */
-  modelProfile?: string;
 }
 
 export interface NormalizedComboConfig {
   strategy: OcxComboStrategy;
   stickyLimit: number;
   cooldownMs?: number;
+  firstByteTimeoutMs?: number;
+  ladderBudgetMs?: number;
+  breakerFailureThreshold?: number;
+  breakerSuccessThreshold?: number;
+  breakerOpenMs?: number;
   waitForCooldownMs: number;
   /** `before-last-resort` defers lastResort targets while a normal one can be waited out (#5691). */
   cooldownWaitPolicy: OcxComboCooldownWaitPolicy | null;
@@ -169,6 +169,39 @@ export function comboConfigIssues(
       || body.cooldownMs < 1
       || body.cooldownMs > 600_000)) {
     issues.push({ path: ["cooldownMs"], message: "cooldownMs must be an integer from 1 to 600000" });
+  }
+  if (body.firstByteTimeoutMs !== undefined
+    && (typeof body.firstByteTimeoutMs !== "number" || !Number.isInteger(body.firstByteTimeoutMs)
+      || body.firstByteTimeoutMs < 1_000
+      || body.firstByteTimeoutMs > 600_000)) {
+    issues.push({
+      path: ["firstByteTimeoutMs"],
+      message: "firstByteTimeoutMs must be an integer from 1000 to 600000",
+    });
+  }
+  if (body.ladderBudgetMs !== undefined
+    && (typeof body.ladderBudgetMs !== "number" || !Number.isInteger(body.ladderBudgetMs)
+      || body.ladderBudgetMs < 1_000
+      || body.ladderBudgetMs > 600_000)) {
+    issues.push({ path: ["ladderBudgetMs"], message: "ladderBudgetMs must be an integer from 1000 to 600000" });
+  }
+  if (body.breakerFailureThreshold !== undefined
+    && (typeof body.breakerFailureThreshold !== "number" || !Number.isInteger(body.breakerFailureThreshold)
+      || body.breakerFailureThreshold < 1
+      || body.breakerFailureThreshold > 20)) {
+    issues.push({ path: ["breakerFailureThreshold"], message: "breakerFailureThreshold must be an integer from 1 to 20" });
+  }
+  if (body.breakerSuccessThreshold !== undefined
+    && (typeof body.breakerSuccessThreshold !== "number" || !Number.isInteger(body.breakerSuccessThreshold)
+      || body.breakerSuccessThreshold < 1
+      || body.breakerSuccessThreshold > 10)) {
+    issues.push({ path: ["breakerSuccessThreshold"], message: "breakerSuccessThreshold must be an integer from 1 to 10" });
+  }
+  if (body.breakerOpenMs !== undefined
+    && (typeof body.breakerOpenMs !== "number" || !Number.isInteger(body.breakerOpenMs)
+      || body.breakerOpenMs < 1_000
+      || body.breakerOpenMs > 86_400_000)) {
+    issues.push({ path: ["breakerOpenMs"], message: "breakerOpenMs must be an integer from 1000 to 86400000" });
   }
   if (body.waitForCooldownMs !== undefined
     && (typeof body.waitForCooldownMs !== "number" || !Number.isInteger(body.waitForCooldownMs)
@@ -346,6 +379,15 @@ export function comboConfigIssues(
         message: `targets[${i}].modelProfile must be a non-empty string of at most ${JEV_MAX_CANDIDATE_FIELD_CHARS} characters; only tab, line feed and carriage return are allowed among control characters`,
       });
     }
+    if (target.firstByteTimeoutMs !== undefined
+      && (typeof target.firstByteTimeoutMs !== "number" || !Number.isInteger(target.firstByteTimeoutMs)
+        || target.firstByteTimeoutMs < 1_000
+        || target.firstByteTimeoutMs > 600_000)) {
+      issues.push({
+        path: ["targets", i, "firstByteTimeoutMs"],
+        message: `targets[${i}].firstByteTimeoutMs must be an integer from 1000 to 600000`,
+      });
+    }
 
     if (provider && model) {
       const key = targetKey({ provider, model });
@@ -386,6 +428,11 @@ export function normalizeComboConfig(raw: OcxComboConfig): NormalizedComboConfig
     strategy: raw.strategy ?? "failover",
     stickyLimit: raw.stickyLimit ?? 1,
     cooldownMs: raw.cooldownMs,
+    firstByteTimeoutMs: raw.firstByteTimeoutMs,
+    ladderBudgetMs: raw.ladderBudgetMs,
+    breakerFailureThreshold: raw.breakerFailureThreshold,
+    breakerSuccessThreshold: raw.breakerSuccessThreshold,
+    breakerOpenMs: raw.breakerOpenMs,
     waitForCooldownMs: raw.waitForCooldownMs ?? COMBO_DEFAULT_WAIT_FOR_COOLDOWN_MS,
     cooldownWaitPolicy: raw.cooldownWaitPolicy === "before-last-resort" ? "before-last-resort" : null,
     defaultEffort,
@@ -406,6 +453,9 @@ export function normalizeComboConfig(raw: OcxComboConfig): NormalizedComboConfig
         ? { modelProfile: target.modelProfile.trim() }
         : {}),
       lastResort: target.lastResort === true,
+      ...(target.firstByteTimeoutMs !== undefined
+        ? { firstByteTimeoutMs: target.firstByteTimeoutMs }
+        : {}),
     })),
   };
 }

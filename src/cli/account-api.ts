@@ -243,6 +243,8 @@ export interface ProviderQuotaReportDto {
   quota: ProviderQuotaDto;
   updatedAt?: number;
   reverseEngineered?: boolean;
+  /** Set while a capacity / risk-control verdict has the provider parked. */
+  capacityHold?: { until: number; escalations: number; reason: string };
 }
 
 interface CodexAccountDto {

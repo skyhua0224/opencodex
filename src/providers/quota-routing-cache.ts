@@ -1,9 +1,12 @@
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { OcxProviderConfig } from "../types";
 import type { ProviderQuota, ProviderQuotaReport } from "./quota";
 import { providerUsesKeyAuthOverride, resolveProviderApiKey } from "./key-store";
 import { getProviderRegistryEntry } from "./registry";
 import { PROVIDER_QUOTA_MAX_AGE_MS } from "./quota-types";
+import { getConfigDir } from "../config/paths";
 
 export interface ProviderQuotaRoutingEvidence {
   quota: ProviderQuota;
@@ -74,11 +77,103 @@ export function getCachedProviderRoutingQuota(
   // An active-key report cannot speak for the other keys the dispatcher may select.
   if ((provider.apiKeyPool?.length ?? 0) > 1) return null;
   const routing = quotaCache.get(name)?.routing;
-  if (!routing || !Number.isFinite(routing.quota.updatedAt) || routing.quota.updatedAt < 0
-    || routing.quota.updatedAt > now || now - routing.quota.updatedAt >= maxAgeMs) return null;
-  const binding = providerQuotaRoutingBinding(name, provider);
-  if (!binding || (!("testOnly" in routing) && routing.binding !== binding)) return null;
-  return routing.quota;
+  if (routing && Number.isFinite(routing.quota.updatedAt) && routing.quota.updatedAt >= 0
+    && routing.quota.updatedAt <= now && now - routing.quota.updatedAt < maxAgeMs) {
+    const binding = providerQuotaRoutingBinding(name, provider);
+    if (binding && ("testOnly" in routing || routing.binding === binding)) return routing.quota;
+  }
+  // Relay panels publish their own plan state (`ocxquota --export`). It is account-scoped, not
+  // credential-scoped, so it needs no binding -- and it is the only quota evidence these rows
+  // have at all, because no probe speaks for a third-party relay.
+  return panelProviderQuota(name, now, maxAgeMs);
+}
+
+/** How long the exported panel file is trusted after it was read from disk. */
+const PANEL_QUOTA_FILE_TTL_MS = 15_000;
+
+interface PanelQuotaEntry {
+  quota: ProviderQuota;
+  /** The site's own verdict moved this provider behind the healthy ones (never out of the ladder). */
+  degraded: boolean;
+  /** Mostly-broken per the site: skipped while alternatives exist, but never to the point of 503. */
+  hopeless: boolean;
+}
+
+let panelQuotaFile: { readAt: number; generatedAt: number; providers: Map<string, PanelQuotaEntry> } | null = null;
+
+/**
+ * One panel-published quota, in the millisecond units every quota comparison here uses.
+ *
+ * The exporter writes epoch SECONDS (that is what the panels report). A reset that is days away
+ * would otherwise read as long past and the window would never look exhausted, so the unit is
+ * fixed up once, here, at the boundary that consumes it.
+ */
+function panelEntry(name: string, now: number, maxAgeMs: number): PanelQuotaEntry | null {
+  if (!panelQuotaFile || now - panelQuotaFile.readAt >= PANEL_QUOTA_FILE_TTL_MS) {
+    let payload: unknown;
+    try {
+      payload = JSON.parse(readFileSync(join(getConfigDir(), "provider-quota.json"), "utf8"));
+    } catch {
+      panelQuotaFile = null;
+      return null;
+    }
+    const generatedAt = (payload as { generatedAt?: unknown } | null)?.generatedAt;
+    const providers = (payload as { providers?: unknown } | null)?.providers;
+    if (typeof generatedAt !== "number" || !providers || typeof providers !== "object") {
+      panelQuotaFile = null;
+      return null;
+    }
+    const map = new Map<string, PanelQuotaEntry>();
+    for (const [provider, entry] of Object.entries(providers as Record<string, unknown>)) {
+      const source = ((entry as { opencodex?: unknown } | null)?.opencodex ?? {}) as Record<string, unknown>;
+      const quota: Record<string, unknown> = { updatedAt: generatedAt };
+      for (const key of ["fiveHourPercent", "fiveHourResetAt", "weeklyPercent", "weeklyResetAt",
+        "monthlyPercent", "monthlyResetAt"] as const) {
+        const value = source[key];
+        if (typeof value !== "number" || !Number.isFinite(value)) continue;
+        quota[key] = key.endsWith("ResetAt") && value < 1e12 ? value * 1000 : value;
+      }
+      if (Array.isArray(source.customWindows)) {
+        // Availability readouts ride in this array only because it is the one shape the panel
+        // renders into a row. They are NOT quota: a site's own up/down rating must never satisfy
+        // the exhaustion predicate, which gates routing. That verdict travels separately as
+        // `official.degraded` / `official.hopeless` (a soft, self-clearing demotion).
+        quota.customWindows = (source.customWindows as Array<Record<string, unknown>>)
+          .filter(window => window && window.kind !== "availability")
+          .map(window => ({
+          label: String(window.label ?? "window"),
+          percent: typeof window.percent === "number" ? window.percent : 0,
+          ...(typeof window.resetAt === "number" && Number.isFinite(window.resetAt)
+            ? { resetAt: window.resetAt < 1e12 ? window.resetAt * 1000 : window.resetAt }
+            : {}),
+          }));
+      }
+      const official = ((entry as { official?: Record<string, unknown> } | null)?.official) ?? {};
+      const degraded = official.degraded === true;
+      const hopeless = official.hopeless === true;
+      map.set(provider, { quota: quota as unknown as ProviderQuota, degraded, hopeless });
+    }
+    panelQuotaFile = { readAt: now, generatedAt, providers: map };
+  }
+  if (now - panelQuotaFile.generatedAt >= maxAgeMs) return null;
+  return panelQuotaFile.providers.get(name) ?? null;
+}
+
+function panelProviderQuota(name: string, now: number, maxAgeMs: number): ProviderQuota | null {
+  return panelEntry(name, now, maxAgeMs)?.quota ?? null;
+}
+
+/**
+ * Official-availability tier for combo selection: `true` means the site itself reports this
+ * provider as unhealthy, so an ordered ladder should try it after the healthy ones.
+ */
+export function panelProviderDegraded(name: string, now = Date.now()): boolean {
+  return panelEntry(name, now, PROVIDER_QUOTA_MAX_AGE_MS)?.degraded === true;
+}
+
+/** The site reports this channel as mostly broken; a soft skip, so it is used as a last resort. */
+export function panelProviderHopeless(name: string, now = Date.now()): boolean {
+  return panelEntry(name, now, PROVIDER_QUOTA_MAX_AGE_MS)?.hopeless === true;
 }
 
 export function setCachedProviderQuotaForTests(

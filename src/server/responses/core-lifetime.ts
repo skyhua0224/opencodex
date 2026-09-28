@@ -1,15 +1,14 @@
 import type { TranslatorBudget } from "../../lib/translator-budget";
 import {
-  isNativePassthroughSseResponse,
-  markNativePassthroughSseResponse,
-  isEagerRelaySseResponse,
-  markEagerRelaySseResponse,
-} from "../relay";
+  createTurnStateSniffer,
+  observeTurnStateResponseHeaders,
+  observeTurnStateUpstreamStatus,
+  type TurnStateWhere,
+} from "../turn-state-observer";
+import { carryResponseMarkers } from "../../lib/response-markers";
+import { runTurnAdapterSseResponses } from "../sse-response-markers";
 
-// runTurn adapters own an event queue and perform their combo preflight before
-// bridging. A second byte-stream reader would reinterpret that transport's
-// already-committed event boundary and can replay custom adapter work.
-export const runTurnAdapterSseResponses = new WeakSet<Response>();
+export { runTurnAdapterSseResponses } from "../sse-response-markers";
 
 
 // Whole-body policy for non-streaming upstream JSON responses (see the application/json
@@ -35,12 +34,23 @@ export const UPSTREAM_JSON_BODY_READ_OPTIONS = {
 
 
 
-export function finalizeOwnedTranslatorBudget(response: Response, budget: TranslatorBudget): Response {
+/**
+ * The adapter answered with its own SSE body, already in the client's protocol.
+ *
+ * Owned here rather than in the shared marker carry so that this module and the carry do not
+ * import each other; every wrapper in this file restates it alongside the rest.
+ */
+export function finalizeOwnedTranslatorBudget(response: Response, budget: TranslatorBudget, turnStateWhere?: TurnStateWhere): Response {
   if (!response.body) {
     budget.dispose();
     return response;
   }
   const reader = response.body.getReader();
+  const turnStateSniffer = turnStateWhere ? createTurnStateSniffer(turnStateWhere) : undefined;
+  if (turnStateWhere) {
+    observeTurnStateUpstreamStatus(response.status, turnStateWhere);
+    observeTurnStateResponseHeaders(response.headers, turnStateWhere);
+  }
   let finalized = false;
   const finalize = () => {
     if (finalized) return;
@@ -52,31 +62,30 @@ export function finalizeOwnedTranslatorBudget(response: Response, budget: Transl
       try {
         const result = await reader.read();
         if (result.done) {
+          try { turnStateSniffer?.finish(); } catch { /* observer never breaks the relay */ }
           finalize();
           controller.close();
         } else {
+          try { turnStateSniffer?.feed(result.value); } catch { /* observer never breaks the relay */ }
           controller.enqueue(result.value);
         }
       } catch (error) {
+        try { turnStateSniffer?.finish(); } catch { /* observer never breaks the relay */ }
         finalize();
         controller.error(error);
       }
     },
     async cancel(reason) {
+      try { turnStateSniffer?.finish(); } catch { /* observer never breaks the relay */ }
       try { await reader.cancel(reason); } finally { finalize(); }
     },
   });
-  const finalizedResponse = new Response(body, {
+  const finalizedResponse = carryResponseMarkers(response, new Response(body, {
     status: response.status,
     statusText: response.statusText,
     headers: response.headers,
-  });
-  if (isNativePassthroughSseResponse(response)) {
-    markNativePassthroughSseResponse(finalizedResponse);
-  }
-  if (isEagerRelaySseResponse(response)) {
-    markEagerRelaySseResponse(finalizedResponse);
-  }
+  }));
+  if (runTurnAdapterSseResponses.has(response)) runTurnAdapterSseResponses.add(finalizedResponse);
   return finalizedResponse;
 }
 
@@ -96,9 +105,12 @@ export function finalizeAccountLease(response: Response, release: () => void): R
     },
     async cancel(reason) { try { await reader.cancel(reason); } finally { finish(); } },
   });
-  const wrapped = new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
-  if (isNativePassthroughSseResponse(response)) markNativePassthroughSseResponse(wrapped);
-  if (isEagerRelaySseResponse(response)) markEagerRelaySseResponse(wrapped);
+  const wrapped = carryResponseMarkers(response, new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  }));
+  if (runTurnAdapterSseResponses.has(response)) runTurnAdapterSseResponses.add(wrapped);
   return wrapped;
 }
 
