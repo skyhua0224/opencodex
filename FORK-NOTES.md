@@ -1,6 +1,6 @@
 # skyhua's opencodex fork — hardening notes
 
-A fork of **opencodex 2.69.0** (MIT, upstream: <https://github.com/lidge-jun/opencodex>) with a
+A fork of **opencodex** (MIT, upstream: <https://github.com/lidge-jun/opencodex>) with a
 set of hardening patches written against the ChatGPT Codex backend as it behaves in practice:
 capacity verdicts that arrive *after* a request is accepted, relays that answer 429/403 in
 provider-specific shapes, panel quota that only exists in a web console, and WebSocket lanes that
@@ -29,7 +29,7 @@ one of them against this list before treating it as a regression:
 | `tests/codex-integration/gpt6-native-rows.test.ts` | the fork's model roster adds the gpt-6 rows |
 | `tests/ci-workflows/*` (docs parity, release line, file-size ratchet) | the fork's own README, release naming and added files |
 
-Environment-only failures unrelated to this fork (they fail on a pristine 2.69 checkout too):
+Environment-only failures unrelated to this fork (they fail on a pristine checkout of the upstream base too):
 `tests/server/management-provider-validation.test.ts` and
 `tests/adapters/anthropic/anthropic-fast-opt-in.test.ts`.
 
@@ -100,10 +100,12 @@ ocx setup               # then: ocx start
 
 ## Relationship to upstream, and how to rebase
 
-- This fork is cut from upstream **2.69.0**; the 2.63.0 patch files under `patches/` are kept as the
-  historical record of the first cut. The way the work was carried onto 2.69.0 is the one to repeat:
-  import the upstream tree, replay this fork's change set onto it with `git apply -3`, and resolve the
-  overlapping hunks by hand -- the files both sides touch are the interesting ones.
+- The upstream base is read from the version string (`<base>-skyhua.<n>`), never from prose: a base
+  written into a document goes stale the moment the fork rebases. The patch files under `patches/` are
+  the historical record of the first cut.
+- The rebase that carried the work forward is the one to repeat: import the next upstream tree, replay this
+  fork's change set onto it with `git apply -3`, and resolve the overlapping hunks by hand --
+  the files both sides touch are the interesting ones.
 - Upstream is not affiliated with this fork; bug reports about the hardening work belong here, and
   anything about opencodex itself belongs upstream.
 - License: MIT, unchanged, with the original copyright notice (see `LICENSE`).
@@ -348,19 +350,19 @@ the turn from a second subscription (`ocx login codex`, one provider row per sub
 
 ### 12. Cutting a release
 
-The fork tags as `v<upstream version>-skyhua.<n>`, so a reader can tell which upstream its patches
-apply to. The current cut is **v2.69.0-skyhua.1**. The 2.63.0 line ended at `v2.63.0-skyhua.2` (`855f636`),
-which was itself preceded by `v2.63.0-skyhua.1` (`ab845fe`).
+The fork tags as `v<upstream base>-skyhua.<n>`, so a reader can tell which upstream its patches
+apply to. The newest such tag is the current cut (`git tag -l 'v*-skyhua.*' | sort -V | tail -1`); no
+tag is named here, because a named one goes stale the moment it is superseded.
 
 The mechanics, in order:
 
 ```bash
-git tag -a v2.69.0-skyhua.2 -m "skyhua hardening fork, based on opencodex 2.69.0 -- <what changed>"
-git push origin v2.69.0-skyhua.2      # gitea-lan
-git push github v2.69.0-skyhua.2      # github
+git tag -a v<base>-skyhua.<n> -m "skyhua hardening fork, based on opencodex <base> -- <what changed>"
+git push origin v<base>-skyhua.<n>    # gitea-lan
+git push github v<base>-skyhua.<n>    # github
 PATH=... npm pack --pack-destination /tmp/ocx-pack
 mv /tmp/ocx-pack/bitkyc08-opencodex-<version>.tgz /tmp/ocx-pack/opencodex-<version>.tgz
-gh release create v2.69.0-skyhua.2 -R skyhua0224/opencodex --latest \
+gh release create v<base>-skyhua.<n> -R skyhua0224/opencodex --latest \
   --title "..." --notes-file /tmp/notes.md /tmp/ocx-pack/opencodex-<version>.tgz
 ```
 

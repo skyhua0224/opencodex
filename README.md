@@ -2,8 +2,10 @@
 
 # opencodex — skyhua's hardening fork
 
-Fork of **opencodex 2.69.0** (MIT). Upstream: <https://github.com/lidge-jun/opencodex>.
+Fork of **opencodex** (MIT). Upstream: <https://github.com/lidge-jun/opencodex>.
 Mirrors: [GitHub](https://github.com/skyhua0224/opencodex) · [Gitea](https://gitea.sky-hua.xyz:24443/skyhua/opencodex).
+The version string carries the upstream base this cut was replayed onto (`<base>-skyhua.<n>`), so
+that fact is read from the artifact instead of being pinned here and going stale on the next rebase.
 
 This fork carries a hardening patch set written against how the ChatGPT Codex backend actually
 behaves: capacity verdicts that arrive *after* a request has been accepted, combo ladders that

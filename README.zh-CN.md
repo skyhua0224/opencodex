@@ -2,8 +2,9 @@
 
 # opencodex — skyhua 的加固分支
 
-基于 **opencodex 2.69.0**（MIT）的分支。上游：<https://github.com/lidge-jun/opencodex>。
+基于 **opencodex**（MIT）的分支。上游：<https://github.com/lidge-jun/opencodex>。
 镜像：[GitHub](https://github.com/skyhua0224/opencodex) · [Gitea](https://gitea.sky-hua.xyz:24443/skyhua/opencodex)。
+版本号自带上游基线（`<基线>-skyhua.<序号>`），基线直接从版本号读，文档里不写死，免得更新一次就过时。
 
 ## 解决的是什么问题
 
@@ -83,7 +84,7 @@ ocx-tiers --findings       # 只列逐条记录
 
 ## 几件要注意的
 
-- 版本线是 **2.69.0-skyhua.N**，更新走本仓库自己的 release：`ocx update` 取的是这里发布、带打包 tarball 的版本，不会再装回官方版。要换源（比如以后发到自己的 npm scope）在环境里设 `OCX_UPDATE_SPEC` 即可；自己从 clone 装的话，`git pull` 后重跑 `npm install -g .`。
+- 版本号形如 **`<上游基线>-skyhua.<序号>`**，基线就在版本号里；更新走本仓库自己的 release：`ocx update` 取的是这里发布、带打包 tarball 的版本，不会再装回官方版。要换源（比如以后发到自己的 npm scope）在环境里设 `OCX_UPDATE_SPEC` 即可；自己从 clone 装的话，`git pull` 后重跑 `npm install -g .`。
 - `src/oauth/google-antigravity.ts` 里那两个 Google 标识是上游自带的（文件注释里写明是 Antigravity 桌面客户端的公开标识，可用环境变量覆盖）。想用自己的就设 `GOOGLE_ANTIGRAVITY_CLIENT_ID` / `GOOGLE_ANTIGRAVITY_CLIENT_SECRET`。仓库里没别的凭据。
 - prelude 暂存最长让首包晚 25 秒，但只在后端迟迟不出字的时候；一出内容立刻放行。
 - 复读守卫的阈值（重复率 0.6、同一 40 字符片段 3 次、压缩比 8、同一工具调用 3 次）刻意保守：正常输出里的表格、测试清单不会命中。
