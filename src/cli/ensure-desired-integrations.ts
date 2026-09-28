@@ -9,11 +9,17 @@
  * each external-file mutation, and use that current config for sync inputs.
  */
 import { loadConfig } from "../config";
+import { cliFirstPartyDesired, firstPartyDesired, reconcileClaudeFirstPartySettings } from "../claude/first-party-settings";
+import { claudeInterceptEnabled } from "../claude/intercept/runtime";
+import { removeDesktopPickerArtifacts } from "../claude/desktop-picker";
+import { findLiveProxy } from "../server/proxy-liveness";
+import { runtimeRequest } from "./runtime-api";
 import { stripGrokConfig, type GrokInjectResult } from "../grok/inject";
 import { inspectDesktop3pConfigLibrary, removeDesktop3pStandardPivot } from "../claude/desktop-3p";
 import {
   applyDesktopFirstParty,
   inspectDesktopFirstParty,
+  observeClaudeDesktopMode,
   removeDesktopFirstParty,
   resolveClaudeDesktopMode,
 } from "../claude/desktop-first-party";
@@ -24,6 +30,7 @@ import {
   shouldSyncGrokOnStart,
 } from "../codex/desired-state";
 import type { OcxConfig } from "../types";
+import { siblingOfLivePort, siblingSkipMessage } from "../codex/sibling-start";
 
 export function grokSyncFailureMessage(err: unknown): string {
   const detail = err instanceof Error ? err.message : String(err);
@@ -44,7 +51,12 @@ export interface EnsureDesiredIntegrationsDeps {
   removeDesktopFirstParty?: typeof removeDesktopFirstParty;
   applyDesktopFirstParty?: typeof applyDesktopFirstParty;
   inspectDesktopFirstParty?: typeof inspectDesktopFirstParty;
+  observeClaudeDesktopMode?: typeof observeClaudeDesktopMode;
+  reconcileClaudeFirstPartySettings?: typeof reconcileClaudeFirstPartySettings;
   inspectDesktop3pConfigLibrary?: typeof inspectDesktop3pConfigLibrary;
+  findLiveProxyImpl?: typeof findLiveProxy;
+  runtimeRequestImpl?: typeof runtimeRequest;
+  removeDesktopPickerArtifacts?: typeof removeDesktopPickerArtifacts;
   log?: (message: string) => void;
   error?: (message: string) => void;
 }
@@ -90,6 +102,10 @@ export async function ensureGrokFenceMatchesDesired(
 ): Promise<void> {
   const config = deps.loadConfig();
   const { log, error } = io(deps);
+  if (siblingOfLivePort() !== null) {
+    log(`   ${siblingSkipMessage()} ~/.grok/config.toml was left exactly as it is.`);
+    return;
+  }
   // A hub-gated skip is NOT "the user turned Grok off" (#4236). Stripping the managed block
   // there deleted a fence the operator still wants — and `ocx ensure` reported it as the
   // Grok toggle doing its job. Only an explicit OFF authorizes the strip; the gate just
@@ -130,13 +146,22 @@ export async function ensureGrokFenceMatchesDesired(
  * When it is ON in first-party mode, refresh a stale env (the intercept port follows the
  * public port, so a port change would otherwise leave Claude Code pointed at a dead proxy).
  */
-export function ensureClaudeDesktopMatchesDesired(
+export async function ensureClaudeDesktopMatchesDesired(
   deps: EnsureDesiredIntegrationsDeps = productionDeps,
-): void {
+): Promise<void> {
   const config = deps.loadConfig();
   const { log, error } = io(deps);
+  if (cliFirstPartyDesired(config)) {
+    const seen = (deps.inspectDesktopFirstParty ?? inspectDesktopFirstParty)(config);
+    if (seen.settings.kind === "absent" || seen.stale || !claudeInterceptEnabled(config)) {
+      const result = (deps.reconcileClaudeFirstPartySettings ?? reconcileClaudeFirstPartySettings)(config,
+        firstPartyDesired(config, (deps.observeClaudeDesktopMode ?? observeClaudeDesktopMode)(config)));
+      if (result.ok && result.changed) log(`   + Claude CLI first-party env refreshed (${result.path})`);
+      else if (!result.ok) error(`⚠️  Claude CLI first-party env refresh skipped: ${result.reason}.`);
+    }
+  }
   if (claudeDesktopIntegrationEnabled(config)) {
-    if (resolveClaudeDesktopMode(config) !== "first-party") return;
+    if (resolveClaudeDesktopMode(config, (deps.observeClaudeDesktopMode ?? observeClaudeDesktopMode)(config)) !== "first-party") return;
     const library = (deps.inspectDesktop3pConfigLibrary ?? inspectDesktop3pConfigLibrary)({
       appliedFingerprint: config.claudeCode?.desktopProfile?.appliedFingerprint ?? null,
     });
@@ -154,8 +179,26 @@ export function ensureClaudeDesktopMatchesDesired(
     return;
   }
   try {
-    const env = (deps.removeDesktopFirstParty ?? removeDesktopFirstParty)();
+    const live = await (deps.findLiveProxyImpl ?? findLiveProxy)();
+    if (live) {
+      const request = deps.runtimeRequestImpl ?? runtimeRequest;
+      await request(
+        "/api/claude-desktop/picker",
+        { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: false, persist: false }) },
+        deps.findLiveProxyImpl ? { findLiveProxy: deps.findLiveProxyImpl } : {},
+      );
+    } else {
+      const removed = await (deps.removeDesktopPickerArtifacts ?? removeDesktopPickerArtifacts)({});
+      if (!removed.ok) error(`⚠️  Claude Desktop picker cleanup skipped${removed.residual?.length ? `: ${removed.residual.join(", ")}` : ""}.`);
+    }
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    error(`⚠️  Claude Desktop picker cleanup skipped: ${detail}.`);
+  }
+  try {
+    const env = (deps.removeDesktopFirstParty ?? removeDesktopFirstParty)(deps.loadConfig());
     if (env.ok && env.changed) log("   ↩️  Claude Desktop first-party env removed.");
+    else if (env.ok && env.retainedFor === "cli") log("   = Shared first-party env retained for Claude Code CLI.");
     else if (!env.ok) error(`⚠️  Claude Desktop first-party env cleanup skipped: ${env.reason} (${env.path}).`);
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
@@ -196,5 +239,5 @@ export async function reconcileEnsureDesiredIntegrations(
     liveHost ? { hostname: liveHost } : {},
     deps,
   );
-  ensureClaudeDesktopMatchesDesired(deps);
+  await ensureClaudeDesktopMatchesDesired(deps);
 }

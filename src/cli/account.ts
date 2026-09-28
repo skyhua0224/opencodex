@@ -1,5 +1,6 @@
 /** `ocx account` — list and switch provider credentials (issue #180). */
 import { loadConfig } from "../config";
+import { explainCodexUseOutcome, reportCodexAccountTargetError, resolveCodexUseTarget } from "./account-target";
 import { providerCodexAccountMode } from "../providers/registry";
 import type { OcxConfig } from "../types";
 import {
@@ -43,30 +44,35 @@ const ACCOUNT_USAGE = `Usage:
   ocx account list [provider] [--json] [--all] [--quota [--refresh]]
   ocx account history openai <pool-account-id> [--limit <1-200>] [--json]
   ocx account current <provider> [--json]
-  ocx account use <provider> <account-or-key-id|main> [--json]
+  ocx account use <provider> <account-or-key-id|alias|main|auto> [--json]
+  ocx account clear <provider> [--json]
   ocx account refresh <provider> [--json]
   ocx account auto-switch <provider> <on|off|status|threshold <0-100>> [--json]
-  ocx account alias <provider> <account-or-key-id> <display-name|-> [--json]
-  ocx account priority <provider> <account-id|main> [<-100..100|first|earlier|normal|later|last|reset>] [--json]
-  ocx account pause <provider> <account-id|main> [--json]
-  ocx account resume <provider> <account-id|main> [--json]
+  ocx account alias <provider> <account-or-key-id|alias> <display-name|-> [--json]
+  ocx account priority <provider> <account-id|alias|main> [<-100..100|first|earlier|normal|later|last|reset>] [--json]
+  ocx account pause <provider> <account-id|alias|main> [--json]
+  ocx account resume <provider> <account-id|alias|main> [--json]
   ocx account pause-exhausted <provider> [--json]
-  ocx account strategy <provider> [<quota|round-robin|fill-first|reset-first>] [--json]
+  ocx account strategy <provider> [<quota|round-robin|fill-first|least-loaded|reset-first>] [--json]
   ocx account sticky <provider> [<1-100>] [--json]
-  ocx account remove <provider> <account-or-key-id|main> --yes [--json]
-  ocx account clear-cooldown <provider> <account-id|main> [--json]
+  ocx account remove <provider> <account-or-key-id|alias|main> --yes [--json]
+  ocx account clear-cooldown <provider> <account-id|alias|main> [--json]
   ocx account add-key <provider> [--label <label>] [--json]
   ocx account import <provider> --format <format> (--file <path>|--stdin) [--json]
   ocx account import-orca --source <orca-data-directory> --registry <orca-data.json> [--apply] [--json]
   ocx account login <provider> [--id <account-id>] [--reauth] [--code -] [--no-wait] [--json]
   ocx account code <provider> [--flow <flow-id>] [--json]   (reads the code from stdin)
-  ocx account cancel <provider> [--flow <flow-id>] [--json]
+  ocx account cancel <provider> [--flow <flow-id>] [--json] (--flow required for codex)
   ocx account reset-credits <account-id|main> [--consume --yes] [--json]
   ocx account grok-reset-coupons [<account-id>] [--consume --yes] [--token-id <token-id>] [--json]
   ocx account main <doctor|list|register|add|reauth|switch|recover> ...
 
 List and switch provider accounts and API-key pools (masked output only).
-'main' selects the Codex App login for the openai account pool.`;
+'main' selects the Codex App login for the openai account pool; 'auto' clears the
+selection so the pool places work by its own strategy — unless an account actually
+carries that id, which wins, so 'ocx account clear' is the spelling that always
+clears. A Codex account can be named by the alias set with 'ocx account alias'
+wherever an id is accepted.`;
 
 function consumeFlag(args: string[], flag: string): boolean {
   const idx = args.indexOf(flag);
@@ -101,7 +107,10 @@ function statusText(row: AccountRow): string {
   // held out -- so printing only one of the two would hide exactly the confusing case (#2703).
   if (row.paused) parts.push("paused");
   if (row.active) parts.push(row.type === "codex" ? "selected" : "active");
-  if (row.needsReauth) parts.push("needs-reauth");
+  if (row.needsReauth && !(row.provider === "kiro" && row.skipReason === "needs_reauth")) parts.push("needs-reauth");
+  // A paused Kiro row already says "paused"; repeating it as a skip reason adds nothing.
+  if (row.provider === "kiro" && row.autoSelectable === false && !(row.paused && row.skipReason === "paused"))
+    parts.push(row.skipReason ? `not-auto-selected(${row.skipReason})` : "not-auto-selected");
   if (row.validationPending) parts.push("validation-pending");
   if (row.selectionExcludedReason === "plan_excluded") {
     parts.push(`not-auto-selected(plan=${row.selectionExcludedPlan ?? row.plan ?? "unknown"})`);
@@ -310,9 +319,12 @@ async function cmdUse(rest: string[], deps: AccountDeps): Promise<number> {
   if (!baseUrl) return proxyUnreachable();
 
   let res: ApiResult;
-  let activeId: string;
+  let activeId: string | null;
   if (c.type === "codex") {
-    activeId = id === MAIN_ALIAS ? MAIN_CODEX_ID : id;
+    const target = await resolveCodexUseTarget(deps, baseUrl, id);
+    if ("networkDown" in target) return proxyUnreachable(target.transportError);
+    if ("error" in target) return reportCodexAccountTargetError(target);
+    activeId = target.accountId;
     res = await apiJson(deps, baseUrl, "PUT", "/api/codex-auth/active", { accountId: activeId });
   } else if (c.type === "oauth") {
     activeId = id;
@@ -336,26 +348,50 @@ async function cmdUse(rest: string[], deps: AccountDeps): Promise<number> {
       ...(pinDrainReason !== undefined ? { pinDrained: true, pinDrainReason } : {}),
     }, null, 2));
   } else {
-    console.log(`${name}: active ${c.type === "api-key" ? "key" : "account"} is now ${displayId(activeId)}`);
+    console.log(activeId === null
+      ? `${name}: automatic account selection (pin cleared)`
+      : `${name}: active ${c.type === "api-key" ? "key" : "account"} is now ${displayId(activeId)}`);
   }
-  if (c.type === "codex") {
-    console.error("Takes effect immediately; running threads move on their next request, and in-flight requests keep the account they captured.");
-    const active = await apiJson(deps, baseUrl, "GET", "/api/codex-auth/active");
-    const threshold = active.status === 200 && typeof active.json.autoSwitchThreshold === "number"
-      ? active.json.autoSwitchThreshold
-      : undefined;
-    if (pinDrainReason !== undefined) {
-      // "may override" is the right caveat for a pin that is currently fine and could be
-      // overtaken later. It is the wrong sentence for one the next request will discard, and
-      // printing only that is what left the operator believing the account was pinned.
-      const because = pinDrainReason === "quota_threshold"
-        ? `is at or above the auto-switch threshold${threshold !== undefined ? ` (${threshold}%)` : ""}`
-        : `cannot currently be selected (${pinDrainReason})`;
-      console.error(`Note: ${displayId(activeId)} ${because}, so routing releases this pin on its next request.`);
-    } else if (threshold !== undefined && threshold > 0) {
-      console.error(`Note: auto-switch (threshold ${threshold}%) may override this pin.`);
-    }
+  if (c.type === "codex") await explainCodexUseOutcome(deps, baseUrl, name, activeId, pinDrainReason);
+  return 0;
+}
+
+/** `ocx account clear` never resolves its argument as an account id, so an account literally
+ * named `auto` cannot shadow the verb that returns the pool to automatic selection. */
+async function cmdClear(rest: string[], deps: AccountDeps): Promise<number> {
+  const wantsJson = consumeFlag(rest, "--json");
+  const name = rest.shift();
+  const leftover = leftoverArgsError(rest);
+  if (!name || leftover) {
+    if (leftover) console.error(leftover);
+    console.error(ACCOUNT_USAGE);
+    return 1;
   }
+  const config = deps.loadConfigImpl?.() ?? loadConfig();
+  const c = classifyAccount(config, name);
+  if ("error" in c) {
+    console.error(`Error: ${c.error}. Known candidates: ${candidateNames(config)}`);
+    return 1;
+  }
+  if (c.type !== "codex") {
+    console.error(`Error: ${name} has no automatic-selection pin to clear; clear applies to Codex account pools`);
+    return 1;
+  }
+  const baseUrl = await resolveBaseUrl(deps);
+  if (!baseUrl) return proxyUnreachable();
+  const res = await apiJson(deps, baseUrl, "PUT", "/api/codex-auth/active", { accountId: null });
+  if (res.status === 0) return proxyUnreachable(res.transportError);
+  if (res.status !== 200) return apiError(res.json, `failed to clear ${name}`, res.status);
+  const pinDrainReason = typeof res.json.pinDrainReason === "string" ? res.json.pinDrainReason : undefined;
+  if (wantsJson) {
+    console.log(JSON.stringify({
+      ok: true, provider: name, type: c.type, activeId: null,
+      ...(pinDrainReason !== undefined ? { pinDrained: true, pinDrainReason } : {}),
+    }, null, 2));
+  } else {
+    console.log(`${name}: automatic account selection (pin cleared)`);
+  }
+  await explainCodexUseOutcome(deps, baseUrl, name, null, pinDrainReason);
   return 0;
 }
 
@@ -369,6 +405,7 @@ export async function cmdAccount(args: string[], deps: AccountDeps = {}): Promis
     }
     if (sub === "current") return await cmdCurrent(rest, deps);
     if (sub === "use") return await cmdUse(rest, deps);
+    if (sub === "clear") return await cmdClear(rest, deps);
     if (sub === "refresh") return await cmdRefresh(rest, deps);
     if (sub === "auto-switch") return await cmdAutoSwitch(rest, deps);
     if (sub === "alias" || sub === "rename") return await cmdAlias(rest, deps);

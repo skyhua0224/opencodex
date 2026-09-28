@@ -19,11 +19,13 @@ import {
   getLoginStatus,
   isPublicOAuthProvider,
   listOAuthProviders,
+  OAUTH_PROVIDERS,
   publicOAuthAuthenticationErrorMessage,
   startLoginFlow,
   submitManualLoginCode,
 } from "../../oauth";
 import { OAuthMutationBusyError, removeCredential } from "../../oauth/store";
+import { cancelKiroDeviceLogin, kiroDeviceConfigBaseline, startKiroDeviceLogin, statusKiroDeviceLogin, type KiroDeviceMethod } from "../../oauth/kiro-device-login";
 import { providerDestinationResolvedError } from "../../lib/destination-policy";
 import { emailMaskingEnabled } from "../../lib/privacy";
 import { reconcileLiveStateStores } from "../../lib/state-store-registrations";
@@ -59,7 +61,7 @@ import {
   setDebugSettings,
   type DebugFlag,
 } from "../../lib/debug-settings";
-import type { OcxClaudeCodeConfig, OcxConfig, OcxCustomModel, OcxProviderConfig } from "../../types";
+import type { OcxApiKeyEntry, OcxClaudeCodeConfig, OcxConfig, OcxCustomModel, OcxProviderConfig } from "../../types";
 import { drainAndShutdown } from "../lifecycle";
 import { filterRequestLogs, getRequestLogEntries, type RequestLogEntry } from "../request-log";
 import { estimateComboCost, estimateRequestCost, normalizeCostTokens, tokensPerSecond } from "../../usage/cost";
@@ -147,8 +149,66 @@ function validateKeyName(
   return { value };
 }
 
+export type IssuedApiKey = Pick<OcxApiKeyEntry, "id" | "name" | "key" | "createdAt">;
+
+/** Shared one-time data-key issuance used by the dashboard and link transactions. */
+export function issueApiKeyInProcess(config: OcxConfig, name: string): IssuedApiKey {
+  const checked = validateKeyName(name, { required: true });
+  if ("error" in checked) throw new Error(checked.error);
+  const entry: IssuedApiKey = {
+    id: randomUUID(),
+    name: checked.value,
+    key: `ocx_data_${randomBytes(20).toString("hex")}`,
+    createdAt: new Date().toISOString(),
+  };
+  const previous = config.apiKeys;
+  config.apiKeys = [...(previous ?? []), entry];
+  try {
+    saveConfigPreservingClaudeCode(config);
+    reconcileLiveStateStores();
+  } catch (error) {
+    config.apiKeys = previous;
+    throw error;
+  }
+  return entry;
+}
+
+/** Revoke and persist one data key; callers can retain their own record on false. */
+export function revokeApiKeyInProcess(config: OcxConfig, id: string): boolean {
+  const before = config.apiKeys ?? [];
+  if (!before.some(key => key.id === id)) return false;
+  config.apiKeys = before.filter(key => key.id !== id);
+  try {
+    saveConfigPreservingClaudeCode(config);
+    reconcileLiveStateStores();
+  } catch (error) {
+    config.apiKeys = before;
+    throw error;
+  }
+  return true;
+}
+
+function canStartManagementOAuth(provider: string, principal: ManagementContext["principal"]): boolean {
+  return provider !== "meta-muse" || principal === "gui-session";
+}
+
+function metaMuseConsentRequired(provider: string, principal: ManagementContext["principal"]): Response | null {
+  if (canStartManagementOAuth(provider, principal)) return null;
+  return jsonResponse({
+    error: "Meta Muse login requires acknowledgement in the OpenCodex dashboard.",
+    code: "oauth_consent_required",
+  }, 403);
+}
+
+function genericOAuthProviderConfig(provider: string, config: ManagementContext["config"]) {
+  const configured = config.providers[provider];
+  if (configured) return configured;
+  const definition = OAUTH_PROVIDERS[provider];
+  return definition?.resolveProviderConfig?.(config) ?? definition?.providerConfig;
+}
+
 export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<Response | null> {
-  const { req, url, config, deps, syncClaudeAgentDefsBestEffort } = ctx;
+  const { req, url, config, deps, principal, syncClaudeAgentDefsBestEffort } = ctx;
 
   if (url.pathname === "/api/accounts/events" && req.method === "GET") {
     const { accountSelectionStream } = await import("./account-selection-stream");
@@ -157,7 +217,9 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
 
   // Which providers support real OAuth login (drives the GUI's "Log in with …" buttons).
   if (url.pathname === "/api/oauth/providers" && req.method === "GET") {
-    return jsonResponse({ providers: listOAuthProviders() });
+    // Discovery reflects this principal's admission; hiding a button is not the
+    // consent boundary, which remains independently enforced on both POST routes.
+    return jsonResponse({ providers: listOAuthProviders().filter(provider => canStartManagementOAuth(provider, principal)) });
   }
 
   // API-key "login" providers (open dashboard → paste key). Drives the GUI's key-provider picker.
@@ -169,13 +231,33 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
   // the provider's loopback callback server (inside this process) captures the redirect in the
   // background, then the credential is persisted. The GUI opens the URL and polls /api/oauth/status.
   if (url.pathname === "/api/oauth/login" && req.method === "POST") {
-    const body = await readManagementJsonBodyOr(req, {}) as { provider?: string; addAccount?: boolean; accountId?: string; reauth?: boolean; openBrowser?: unknown };
+    const body = await readManagementJsonBodyOr(req, {}) as { provider?: string; addAccount?: boolean; accountId?: string; reauth?: boolean; openBrowser?: unknown; method?: unknown };
     const provider = (body.provider ?? "").trim().toLowerCase();
     if (!isPublicOAuthProvider(provider)) return jsonResponse({ error: "unknown oauth provider" }, 400);
+    // Muse may import a local Keychain credential or start a device grant; add-account
+    // and reauth skip the import. All management login paths require the dashboard
+    // principal before credential acquisition. A raw token proves administration,
+    // not acknowledgement; caller-supplied headers are not consent evidence.
+    const consentRequired = metaMuseConsentRequired(provider, principal);
+    if (consentRequired) return consentRequired;
     const namespaceCollision = codexAccountNamespaceProviderCollisionError(config.codexAccountNamespaces, provider);
     if (namespaceCollision) return jsonResponse({ error: namespaceCollision }, 409);
     const accountId = body.accountId?.trim();
     const reauth = body.reauth === true || Boolean(accountId);
+    if (provider === "kiro") {
+      if (reauth && !accountId) return jsonResponse({ error: "Kiro reauth requires an accountId" }, 400);
+      if (body.method !== undefined) {
+        if (body.method !== "builder-id" && body.method !== "google" && body.method !== "github") {
+          return jsonResponse({ error: "invalid Kiro device method" }, 400);
+        }
+        if (reauth) return jsonResponse({ error: "native_login_is_add_only" }, 400);
+        try {
+          return jsonResponse(await startKiroDeviceLogin(body.method as KiroDeviceMethod, principal ?? "admin-token", readConfigDiagnostics().config));
+        } catch {
+          return jsonResponse({ error: "Kiro device login could not start" }, 409);
+        }
+      }
+    }
     try {
       if (accountId) {
         const { getAccountSet } = await import("../../oauth/store");
@@ -228,9 +310,14 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
   // Cancel an in-progress browser/device OAuth login (GUI "Cancel" / modal close). Guarded by
   // the same public predicate as /api/oauth/login — only publicly startable flows are cancellable.
   if (url.pathname === "/api/oauth/login/cancel" && req.method === "POST") {
-    const body = await readManagementJsonBodyOr(req, {}) as { provider?: string };
+    const body = await readManagementJsonBodyOr(req, {}) as { provider?: string; flowId?: unknown };
     const provider = (body.provider ?? "").trim().toLowerCase();
     if (!isPublicOAuthProvider(provider)) return jsonResponse({ error: "unknown oauth provider" }, 400);
+    if (provider === "kiro" && body.flowId !== undefined) {
+      if (typeof body.flowId !== "string") return jsonResponse({ error: "unknown login flow" }, 404);
+      const result = cancelKiroDeviceLogin(body.flowId, principal ?? "admin-token");
+      return result ? jsonResponse(result) : jsonResponse({ error: "unknown login flow" }, 404);
+    }
     const { cancelLoginFlow } = await import("../../oauth");
     const cancelled = cancelLoginFlow(provider);
     return jsonResponse({ ok: true, cancelled });
@@ -242,6 +329,8 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
     const body = await readManagementJsonBodyOr(req, {}) as { provider?: string; input?: string; code?: string };
     const provider = (body.provider ?? "").trim().toLowerCase();
     if (!isPublicOAuthProvider(provider)) return jsonResponse({ error: "unknown oauth provider" }, 400);
+    const consentRequired = metaMuseConsentRequired(provider, principal);
+    if (consentRequired) return consentRequired;
     const input = typeof body.input === "string" ? body.input : typeof body.code === "string" ? body.code : "";
     // Authorization responses are measured in hundreds of bytes; never accept the
     // generic management-body allowance here.
@@ -254,6 +343,17 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
   if (url.pathname === "/api/oauth/status" && req.method === "GET") {
     const provider = (url.searchParams.get("provider") ?? "").trim().toLowerCase();
     if (!isPublicOAuthProvider(provider)) return jsonResponse({ error: "unknown oauth provider" }, 400);
+    if (provider === "kiro" && url.searchParams.has("flowId")) {
+      const flowId = url.searchParams.get("flowId") ?? "";
+      const baseline = kiroDeviceConfigBaseline(flowId, principal ?? "admin-token");
+      const status = await statusKiroDeviceLogin(flowId, principal ?? "admin-token");
+      if (!status) return jsonResponse({ error: "unknown login flow" }, 404);
+      if (status.state === "done") {
+        reconcileLiveConfigFromDisk(config, baseline ?? structuredClone(config));
+        reconcileLiveStateStores();
+      }
+      return jsonResponse(status);
+    }
     // Resolved here, at the request boundary that already holds the config, and passed down.
     // getLoginStatus stays free of config I/O. This route does not re-mask afterwards: it
     // consumes the already-projected status rather than redacting a second time.
@@ -292,6 +392,10 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
     const quotaMode = providerOAuthAccountQuotaMode(provider);
     const quotaProvider = config.providers[provider];
     const { getAccountSet } = await import("../../oauth/store");
+    const { isGenericFailoverProvider, kiroAutoSelection } = await import("../../oauth/generic-account-failover");
+    const effectiveProvider = genericOAuthProviderConfig(provider, config);
+    const supportsPause = effectiveProvider !== undefined
+      && isGenericFailoverProvider(provider, effectiveProvider);
     const {
       oauthAccountHealthFields,
       projectOAuthAccountHealth,
@@ -310,7 +414,9 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
               needsReauth: summary.needsReauth === true,
               reauthReason: summary.needsReauth === true ? "refresh_failed" : undefined,
             });
-          return { ...summary, ...oauthAccountHealthFields(provider, summary.id, health), quotaMode };
+          return { ...summary, ...oauthAccountHealthFields(provider, summary.id, health), quotaMode,
+            ...(supportsPause ? { paused: full?.paused === true } : {}),
+            ...(provider === "kiro" && full ? kiroAutoSelection(full) : {}) };
         }),
       };
     };
@@ -355,8 +461,15 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
     const provider = (body.provider ?? "").trim().toLowerCase();
     if (!isPublicOAuthProvider(provider)) return jsonResponse({ error: "unknown oauth provider" }, 400);
     if (!body.accountId) return jsonResponse({ error: "missing accountId" }, 400);
-    const { setActiveAccount } = await import("../../oauth/store");
-    if (!(await setActiveAccount(provider, body.accountId))) return jsonResponse({ error: "account not found" }, 404);
+    const { getAccountCredentialWithStatus, setActiveAccount } = await import("../../oauth/store");
+    const current = getAccountCredentialWithStatus(provider, body.accountId);
+    if (!current) return jsonResponse({ error: "account not found" }, 404);
+    if (current.paused) return jsonResponse({ error: "account is paused" }, 409);
+    if (!(await setActiveAccount(provider, body.accountId))) {
+      const latest = getAccountCredentialWithStatus(provider, body.accountId);
+      if (!latest) return jsonResponse({ error: "account not found" }, 404);
+      return jsonResponse({ error: latest.paused ? "account is paused" : "account selection changed" }, 409);
+    }
     const { forgetGenericFailoverRoster } = await import("../../oauth/generic-account-failover");
     forgetGenericFailoverRoster(provider);
     // Seed the rotation cursor on the operator's pick, or a sticky round-robin ring hands the
@@ -378,20 +491,61 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
     return jsonResponse({ ok: true, provider, activeAccountId: body.accountId });
   }
 
+  if (url.pathname === "/api/oauth/accounts/pause" && req.method === "PUT") {
+    const body = await readManagementJsonBodyOr(req, {});
+    if (!isPlainRecord(body)) return jsonResponse({ error: "body must be an object" }, 400);
+    const provider = typeof body.provider === "string" ? body.provider.trim().toLowerCase() : "";
+    if (!isPublicOAuthProvider(provider)) return jsonResponse({ error: "unknown oauth provider" }, 400);
+    if (typeof body.accountId !== "string" || body.accountId.length === 0) {
+      return jsonResponse({ error: "missing accountId" }, 400);
+    }
+    if (typeof body.paused !== "boolean") return jsonResponse({ error: "paused must be a boolean" }, 400);
+
+    const { isGenericFailoverProvider } = await import("../../oauth/generic-account-failover");
+    const effectiveProvider = genericOAuthProviderConfig(provider, config);
+    if (!effectiveProvider || !isGenericFailoverProvider(provider, effectiveProvider)) {
+      return jsonResponse({ error: "account pause is not supported for this OAuth provider" }, 400);
+    }
+
+    const { setAccountPaused } = await import("../../oauth/store");
+    const result = await setAccountPaused(provider, body.accountId, body.paused);
+    if (result.status === "not-found") return jsonResponse({ error: "account not found" }, 404);
+
+    if (result.activeAccountChanged) {
+      const { genericPoolKey, seedPoolRotationAccount } = await import("../../oauth/pool-kernel");
+      seedPoolRotationAccount(genericPoolKey(provider), result.activeAccountId);
+      const { clearModelCache } = await import("../../codex/model-cache");
+      const { clearGatherRoutedModelsInflight } = await import("../../codex/catalog");
+      clearModelCache(provider);
+      clearGatherRoutedModelsInflight();
+      const { clearProviderQuotaCache } = await import("../../providers/quota");
+      clearProviderQuotaCache();
+    }
+
+    return jsonResponse({
+      ok: true,
+      provider,
+      accountId: body.accountId,
+      paused: body.paused,
+      activeAccountId: result.activeAccountId,
+      activeAccountChanged: result.activeAccountChanged,
+    });
+  }
+
   // The unified pool-settings contract (#695 wp5c). The three legacy paths keep working and
   // keep their own shapes -- goldens pin them -- but this is the one an operator or a dashboard
   // should read, because it answers with the same keys for every kind and DECLARES which of
   // them that kind honours.
   if (url.pathname === "/api/pool/settings" && (req.method === "GET" || req.method === "PUT" || req.method === "PATCH")) {
     const {
-      poolSettingsCapability, parseGenericPoolStrategy, parseGenericAutoSwitchThreshold, parseGenericStickyLimit,
+      poolSettingsCapability, parseGenericPoolStrategy, parseGenericAutoSwitchThreshold, parseGenericStickyLimit, parseKiroAccountCap,
       unifiedPoolSettingsDto,
     } = await import("../../oauth/pool-settings-capability");
     const rawBody = req.method === "GET" ? {} : await readManagementJsonBodyOr(req, {});
     if (req.method !== "GET" && !isPlainRecord(rawBody)) {
       return jsonResponse({ error: "body must be an object" }, 400);
     }
-    const fields = rawBody as { provider?: unknown; enabled?: unknown; strategy?: unknown; stickyLimit?: unknown; autoSwitchThreshold?: unknown; quotaWindow?: unknown };
+    const fields = rawBody as { provider?: unknown; enabled?: unknown; strategy?: unknown; stickyLimit?: unknown; autoSwitchThreshold?: unknown; quotaWindow?: unknown; maxConcurrentPerAccount?: unknown };
     const provider = req.method === "GET"
       ? (url.searchParams.get("provider") ?? "").trim().toLowerCase()
       : (typeof fields.provider === "string" ? fields.provider.trim().toLowerCase() : "");
@@ -403,10 +557,10 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
     // sticky limit is refused identically whichever pool is addressed.
     let strategy: string | undefined;
     if (fields.strategy !== undefined) {
-      const parsed = kind === "codex" ? parseCodexAccountPoolStrategy(fields.strategy) : parseGenericPoolStrategy(fields.strategy);
+      const parsed = kind === "codex" ? parseCodexAccountPoolStrategy(fields.strategy) : parseGenericPoolStrategy(fields.strategy, provider);
       if (parsed === null) return jsonResponse({ error: kind === "codex"
         ? "strategy must be one of: quota, round-robin, fill-first, reset-first"
-        : "strategy must be one of: quota, round-robin, fill-first" }, 400);
+        : `strategy must be one of: quota, round-robin, fill-first${provider === "kiro" ? ", least-loaded" : ""}` }, 400);
       strategy = parsed;
     }
     let stickyLimit: number | undefined;
@@ -434,6 +588,12 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
       if (kind === "codex") return jsonResponse({ error: "enabled is not part of the codex pool contract" }, 400);
       if (typeof fields.enabled !== "boolean") return jsonResponse({ error: "enabled must be a boolean" }, 400);
     }
+    let accountCap: number | null | undefined;
+    if (fields.maxConcurrentPerAccount !== undefined) {
+      if (provider !== "kiro" || kind !== "generic") return jsonResponse({ error: "maxConcurrentPerAccount is only supported for Kiro OAuth" }, 400);
+      accountCap = fields.maxConcurrentPerAccount === null ? null : parseKiroAccountCap(fields.maxConcurrentPerAccount);
+      if (accountCap === null && fields.maxConcurrentPerAccount !== null) return jsonResponse({ error: "maxConcurrentPerAccount must be an integer 1-100 or null" }, 400);
+    }
 
     if (req.method !== "GET") {
       if (kind === "codex") {
@@ -453,6 +613,8 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
         const next = { ...(prov.oauthAccountFailover ?? {}) };
         if (fields.enabled !== undefined) next.enabled = fields.enabled as boolean;
         if (strategy !== undefined) next.strategy = strategy as never;
+        if (accountCap === null) delete next.maxConcurrentPerAccount;
+        else if (accountCap !== undefined) next.maxConcurrentPerAccount = accountCap;
         if (stickyLimit !== undefined) next.stickyLimit = stickyLimit;
         if (autoSwitchThreshold !== undefined) next.autoSwitchThreshold = autoSwitchThreshold;
         if (Object.keys(next).length > 0) prov.oauthAccountFailover = next;
@@ -503,12 +665,13 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
       strategy?: unknown;
       stickyLimit?: unknown;
       quotaWindow?: unknown;
+      maxConcurrentPerAccount?: unknown;
     };
     const provider = typeof body.provider === "string" ? body.provider.trim().toLowerCase() : "";
     if (provider !== "anthropic") {
       const {
         poolSettingsCapability, genericPoolSettingsDto, parseGenericPoolStrategy, parseGenericAutoSwitchThreshold,
-        parseGenericStickyLimit,
+        parseGenericStickyLimit, parseKiroAccountCap,
       } = await import("../../oauth/pool-settings-capability");
       const prov = config.providers[provider];
       if (!provider || !prov || poolSettingsCapability(provider, prov) !== "generic") {
@@ -525,8 +688,8 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
       if (body.strategy !== undefined) {
         if (body.strategy === null) delete next.strategy;
         else {
-          const parsed = parseGenericPoolStrategy(body.strategy);
-          if (parsed === null) return jsonResponse({ error: "strategy must be one of: quota, round-robin, fill-first" }, 400);
+          const parsed = parseGenericPoolStrategy(body.strategy, provider);
+          if (parsed === null) return jsonResponse({ error: `strategy must be one of: quota, round-robin, fill-first${provider === "kiro" ? ", least-loaded" : ""}` }, 400);
           next.strategy = parsed;
         }
       }
@@ -545,6 +708,13 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
           if (parsed === null) return jsonResponse({ error: "stickyLimit must be an integer 1-100" }, 400);
           next.stickyLimit = parsed;
         }
+      }
+      if (body.maxConcurrentPerAccount !== undefined) {
+        if (provider !== "kiro") return jsonResponse({ error: "maxConcurrentPerAccount is only supported for Kiro OAuth" }, 400);
+        const cap = body.maxConcurrentPerAccount === null ? null : parseKiroAccountCap(body.maxConcurrentPerAccount);
+        if (cap === null && body.maxConcurrentPerAccount !== null) return jsonResponse({ error: "maxConcurrentPerAccount must be an integer 1-100 or null" }, 400);
+        if (cap === null) delete next.maxConcurrentPerAccount;
+        else next.maxConcurrentPerAccount = cap;
       }
       if (Object.keys(next).length > 0) prov.oauthAccountFailover = next;
       else delete prov.oauthAccountFailover;
@@ -939,16 +1109,7 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
     const nameField = validateKeyName(body.name, { required: false });
     if ("error" in nameField) return jsonResponse({ error: nameField.error }, 400, req, config);
     const name = nameField.value || "default";
-    // A direct random draw. The previous derivation hashed every configured
-    // provider API key into the input, which was never needed for uniqueness and
-    // made this secret's safety argument depend on string concatenation rather
-    // than the RNG. 20 bytes is the same 40 hex characters as before, so nothing
-    // that pattern-matches the key shape changes.
-    const key = "ocx_data_" + randomBytes(20).toString("hex");
-    const entry = { id: randomUUID(), name, key, createdAt: new Date().toISOString() };
-    config.apiKeys = [...(config.apiKeys ?? []), entry];
-    saveConfigPreservingClaudeCode(config);
-    reconcileLiveStateStores();
+    const entry = issueApiKeyInProcess(config, name); // shared helper uses randomBytes(20)
     return jsonResponse({ id: entry.id, name: entry.name, key: entry.key, createdAt: entry.createdAt }, 201, req, config);
   }
 
@@ -1005,12 +1166,8 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
     const body = await readJsonBody(req);
     if (!body) return jsonResponse({ error: "invalid body" }, 400, req, config);
     if (typeof body.id !== "string" || !body.id) return jsonResponse({ error: "id required" }, 400, req, config);
-    const before = (config.apiKeys ?? []).length;
-    config.apiKeys = (config.apiKeys ?? []).filter(k => k.id !== body.id);
     // A stale id must not read as a successful revocation.
-    if (config.apiKeys.length === before) return jsonResponse({ error: "key not found" }, 404, req, config);
-    saveConfigPreservingClaudeCode(config);
-    reconcileLiveStateStores();
+    if (!revokeApiKeyInProcess(config, body.id)) return jsonResponse({ error: "key not found" }, 404, req, config);
     return jsonResponse({ success: true }, 200, req, config);
   }
   return null;

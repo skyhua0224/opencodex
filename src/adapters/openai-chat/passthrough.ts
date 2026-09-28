@@ -1,3 +1,4 @@
+import { protectGlmSummaryBudget } from "./summary-budget";
 import { openAIChatTransport, stripBracketedModelSuffix } from "./wire";
 import type { AdapterRequest } from "../base";
 import { frameAgentRouterMessages } from "../agentrouter";
@@ -72,6 +73,7 @@ export function buildOpenAIChatPassthroughRequest(
   for (const field of CHAT_PASSTHROUGH_FIELDS) {
     if (rawBody[field] !== undefined) body[field] = rawBody[field];
   }
+  if (protectGlmSummaryBudget(body, provider.baseUrl, body.reasoning_effort)) body.reasoning_effort = "low";
   const rawEfforts = modelRecordValue(provider.modelReasoningEfforts, modelId) ?? provider.reasoningEfforts;
   const reasoningDisabled = modelInList(provider.noReasoningModels, modelId) || rawEfforts?.length === 0;
   if (reasoningDisabled) {
@@ -96,6 +98,7 @@ export function buildOpenAIChatPassthroughRequest(
 
   if (modelInList(provider.noTemperatureModels, modelId)) delete body.temperature;
   if (modelInList(provider.noTopPModels, modelId)) delete body.top_p;
+  if (modelInList(provider.noStopModels, modelId)) delete body.stop;
   if (modelInList(provider.noPenaltyModels, modelId)) {
     delete body.presence_penalty;
     delete body.frequency_penalty;

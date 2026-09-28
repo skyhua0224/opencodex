@@ -8,6 +8,9 @@ import {
   REALTIME_WS_BASE_URL_KEY,
   isRootOpenaiBaseUrlLine,
   isRootRealtimeWsBaseUrlLine,
+  providerTableStart,
+  providerTableString,
+  rootTomlString,
   tomlStringPattern,
 } from "../injected-marker";
 import {
@@ -17,6 +20,7 @@ import {
   resolveCodexConfigPath,
   tomlString,
 } from "../paths";
+import { readBoundedCodexConfig } from "./bounded-config-reader";
 import {
   type CodexRoutingTarget,
   providerBaseHost,
@@ -27,14 +31,39 @@ import {
 
 export function externalCodexModelProvider(content: string): string | null {
   const provider = resolveEffectiveProjectModelProvider(content).provider;
-  return provider && provider !== "openai" && provider !== "opencodex"
-    ? provider
-    : null;
+  if (!provider || provider === "openai" || provider === "opencodex") return null;
+  // A provider table counts as an external owner only when it carries a `base_url` — a
+  // gateway names somebody else's endpoint. A base-url-less table is the Codex desktop
+  // app's own native-routing placeholder (since app 26.924 each app-managed rewrite
+  // writes `model_provider = "custom"` plus such a table, stripping the injected root
+  // keys alongside), which re-injects cleanly because the injector strips a root
+  // `model_provider` line first. A REAL external provider must carry a base_url.
+  if (providerTableStart(content.split("\n"), provider) !== -1 && providerTableString(content, provider, "base_url") === null) {
+    return null;
+  }
+  return provider;
 }
 
+/**
+ * The ownership answer for read/write paths — inject, sync, connect, restore, and the
+ * shutdown gate. It deliberately reads the whole file like Codex does (links included):
+ * a large or link-mediated config is still a valid config, and these callers must
+ * classify it exactly rather than degrade to "undetermined".
+ */
 export function currentExternalCodexModelProvider(): string | null {
   if (!existsSync(CODEX_CONFIG_PATH)) return null;
   return externalCodexModelProvider(readFileSync(CODEX_CONFIG_PATH, "utf8"));
+}
+
+/**
+ * The same ownership answer for read-only observation (the settings GET / poll path),
+ * through a bounded read so a special or oversized config.toml cannot stall a request.
+ * A present-but-unreadable config throws so the caller reports undetermined ownership
+ * instead of "none".
+ */
+export function observedExternalCodexModelProvider(): string | null {
+  const content = readBoundedCodexConfig(CODEX_CONFIG_PATH);
+  return content === null ? null : externalCodexModelProvider(content);
 }
 
 /**
@@ -301,6 +330,142 @@ export function setRootRealtimeWsBaseUrl(
   }
   // No marker-owned routing override to attach to: the override has no owner, so inject nothing.
   return { content, keptUserRealtimeWsBaseUrl: false };
+}
+
+/**
+ * Root key codex-rs reads for its web-search mode. The value opencodex writes is the only one that
+ * takes the native hosted tool away; the other modes keep it, so they are never written here.
+ */
+export const ROOT_WEB_SEARCH_KEY = "web_search";
+
+/** The one value opencodex writes for {@link ROOT_WEB_SEARCH_KEY}. */
+export const ROOT_WEB_SEARCH_DISABLED_LINE = 'web_search = "disabled"';
+
+/** The value {@link ROOT_WEB_SEARCH_DISABLED_LINE} carries, as the journal records it. */
+export const ROOT_WEB_SEARCH_DISABLED_VALUE = "disabled";
+
+export function isRootWebSearchLine(line: string): boolean {
+  // The quoted spellings are the same key to TOML, and `tomlStringPattern` -- which the value
+  // evidence below goes through -- already reads them. A predicate that matched only the bare
+  // spelling would leave `"web_search" = "live"` in place while inserting our own line, and two
+  // root keys of the same name stop Codex from loading the file at all.
+  return /^\s*(?:"web_search"|'web_search'|web_search)\s*=/.test(line);
+}
+
+/** What an earlier injection recorded about this key, read back from the journal. */
+export interface RootWebSearchJournal {
+  /** The value that injection wrote, or null when it wrote none. */
+  injectedValue?: string | null;
+  /** The user-owned line that injection had to remove, or null when there was none. */
+  replacedUserLine?: string | null;
+}
+
+/** What one pass of {@link ensureRootWebSearchDisabled} did, for the journal to record. */
+export interface RootWebSearchOutcome {
+  content: string;
+  /** The user-owned root line this pass removed, or null when there was none. */
+  replacedUserLine: string | null;
+  /** The value this pass wrote, or null when it wrote none. */
+  wroteValue: string | null;
+}
+
+/** Insert root-level lines ahead of the first table; TOML root keys may not follow one. */
+function insertRootLines(lines: string[], text: string): string {
+  const firstTable = lines.findIndex((line) => /^\s*\[/.test(line));
+  if (firstTable === -1) return `${lines.join("\n").replace(/\n+$/, "")}\n${text}\n`;
+  let at = firstTable;
+  while (at > 0 && lines[at - 1].trim() === "") at -= 1;
+  lines.splice(at, 0, ...text.split("\n"));
+  return lines.join("\n");
+}
+
+/**
+ * Ensure the root `web_search` key follows the web-search sidecar's master switch.
+ *
+ * Codex reads this key (modes `disabled`/`cached`/`indexed`/`live`) to decide whether its native
+ * Responses `web_search` tool is offered at all; `disabled` is the only mode that removes the tool
+ * from the model's tool list. An operator who runs an MCP search server instead needs exactly that,
+ * because a native tool the client still advertises wins the model's attention away from the MCP
+ * one. So the switch is not advisory: while `webSearchSidecar.enabled` is false we own the value.
+ *
+ * Ownership, both directions:
+ * - `disabled` removes EVERY root `web_search` line (ours or the user's) and writes the marker-owned
+ *   pair. Two root keys of the same name are invalid TOML, so keeping a user line alongside ours
+ *   would stop Codex from loading the file at all — and the operator has just asked for this exact
+ *   value. A value the user owned is reported back as `replacedUserLine` so the journal can carry
+ *   it, and `ocx restore` additionally replays the snapshot, like every other line this injection
+ *   rewrites.
+ * - enabled (or unset) removes only the marker-owned pair, so re-enabling the sidecar cannot leave
+ *   the native tool switched off — which would silently leave the sidecar with nothing to intercept.
+ *   Two further sources of ownership come from the journal: the exact value a recorded injection
+ *   wrote, so a line whose marker comment a Codex app reserialize dropped is still ours (#1798), and
+ *   the user line that injection removed, which goes back now that nothing owns the key.
+ */
+export function ensureRootWebSearchDisabled(
+  content: string,
+  disabled: boolean,
+  journal: RootWebSearchJournal = {},
+): RootWebSearchOutcome {
+  const lines = stripInjectedRootWebSearch(content, journal.injectedValue).split("\n");
+  const firstTable = lines.findIndex((line) => /^\s*\[/.test(line));
+  const rootEnd = firstTable === -1 ? lines.length : firstTable;
+  if (!disabled) {
+    const restore = journal.replacedUserLine?.trim();
+    const owned = lines.slice(0, rootEnd).some(isRootWebSearchLine);
+    return {
+      content: restore && !owned ? insertRootLines(lines, restore) : lines.join("\n"),
+      replacedUserLine: null,
+      wroteValue: null,
+    };
+  }
+  // Whatever root line is left here is not marker-owned and not the value we recorded writing, so
+  // it is the operator's own mode: keep its exact text for the pass that switches the sidecar back
+  // on. Only one can be valid TOML, and the first is the one Codex reads. A pass that finds no such
+  // line keeps the one an earlier off pass recorded — the ordinary way to reach that state is a
+  // second injection while the switch is still off (a model change), and the operator's mode must
+  // not evaporate because the line it came from is already gone.
+  const replacedUserLine = lines
+    .slice(0, rootEnd)
+    .find((line) => isRootWebSearchLine(line))
+    ?.replace(/\r$/, "") ?? journal.replacedUserLine?.trim() ?? null;
+  return {
+    content: insertRootLines(
+      lines.filter((line, index) => index >= rootEnd || !isRootWebSearchLine(line)),
+      `${OCX_ROUTING_MARKER_LINE}\n${ROOT_WEB_SEARCH_DISABLED_LINE}`,
+    ),
+    replacedUserLine,
+    wroteValue: ROOT_WEB_SEARCH_DISABLED_VALUE,
+  };
+}
+
+/**
+ * Remove the marker-owned root `web_search` pair (marker line + the key line right after it).
+ * Same ownership rule as `stripInjectedOpenaiBaseUrl`: a user's own line has no marker above it and
+ * survives, so a hand-set mode is never reinterpreted as ours after an injection cycle. `injectedValue`
+ * adds the #1798 value evidence — the exact value a recorded injection wrote — so a line whose marker
+ * comment a Codex app reserialize dropped is still recognized as ours.
+ */
+export function stripInjectedRootWebSearch(content: string, injectedValue?: string | null): string {
+  const lines = content.split("\n");
+  const firstTable = lines.findIndex((line) => /^\s*\[/.test(line));
+  const rootEnd = firstTable === -1 ? lines.length : firstTable;
+  const drop = new Set<number>();
+  for (let i = 0; i + 1 < rootEnd; i += 1) {
+    if (lines[i].includes(OCX_SECTION_MARKER) && isRootWebSearchLine(lines[i + 1])) {
+      drop.add(i);
+      drop.add(i + 1);
+    }
+  }
+  if (injectedValue) {
+    for (let i = 0; i < rootEnd; i += 1) {
+      if (!isRootWebSearchLine(lines[i])) continue;
+      if (rootTomlString(lines[i], ROOT_WEB_SEARCH_KEY) !== injectedValue) continue;
+      drop.add(i);
+      if (i > 0 && lines[i - 1].includes(OCX_SECTION_MARKER)) drop.add(i - 1);
+    }
+  }
+  if (drop.size === 0) return content;
+  return lines.filter((_, index) => !drop.has(index)).join("\n");
 }
 
 /**

@@ -13,6 +13,7 @@ import type { ResponsesEffects } from "./response-effects";
 import type { ResponsesSendBudget } from "./request-send-budget";
 import { transientSendCapFor } from "./request-send-budget";
 import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
+import { isLocalUpstream } from "../../lib/local-upstream";
 import { codexSafetyBufferingFilterOptions, terminalStatusFromParsed } from "../relay";
 import { imageGenToolCallAliases } from "../responses-image-gen-repair";
 import { rememberResponseState, isBodyNonPersistable } from "../../responses/state";
@@ -21,6 +22,7 @@ import {
   hasExplicitWireToolCatalog,
   collectDeclaredWireToolNames,
   collectDeclaredBareWireToolNames,
+  collectDeclaredBareCustomWireToolNames,
   collectDeclaredNamelessClientCallTypes,
   collectProviderExecutedCallTypes,
   undeclaredToolCallName,
@@ -41,7 +43,9 @@ import {
   NamespaceToolCollisionError,
   restoreRoutedNamespaceCalls,
 } from "../../responses/namespace-tool-compat";
+import { restoreRoutedCustomCalls, RoutedCustomToolCompatError } from "../../responses/custom-tool-compat";
 import { XaiToolSchemaCompatibilityError } from "../../adapters/xai-tool-schema";
+import { MuseToolChoiceCompatibilityError } from "../../adapters/openai-responses/muse-tool-choice";
 import { formatErrorResponse } from "../../bridge";
 import { redactSecretString } from "../../lib/redact";
 import {
@@ -61,7 +65,6 @@ import {
   parseMuseSubscriptionUsage,
 } from "../../providers/muse-subscription-usage";
 import { restoreMuseToolNames } from "../../responses/muse-tool-name-alias";
-import { restoreRoutedCustomCalls } from "../../responses/custom-tool-compat";
 import { restorePlaintextV2AgentMessageCalls } from "../../responses/plaintext-v2-agent-messages";
 import {
   recordAdapterReasoning,
@@ -102,7 +105,7 @@ import {
   clearCodexModelDenialEvidence,
   recordCodexModelDenialEvidence,
 } from "../../codex/model-entitlements";
-import { isCodexWsUpstreamResponse, readCodexWsStage } from "./codex-ws-wire";
+import { codexWsSocketDeathStage, isCodexWsUpstreamResponse, readCodexWsStage } from "./codex-ws-wire";
 import { linkAbortSignal } from "./core-lifetime";
 import type { CodexAuthContext } from "../../codex/auth-context";
 import { checkOutboundBodySize, describeOutboundBodyRefusal } from "./outbound-body-guard";
@@ -110,10 +113,12 @@ import { streamingContextOverflowResponse } from "./context-overflow";
 import {
   SendBudgetExhaustedError,
   fetchWithTransientRetry,
-  CAPACITY_RETRY_DELAYS_MS,
   applyUpstreamRecoveryInit,
   isNonReplayableResponse,
+  isConnectionResetError,
+  settleOperatorReplacement,
   refetchAfterProtocolSafeReset,
+  replayRefusalResponse,
   prepareSameTarget429Wait,
   sleepWithAbort,
 } from "../../lib/upstream-retry";
@@ -123,7 +128,6 @@ import { recordCodexUpstreamOutcome } from "../../codex/routing";
 import { describeUpstreamConnectFailure } from "./upstream-error";
 import type { OpaqueBlobRecoveryGuard } from "./core-opaque-recovery";
 import {
-  isOpenCodeGoDestination,
   rateLimitRetryPolicyFor,
   rateLimitRetryDelayMs,
   transientRetryPolicyFor,
@@ -136,13 +140,12 @@ import type { OAuthAccessSnapshot } from "../../oauth";
 import { publicOAuthAuthenticationErrorMessage } from "../../oauth";
 import { resolveCopilotApiBaseUrl } from "../../oauth/github-copilot";
 import {
-  GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST,
+  hasEligibleGenericOAuthFailoverTarget,
   isGenericOAuthFailoverEnabled,
   rotateGenericOAuthAccountOn429,
   failoverAccountSnapshot,
 } from "../../oauth/generic-account-failover";
 import { captureCodexAffinityDiagnostic } from "../../codex/affinity-debug";
-import { observeClientFingerprint } from "../../codex/client-fingerprint-guard";
 import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS } from "../../codex/catalog/native-models";
 import {
   attemptOpaqueBlobRecovery,
@@ -160,73 +163,6 @@ import { ambiguousResendAllowanceFor, selfContainedResponsesBody } from "./reset
 import { upstreamErrorMessageFromPayload, ENCRYPTED_FUNCTION_OUTPUT_REJECTION } from "../../lib/errors";
 import { isTransientConsoleGoUploadRejection } from "../../providers/opencode-zen-rate-limit";
 import { planReasoningEffortDowngrade } from "../../providers/reasoning-metadata";
-import { withResponseAttestation } from "../../lib/response-attestation";
-import { guardNativeDegenerateOutput } from "./combo-degenerate-output";
-import { conversationKeyFromHeaders } from "../ws-thread-transport";
-
-/**
- * The paced capacity ladder for one provider, or nothing when it is not opted in.
- *
- * Only the canonical OpenAI forward row earns it by default: that is the lane whose shed answers
- * ("Our servers are currently overloaded", 8% of one conversation's turns on 2026-09-23) are the
- * operator's actual complaint. OCX_CAPACITY_ABSORB_ALL=1 widens it for every provider,
- * which exists so the same path can be exercised against a local stub instead of production.
- */
-/**
- * Observers applied to an upstream stream before it is delivered, for every provider.
- *
- * Two jobs, both of them "this proxy should have said something" problems:
- *
- * 1. A conversation that called a provider DIRECTLY gets the same repetition guard combos have had
- *    since the 2-minute park patch. Without it a looping native stream (the exact shape that made
- *    a relay answer every turn with the same paragraph) was simply relayed until the client gave up.
- *    A native turn has no second row, so the guard cuts the stream and announces the verdict; the
- *    retry that follows is the client's, and the verdict is remembered for the lane so a combo
- *    serving that conversation later demotes the row the loop came from.
- * 2. Attestation: record when the origin reports a different model than the one asked for, when it
- *    answers on a lower service tier than the one configured, or when it announces a safety buffer
- *    that may serve the turn on a faster model. None of those raise an error, and none of them used
- *    to leave a trace.
- */
-function applyResponseGuards(
-  response: Response,
-  ctx: {
-    lane: string | undefined;
-    provider: string;
-    model: string;
-    configuredTier: string | undefined;
-    comboAttempt: boolean;
-    /** Marks for the latency ledger, and whether the client sent a Cookie header. */
-    timing?: { dispatchStartedAt: number; sendStartedAt: number } | undefined;
-    clientSentCookie?: boolean | undefined;
-    logCtx: { upstreamError?: string };
-  },
-): Response {
-  if (!response.ok || !response.body) return response;
-  let guarded = response;
-  if (!ctx.comboAttempt) {
-    guarded = guardNativeDegenerateOutput(guarded, {
-      lane: ctx.lane,
-      label: ctx.provider + "/" + ctx.model,
-      onVerdict: detail => { ctx.logCtx.upstreamError = "degenerate output: " + detail; },
-    });
-  }
-  return withResponseAttestation(guarded, {
-    transport: isCodexWsUpstreamResponse(guarded) ? "ws" : "http",
-    timing: ctx.timing,
-    clientSentCookie: ctx.clientSentCookie,
-    requestedModel: ctx.model,
-    configuredTier: ctx.configuredTier,
-    provider: ctx.provider,
-    lane: ctx.lane,
-  });
-}
-
-function capacityAbsorbDelays(provider: OcxProviderConfig): readonly number[] | undefined {
-  if (isCanonicalOpenAiForwardProvider(provider)) return CAPACITY_RETRY_DELAYS_MS;
-  return process.env.OCX_CAPACITY_ABSORB_ALL === "1" ? CAPACITY_RETRY_DELAYS_MS : undefined;
-}
-
 
 /** Prepares and recovers one native Responses exchange before client commitment. */
 export async function preparePassthroughExchange(
@@ -259,6 +195,7 @@ export async function preparePassthroughExchange(
     | "refreshResolvedOAuthSelection"
     | "replayOAuthCredentialSnapshot"
     | "genericFailovers"
+    | "genericFailoverLimit"
     | "applyFailoverSnapshot"
     | "noteRoutedAttemptSend"
     | "selectionIsCurrent"
@@ -281,6 +218,7 @@ export async function preparePassthroughExchange(
     | "recoveryClassFor"
     | "sendBudgetExhausted"
     | "claimAmbiguousResend"
+    | "ambiguousResendSpent"
     | "reserveCredentialHop"
     | "pendingHopPermit"
     | "workflowRootId"
@@ -288,8 +226,6 @@ export async function preparePassthroughExchange(
   >,
 ) {
   const { config, logCtx, options, req } = requestContext;
-  /** Marks for the latency ledger: entry, then just before the upstream send. */
-  const dispatchStartedAt = Date.now();
   const {
     route,
     toolBridgeMaps,
@@ -379,6 +315,7 @@ export async function preparePassthroughExchange(
     const clientExplicitWireToolCatalog = hasExplicitWireToolCatalog(clientToolAuthorizationBody);
     const clientDeclaredWireToolNames = collectDeclaredWireToolNames(clientToolAuthorizationBody);
     const clientDeclaredBareWireToolNames = collectDeclaredBareWireToolNames(clientToolAuthorizationBody);
+    const clientDeclaredBareCustomWireToolNames = collectDeclaredBareCustomWireToolNames(clientToolAuthorizationBody);
     const clientDeclaredNamelessCallTypes = collectDeclaredNamelessClientCallTypes(
       clientToolAuthorizationBody,
     );
@@ -399,7 +336,12 @@ export async function preparePassthroughExchange(
       // unstructured 500 — and no request log — depending only on whether a rotation ran first.
       // Same shape for a tool_choice this proxy cannot honor: the destination rejects a schema the
       // catalog had to drop, so the selector naming it is a client input error, not a 500.
-      if (error instanceof NamespaceToolCollisionError || error instanceof XaiToolSchemaCompatibilityError) {
+      if (
+        error instanceof NamespaceToolCollisionError
+        || error instanceof XaiToolSchemaCompatibilityError
+        || error instanceof RoutedCustomToolCompatError
+        || error instanceof MuseToolChoiceCompatibilityError
+      ) {
         return formatErrorResponse(400, "invalid_request_error", redactSecretString(error.message));
       }
       throw error;
@@ -421,6 +363,11 @@ export async function preparePassthroughExchange(
         ) routedCustomToolRepairNames.add(name);
       }
     }
+    // Only grant direct MCP recovery when this delivery actually restores converted custom
+    // calls. Native forward and injection paths have no such rewrite.
+    const recoverableBareCustomWireToolNames = new Set(
+      [...clientDeclaredBareCustomWireToolNames].filter(name => routedCustomToolNames.has(name)),
+    );
     for (const name of request.convertedRoutedToolSearchNames ?? []) {
       // The adapter already keeps this set empty when tool_choice forbids the private search.
       // Its wire name may be collision-aliased, so comparing it to the caller-facing name here
@@ -620,6 +567,7 @@ export async function preparePassthroughExchange(
         declaredNamelessClientCallTypes,
         providerExecutedCallTypes,
         declaredBareWireToolNames,
+        recoverableBareCustomWireToolNames,
       ) !== undefined) {
         inspectionSawUndeclaredTool = true;
       }
@@ -665,6 +613,7 @@ export async function preparePassthroughExchange(
           declaredNamelessClientCallTypes,
           providerExecutedCallTypes,
           declaredBareWireToolNames,
+          recoverableBareCustomWireToolNames,
         ) !== undefined
       ) {
         return;
@@ -819,6 +768,57 @@ export async function preparePassthroughExchange(
     const claimPreHeaderResend = (): boolean =>
       authorizeResendForRecovery("pre-header", "connection-reset", ambiguousResend()).allowed;
     /**
+     * The one replacement send the ambiguous rows at the end of the recovery loop may buy: an SSE
+     * body that died before any output, and a Codex WebSocket that died under its create frame
+     * (#4191).
+     *
+     * HTTP-only for both. A replacement HTTP body must not open a fresh WebSocket exchange: the SSE
+     * row replaces an HTTP stream, which a WS create frame is not, and the WebSocket row replaces
+     * the transport that just failed.
+     */
+    const sendAmbiguousReplacement = (
+      signal: AbortSignal = upstream.signal,
+    ): Promise<Response> => fetchWithHeaderTimeout(
+      request.url,
+      applyUpstreamRecoveryInit({
+        method: request.method,
+        headers: request.headers,
+        body: request.body,
+      }, "connection-reset"),
+      signal,
+      connectMs,
+      true,
+      providerFetch(route.provider, options.codexWsRuntimeIdentity, {
+        httpOnly: true,
+        providerName: route.providerName,
+        modelId: route.modelId,
+        dispatchOverride: oauthDispatch(request),
+        beforeDispatch: headers => {
+          if (signal.aborted) throw signal.reason;
+          if (!transportState.selectionIsCurrent(transportState.requestBindings.get(request))) {
+            throw new Error("Credential selection changed before pre-output stream recovery");
+          }
+          if (isCanonicalOpenAiForwardProvider(route.provider)) {
+            createCodexReserveDispatchGuard(
+              admissionState.authCtx,
+              options.codexAuthPolicy ?? config,
+              route.modelId,
+              options.admission,
+              options.visionDescribeTerminal === true,
+            )?.(headers);
+          }
+          // Recorded with the kind the gate derived its cause from, at the moment the
+          // send actually leaves. One authorisation, one recorded reason, one send.
+          transportState.noteRoutedAttemptSend(passthroughEstimate, "connection-reset");
+          // Charged to the SAME request counter every other send goes through. The
+          // replacement is bought here rather than by a nested retry helper, so there is
+          // one charge for one send and no per-layer counter to reconcile.
+          noteTransientSends(1);
+        },
+      }),
+      route.provider.authMode === "forward",
+    );
+    /**
      * Refuse a built body that exceeds the operator's configured ceiling, before it is sent.
      *
      * Unconfigured this measures nothing and returns undefined, so an unset proxy behaves
@@ -927,7 +927,6 @@ export async function preparePassthroughExchange(
       // Transient-5xx pre-stream retry (devlog/_plan/260716_claudecode_hardening/010):
       // the ChatGPT backend emits transient 502/520s that an immediate retry absorbs.
       // Body is a replayable string; nothing has streamed to the client yet.
-      const sendStartedAt = Date.now();
       upstreamResponse = await fetchWithTransientRetry(
         recovery => {
           // The pool-wide recovery window measures recovery traffic against observed demand,
@@ -961,33 +960,8 @@ export async function preparePassthroughExchange(
         { abortSignal: upstream.signal, label: safeHostLabel(request.url),
           attempts: remainingTransientSendBudget(transientSendAttempts()), onSendsConsumed: noteTransientSends,
           claimAmbiguousResend: claimPreHeaderResend,
-          // The FIRST send of a native request needs the capacity ladder too. It was missing here
-          // while the four recovery legs already had it, and the consequence was exact: a native
-          // gpt-6-sol turn whose first send came back 503 "Our servers are currently overloaded"
-          // went straight to the client as a capacity error (measured 2026-09-24 13:27, three in a
-          // row, sendCount=1) while the same provider on the recovery legs retried. Scoped to the
-          // canonical forward row; the ladder's sends are additional to the budget and unlock only
-          // on 502/503/504.
-          retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
-          retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider), retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider),
-          // The OpenCode Go destination stalls-then-drops inference sends (ambiguous
-          // pre-header resets surfacing as refused 429s); its subscription traffic is
-          // inference-only, so a bounded reset replay here absorbs the blip instead of
-          // failing the turn. Recovery legs keep the fail-closed refusal; only this
-          // initial send is replay-eligible. Attempts stay budget-bounded via attempts.
-          replaySafe: isOpenCodeGoDestination(route.provider),
         },
       );
-      upstreamResponse = applyResponseGuards(upstreamResponse, {
-        clientSentCookie: req.headers.has("cookie"),
-        timing: { dispatchStartedAt, sendStartedAt },
-        lane: conversationKeyFromHeaders(req.headers),
-        provider: route.providerName,
-        model: route.modelId,
-        configuredTier: logCtx.configuredServiceTier,
-        comboAttempt: options.comboAttempt === true,
-        logCtx,
-      });
     } catch (err) {
       return transportFailureResponse(err);
     } finally {
@@ -1085,12 +1059,7 @@ export async function preparePassthroughExchange(
               .then(adoptObservedResponse);
           },
           { abortSignal: upstream.signal, label: safeHostLabel(request.url), attempts: allowance.attempts,
-            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend,
-            // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
-            // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
-            retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
-            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider),
-            retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider) },
+            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend },
         );
       } catch (err) {
         return { failed: transportFailureResponse(err) };
@@ -1217,12 +1186,7 @@ export async function preparePassthroughExchange(
           },
           { abortSignal: upstream.signal, label: safeHostLabel(request.url),
             attempts: remainingTransientSendBudget(transientSendAttempts()),
-            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend,
-            // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
-            // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
-            retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
-            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider),
-            retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider) },
+            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend },
         );
       } catch (err) {
         return transportFailureResponse(err);
@@ -1348,12 +1312,7 @@ export async function preparePassthroughExchange(
               .then(adoptObservedResponse);
           },
           { abortSignal: upstream.signal, label: safeHostLabel(request.url), attempts: remainingTransientSendBudget(transientSendAttempts()),
-            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend,
-            // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
-            // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
-            retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
-            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider),
-            retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider) },
+            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend },
         );
       } catch (err) {
         return transportFailureResponse(err);
@@ -1371,7 +1330,7 @@ export async function preparePassthroughExchange(
       // have run and would cool down an account that refused nothing.
       && !isNonReplayableResponse(upstreamResponse)
      && transportState.genericFailoverAccountId
-      && transportState.genericFailovers < GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST
+      && transportState.genericFailovers < transportState.genericFailoverLimit
       && isGenericOAuthFailoverEnabled(config, route.providerName)
     ) {
       // The roster cap above is one half of the bound; the request's shared budget is the
@@ -1416,10 +1375,11 @@ export async function preparePassthroughExchange(
         // No credential moved, so the reservation costs nothing.
         hop.permit?.release();
       } else {
-        // Rotation was available -- the roster cap above admitted it -- and the shared request
-        // budget refused. Recorded so a one-send log is not read as "nothing was eligible",
-        // which is the ambiguity this attribution exists to remove (#5044).
-        noteAttemptRecoveryWithheld(logCtx.activeAttempt, "rotation-send-budget");
+        // The activation quorum ignores cooldowns; prove that the selector has a live alternate
+        // before describing this as a recovery that only the shared request budget withheld.
+        if (hasEligibleGenericOAuthFailoverTarget(
+          route.providerName, transportState.genericFailoverAccountId, Date.now(), route.modelId,
+        )) noteAttemptRecoveryWithheld(logCtx.activeAttempt, "rotation-send-budget");
       }
     }
 
@@ -1486,12 +1446,7 @@ export async function preparePassthroughExchange(
               .then(adoptObservedResponse);
           },
           { abortSignal: upstream.signal, label: safeHostLabel(request.url), attempts: remainingTransientSendBudget(transientSendAttempts()),
-            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend,
-            // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
-            // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
-            retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
-            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider),
-            retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider) },
+            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend },
         );
       } catch (err) {
         return transportFailureResponse(err);
@@ -1507,9 +1462,6 @@ export async function preparePassthroughExchange(
         || captureAuthCtx.kind === "main-pool",
     ): void => {
       if (!isCanonicalOpenAiForwardProvider(route.provider)) return;
-      // Every canonical response is one free look at the fingerprint that reached the origin.
-      // Observation only; see codex/client-fingerprint-guard.ts for why this is never a rewrite.
-      observeClientFingerprint(req.headers, route.providerName);
       captureCodexAffinityDiagnostic({
         inboundHeaders: req.headers,
         outboundHeaders: captureRequest.headers,
@@ -1669,7 +1621,8 @@ export async function preparePassthroughExchange(
       if (options.abortSignal?.aborted) return transportFailureResponse(options.abortSignal.reason);
       upstreamResponse = preflight.response;
       if (preflight.kind === "failed") {
-        if (!configuredTransientSendBudgetExhausted()) {
+        // A zero-output failure does not undo an ambiguous replacement already sent.
+        if (!configuredTransientSendBudgetExhausted() && !sendBudgetState.ambiguousResendSpent) {
           const streamedOpaqueRecovery = await attemptOpaqueBlobRecovery({
             response: upstreamResponse,
             outboundBody: request.body,
@@ -1689,6 +1642,8 @@ export async function preparePassthroughExchange(
         logCtx.terminalHttpStatus = preflightLog.terminalHttpStatus;
         logCtx.terminalErrorCode = preflightLog.terminalErrorCode;
         logCtx.terminalIncompleteReason = preflightLog.terminalIncompleteReason;
+        // The projected failure must not invite another send after the replacement was spent.
+        if (sendBudgetState.ambiguousResendSpent) upstreamResponse = settleOperatorReplacement(upstreamResponse);
       }
     }
     // Console Go (opencode-zen / opencode-go) intermittently rejects a body it accepts seconds
@@ -1752,6 +1707,47 @@ export async function preparePassthroughExchange(
       }
     }
 
+    // The WebSocket row of the same table (#4191). A Codex socket that closed or failed under its
+    // create frame, before any Responses event, settled as a non-replayable 502 and every leg above
+    // let it through. Whether the turn ran upstream is as unknown as after a reset before the head,
+    // so the same grant decides, asked with the stage the exchange reached. The replacement's answer
+    // then goes round the loop like any other, and once the grant is spent nothing may send the
+    // turn a third time.
+    const socketDeathStage = codexWsSocketDeathStage(upstreamResponse);
+    if (
+      socketDeathStage
+      && !upstream.signal.aborted
+      // Asked before the gate, which claims last: a replacement the budget cannot fund must not
+      // spend the request's one grant.
+      && remainingTransientSendBudget(transientSendAttempts()) > 0
+      && authorizeResendForRecovery(socketDeathStage, "connection-reset", ambiguousResend()).allowed
+    ) {
+      try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed/closed */ }
+      console.warn(`[upstream-retry] codex websocket died before any Responses event (${safeHostLabel(request.url)}); `
+        + "using one replacement over HTTP");
+      let replacement: Response | undefined;
+      while (!replacement) {
+        try {
+          replacement = await sendAmbiguousReplacement().then(adoptObservedResponse);
+        } catch (err) {
+          if (upstream.signal.aborted) return transportFailureResponse(err);
+          // A replacement that reset before its head is the pre-header row again: a configured
+          // second grant (and a send the budget can still fund) may buy one more send. The gate
+          // claims from the request's finite allowance, so this loop is bounded by it.
+          if (
+            isConnectionResetError(err)
+            && remainingTransientSendBudget(transientSendAttempts()) > 0
+            && claimPreHeaderResend()
+          ) continue;
+          break;
+        }
+      }
+      // The first send may already have run the turn, so a replacement that failed settles as
+      // the refusal rather than as a transport error the client would retry.
+      upstreamResponse = replacement ? settleOperatorReplacement(replacement) : replayRefusalResponse();
+      continue passthroughRecovery;
+    }
+
     // The post-header row of the same table. A native SSE body can die after the head with the
     // caller having observed nothing, which is the identical question the pre-header helper
     // answers -- and the identical grant, because both claim from this request's one allowance.
@@ -1775,48 +1771,7 @@ export async function preparePassthroughExchange(
         upstreamResponse,
         { model: logCtx.model, provider: logCtx.provider },
         (error, stage) => refetchAfterProtocolSafeReset(
-          (signal = upstream.signal) => fetchWithHeaderTimeout(
-            request.url,
-            applyUpstreamRecoveryInit({
-              method: request.method,
-              headers: request.headers,
-              body: request.body,
-            }, "connection-reset"),
-            signal,
-            connectMs,
-            true,
-            providerFetch(route.provider, options.codexWsRuntimeIdentity, {
-              // A replacement HTTP body must not open a fresh WebSocket exchange: the turn it
-              // replaces was an HTTP stream, and a WS create frame is a different send.
-              httpOnly: true,
-              providerName: route.providerName,
-              modelId: route.modelId,
-              dispatchOverride: oauthDispatch(request),
-              beforeDispatch: headers => {
-                if (signal.aborted) throw signal.reason;
-                if (!transportState.selectionIsCurrent(transportState.requestBindings.get(request))) {
-                  throw new Error("Credential selection changed before pre-output stream recovery");
-                }
-                if (isCanonicalOpenAiForwardProvider(route.provider)) {
-                  createCodexReserveDispatchGuard(
-                    admissionState.authCtx,
-                    options.codexAuthPolicy ?? config,
-                    route.modelId,
-                    options.admission,
-                    options.visionDescribeTerminal === true,
-                  )?.(headers);
-                }
-                // Recorded with the kind the gate derived its cause from, at the moment the
-                // send actually leaves. One authorisation, one recorded reason, one send.
-                transportState.noteRoutedAttemptSend(passthroughEstimate, "connection-reset");
-                // Charged to the SAME request counter every other send goes through. The
-                // replacement is bought here rather than by a nested retry helper, so there is
-                // one charge for one send and no per-layer counter to reconcile.
-                noteTransientSends(1);
-              },
-            }),
-            route.provider.authMode === "forward",
-          ).then(adoptObservedResponse),
+          (signal = upstream.signal) => sendAmbiguousReplacement(signal).then(adoptObservedResponse),
           error,
           {
             abortSignal: upstream.signal,
@@ -1838,6 +1793,12 @@ export async function preparePassthroughExchange(
     }
     break;
     }
+
+  // Where this relay dials upstream. Local infrastructure (loopback / private / `.local` / `.lan`)
+  // is operator-trusted and its silent phases are normal, so an unset stall budget resolves to
+  // disabled for it. Provider rotation above keeps the same endpoint origin, so the routed
+  // provider's baseUrl is the stable classification source.
+  const localUpstream = isLocalUpstream(route.provider.baseUrl);
 
   return {
     codexSafetyBufferingOptions,
@@ -1863,6 +1824,7 @@ export async function preparePassthroughExchange(
     },
     declaredWireToolNames,
     declaredBareWireToolNames,
+    recoverableBareCustomWireToolNames,
     declaredNamelessClientCallTypes,
     authorizedBareNamespaceToolAliases,
     normalizeFunctionCompletionJson,
@@ -1876,6 +1838,7 @@ export async function preparePassthroughExchange(
     rememberPassthroughResponseChecked,
     upstream,
     connectMs,
+    localUpstream,
     upstreamResponse,
   };
 }

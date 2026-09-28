@@ -1,3 +1,4 @@
+import type { CursorForegroundShellOwner } from "./native-foreground-shell";
 import { createHash } from "node:crypto";
 import { enforceAppOwnedMemoryBudget } from "../../lib/app-owned-memory";
 import { create } from "@bufbuild/protobuf";
@@ -66,6 +67,8 @@ export type CursorNativeExecDeps = CursorNativeNetworkDeps & CursorNativeToolDep
 export interface CursorNativeExecContext extends CursorNativeExecDeps {
   /** Stable owner for background shells created by this transport session. */
   sessionId?: string;
+  foregroundShellOwner?: CursorForegroundShellOwner;
+  signal?: AbortSignal;
   mcpToolDefs?: McpToolDefinition[];
   clientToolDefs?: McpToolDefinition[];
   /** Unsafe opt-in escape hatch for Cursor server-driven local fs/shell/fetch execution. */
@@ -509,6 +512,21 @@ export function cursorBlobByteLength(blobId: Uint8Array): number | null {
   return entry ? entry.data.byteLength : null;
 }
 
+/** Read one stored root for usage estimation without hydration, pin release, or served-byte accounting. */
+export function cursorBlobTextForEstimate(blobId: Uint8Array): string | null {
+  if (!(blobId instanceof Uint8Array) || blobId.byteLength === 0) return null;
+  try {
+    const entry = blobs.get(key(blobId));
+    if (!entry) return null;
+    return new TextDecoder("utf-8", { fatal: true }).decode(entry.data);
+  } catch {
+    debugProviderDiagnostic("cursor", "blob-estimate-unreadable", {
+      bytes: blobId.byteLength,
+    });
+    return null;
+  }
+}
+
 /**
  * Serve-time integrity for content-addressed blobs (devlog 260826_cursor_responses_gap 080):
  * a raw 32-byte blob id IS the SHA-256 of its bytes, so served data whose digest mismatches
@@ -691,8 +709,8 @@ export async function handleCursorNativeExec(execMsg: ExecServerMessage, deps: C
   if (execCase === "deleteArgs") return [deps.rejectNativeFileMutations ? rejectDeleteExecForApplyPatch(execMsg, deps.structuredEditAvailable === true) : deleteExec(execMsg)];
   if (execCase === "lsArgs") return [lsExec(execMsg)];
   if (execCase === "grepArgs") return [grepExec(execMsg)];
-  if (execCase === "shellArgs") return [shellExec(execMsg)];
-  if (execCase === "shellStreamArgs") return shellStreamExec(execMsg);
+  if (execCase === "shellArgs") return [shellExec(execMsg, deps.nativeExecRedirectHint)];
+  if (execCase === "shellStreamArgs") return shellStreamExec(execMsg, deps.foregroundShellOwner, deps.signal, deps.nativeExecRedirectHint);
   if (execCase === "backgroundShellSpawnArgs") return [backgroundShellSpawnExec(execMsg, deps.sessionId ?? "")];
   if (execCase === "writeShellStdinArgs") return [writeShellStdinExec(execMsg, deps.sessionId ?? "")];
   if (execCase === "fetchArgs") return [await fetchExec(execMsg, deps)];

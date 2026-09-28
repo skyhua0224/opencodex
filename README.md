@@ -1,119 +1,6 @@
-**English** | [简体中文](README.zh-CN.md)
-
-# opencodex — skyhua's hardening fork
-
-Fork of **opencodex 2.63.0** (MIT). Upstream: <https://github.com/lidge-jun/opencodex>.
-Mirrors: [GitHub](https://github.com/skyhua0224/opencodex) · [Gitea](https://gitea.sky-hua.xyz:24443/skyhua/opencodex).
-
-This fork carries a hardening patch set written against how the ChatGPT Codex backend actually
-behaves: capacity verdicts that arrive *after* a request has been accepted, combo ladders that
-used to fail a whole turn on one row's answer, relay quotas that only exist in a web panel, and
-WebSocket lanes that degrade quietly per conversation. The full inventory, the measurements behind
-each threshold, and how to rebase it onto a newer upstream release live in
-**[FORK-NOTES.md](FORK-NOTES.md)**.
-
-## Install
-
-```bash
-git clone https://github.com/skyhua0224/opencodex.git
-cd opencodex
-npm install -g .        # or: bun install -g .
-ocx setup               # then: ocx start
-```
-
-Self-tests for the new paths (bun):
-
-```bash
-bun test/codex-ws-capacity-selftest.ts
-bun test/sse-prelude-retry-selftest.ts
-bun test/capacity-absorb-selftest.ts
-bun test/thread-affinity-selftest.ts
-```
-
-## What this fork adds, in one screen
-
-- **Capacity verdicts never reach the client on the official lane.** Four layers, cheapest first:
-  an in-socket resend after a declined create, a WebSocket prelude hold, a replayable 503 that lets
-  the caller re-dial, and a paced 5s/12s/25s/45s ladder. The SSE lane gets the same treatment: a
-  decline that arrives inside an already-200 body is swallowed and a fresh attempt is spliced in
-  (`src/lib/sse-prelude-retry.ts`). A decline after content is passed through, because resending
-  there would generate a second answer for the same turn.
-- **Combo ladders that keep walking.** One row's replay refusal no longer stops the ladder;
-  quota-exhausted sites are skipped rather than treated as walls; the official row alone escalates
-  onto the 10m → 1h → 3h → 6h → 12h → 24h capacity hold; an exhausted fleet answers
-  `503 combo_unavailable` with `Retry-After` instead of a bare 429 the Codex client refuses to
-  retry; and degenerate output (repeated segments, a repeated tool signature) parks that row for
-  two minutes instead of disabling the channel.
-- **Per-conversation transport.** A conversation that keeps collecting overload verdicts steps off
-  the WebSocket lane for a while and has its routing identity re-rolled (the client's
-  `x-codex-window-id` and the server's `x-codex-turn-state` are dropped for that conversation, and
-  the hold survives restarts).
-- **Native sessions get the repetition guard too.** The metrics combos have used (repeat ratio,
-  longest repeated segment, zlib ratio, identical tool-call signature) now watch directly-routed
-  streams as well: a channel that starts repeating is cut with `response.failed`/`degenerate_output`
-  instead of being relayed to the end, and the verdict is remembered for that conversation, so a
-  combo serving it later demotes the row that looped.
-- **Model, tier and safety-buffer attestation.** When the origin reports a different model than the
-  one requested, answers on a lower service tier than the one configured, or announces a safety
-  buffer that can serve the turn on a faster model, that lands in `~/.opencodex/model-attestation.jsonl`
-  and on the log. Nothing is rewritten and nothing errors.
-- **`ocx-tiers`**, one command over `usage.jsonl` plus those ledgers: did the tier drop, was a model
-  substituted, how many streams were cut for repetition, whether this lane ever sees the edge affinity
-  cookies, and how a slow turn splits between our queue, the origin headers, the first content frame and
-  the tail (`--links`, `--latency`). `--wsreuse` puts the three WebSocket lanes side by side -- fresh,
-  resend inside a turn, cross-turn -- with failures and first-frame medians for each.
-- **Latency and link ledgers.** `~/.opencodex/cookie-link.jsonl` records every guarded request's cookie
-  shape (names, counts and a hash of the affinity pair -- never a value), and `latency.jsonl` records
-  turns at or above 20s with the segment split, so "the proxy feels slow" becomes attributable.
-- **A pre-content socket close is replayable.** When the WebSocket lane dies before any frame has been
-  relayed, the failure is settled as a resendable status instead of the non-replayable one, so the
-  capacity ladder re-dials a fresh socket. The ambiguous marker now only applies once frames are out.
-- **The socket pool actually reaches the origin.** Two bugs kept the WebSocket pool from ever seeing a real
-  turn: the client's ~4 KiB rotating `x-oai-attestation` exceeded the per-field bound the identity inherited
-  from the response-id validator, and per-request headers (attestation, client request id) were part of the
-  socket key, so no two attempts could agree on one socket. Long fields are hashed into the key and the
-  per-request headers are ignored; a conversation's retries now land on the socket the previous attempt left
-  behind. Reusing that socket for the *next* turn is available and **off by default**
-  (`OCX_WS_CROSS_TURN_REUSE=1`), because a deadline that cannot distinguish a retired socket from a slow
-  origin costs more than it saves on days the origin answers in tens of seconds.
-- **Quota the panel knows and the API does not.** Panel-family subscriptions feed the router:
-  custom windows, epoch-second reset stamps, and `>= 100%` means exhausted.
-- **An intelligence probe with a verifiable answer.** `tools/pelican-probe.py` runs the two questions
-  sub2api ships (its prompt text, contract, `high` effort, expected answer and grading rules) against
-  any channel through this proxy, grades with a judge on a different channel and writes
-  `~/.opencodex/intelligence-probe.jsonl`. First run: the official `gpt-6-sol`/`luna`/`astra` all
-  answered 29 to a question whose minimum is provably 21, while `ciii-*` returned `Upstream
-  authentication failed` and every `lucen-*`/`portal` returned `SUBSCRIPTION_NOT_FOUND`.
-- **Model catalog and management surface** for the `gpt-6` family and the provider fields the
-  hardening needs (`retryOnReset`, transient-5xx policy, reasoning efforts, context windows).
-- **A wrong answer now costs a channel its turn.** `tools/pelican-probe.py --kind bank --apply` asks
-  six questions whose answers were each verified independently (exhaustive searches, `datetime`,
-  execution) and grades with a model on a different provider; a clear wrong answer holds that
-  provider for 30 minutes and combos demote it, while transport errors, auth failures and unknown
-  verdicts change nothing. A full clean round releases the hold. It runs on demand -- the first live
-  round held the official lane for answering 29 to a question whose minimum is provably 21 -- with
-  the units in `tools/` as opt-in templates for anyone who prefers a schedule.
-- **A lane-level breaker for the official transport.** When the origin closes the Codex WebSocket
-  without answering (control frames only, close 1011), turns used to burn the full 5+12+25+45s
-  capacity ladder and still fail. The breaker counts that exact shape across conversations and
-  rides HTTP/SSE for 10 minutes, escalating to 30 and 60 on repeats, with evidence in
-  `~/.opencodex/ws-lane.jsonl`. `provider.openai.upstreamWebsocket = false` remains the manual
-  switch, and is what this deployment runs on right now.
-- **Health, fingerprint and restriction watchers.** `ocx-tiers --health` scores each provider from
-  its error rate and p90 first-output time; `--fingerprints` lists client-fingerprint drift (a
-  Codex update or a header-rewriting relay stops being invisible); and a verdict that is about the
-  client rather than the load ("only allows Codex official clients") re-rolls that conversation's
-  routing identity immediately instead of waiting for a load threshold.
-
-## License
-
-MIT, unchanged, with upstream's copyright notice — see [LICENSE](LICENSE). Upstream is not
-affiliated with this fork; issues about the hardening work belong here, anything about opencodex
-itself belongs upstream.
-
----
-
-## Upstream README
+<p align="center">
+  <img src="assets/banner.png" alt="opencodex — universal provider proxy for Codex, Claude Code, Claude Desktop and Grok Build" width="100%">
+</p>
 
 <h3 align="center">make codex open!</h3>
 <p align="center"><b>Universal provider proxy for OpenAI Codex, Claude Code, Claude Desktop &amp; Grok Build</b><br>
@@ -130,6 +17,13 @@ Two commands, and every one of them runs any LLM you point it at.</p>
 npm install -g @bitkyc08/opencodex
 ocx start
 ```
+
+<p align="center">
+  <a href="https://github.com/lidge-jun/opencodex/releases/latest"><img src="https://img.shields.io/badge/macOS-.dmg-24292f?logo=apple&logoColor=white" alt="Download for macOS (.dmg)"></a>
+  <a href="https://github.com/lidge-jun/opencodex/releases/latest"><img src="https://img.shields.io/badge/Windows-.msi-24292f?logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0id2hpdGUiPjxwYXRoIGQ9Ik0zIDNoOC41djguNUgzem05LjUgMEgyMXY4LjVoLTguNXpNMyAxMi41aDguNVYyMUgzem05LjUgMEgyMVYyMWgtOC41eiIvPjwvc3ZnPg==" alt="Download for Windows (.msi)"></a>
+  <a href="https://github.com/lidge-jun/opencodex/releases/latest"><img src="https://img.shields.io/badge/Linux-.AppImage-24292f?logo=linux&logoColor=white" alt="Download for Linux (.AppImage)"></a>
+  <a href="https://github.com/lidge-jun/opencodex/releases/latest"><img src="https://img.shields.io/badge/Linux-.deb-24292f?logo=debian&logoColor=white" alt="Download for Linux (.deb)"></a>
+</p>
 
 <table>
 <tr>
@@ -195,7 +89,7 @@ account while existing threads stay pinned to the account that started them.
 
 ## Quick start
 
-### Personal install
+### Personal install (CLI)
 
 ```bash
 npm install -g @bitkyc08/opencodex   # Node 18+; the Bun runtime is bundled automatically
@@ -209,26 +103,28 @@ Open **http://localhost:10100** and configure everything in the web dashboard �
 re-opens the dashboard at any time.
 
 <details>
-<summary><b>Desktop app and macOS widget — beta</b></summary>
+<summary><b>Desktop app (beta)</b></summary>
 
-A native shell around the same dashboard, plus a WidgetKit extension that shows proxy status,
-today's usage and provider quotas without opening a browser. The proxy is unchanged: the app
-finds a running one or starts the bundled `ocx` sidecar, and the dashboard stays at
-**http://localhost:10100**.
+The desktop app is the same proxy and dashboard in a native window, with a tray and bundled `ocx`.
+It attaches to a proxy that is already running, or starts its bundled one, and the dashboard stays
+on the proxy port (**http://localhost:10100** unless you configured another). Pick the file for your
+platform from the [latest release](https://github.com/lidge-jun/opencodex/releases/latest):
 
-It is beta. Builds are signed for integrity but not notarized, so macOS asks for a
-right-click → **Open** on first launch and Windows SmartScreen warns on the installer. The
-widget needs macOS 14 or newer; the snapshot model it renders lives in [`app/`](./app)
-(`MenuBarCore`).
+| Platform | File | Notes |
+|---|---|---|
+| macOS 13+ (Apple Silicon and Intel) | `OpenCodex-<version>-macos.dmg` | Universal build, signed with a Developer ID and notarized |
+| Windows (x64) | `OpenCodex-<version>-windows-x64.msi` | Not code-signed yet: SmartScreen asks once, choose **More info → Run anyway** |
+| Linux (x86_64) | `OpenCodex-<version>-linux-x86_64.AppImage` or `-linux-amd64.deb` | The tray needs an AppIndicator-capable desktop |
 
-Download it from the [latest release](https://github.com/lidge-jun/opencodex/releases), or build
-it locally with `bun run prepare-sidecar && bun run prepare-widget && bunx tauri build`.
-
-Install locations, service files and everything else written to disk are listed in
-[`AGENTS_INSTALL.md`](./AGENTS_INSTALL.md#where-things-are-installed). The
-[Desktop App guide](https://lidge-jun.github.io/opencodex/guides/desktop-app/) and the
-[macOS Menu Bar App guide](https://lidge-jun.github.io/opencodex/guides/macos-menu-bar/) cover
-per-platform installation and the Gatekeeper prompt.
+Every file has a `.sha256` next to it on the release page. On macOS 14+ the app also ships a
+WidgetKit extension that shows proxy status, today's usage and provider quotas; the snapshot model
+it renders lives in [`app/`](./app) (`MenuBarCore`). To build the app yourself, run
+`bun install && bun run build:gui` at the repository root, then in `desktop/` run
+`bun install && bun run prepare-sidecar && bun run prepare-widget && bun run build:local` on macOS,
+or `bun install && bun run prepare-sidecar && bun run build:local` on Windows and Linux (the widget
+step needs macOS). The [Desktop App guide](https://opencodex.me/guides/desktop-app/) and the
+[macOS Menu Bar App guide](https://opencodex.me/guides/macos-menu-bar/) cover first launch, and
+[`AGENTS_INSTALL.md`](./AGENTS_INSTALL.md#where-things-are-installed) lists everything written to disk.
 
 </details>
 
@@ -324,8 +220,9 @@ setup, authenticated acceptance checks, remote management, and rollback.
 
 ```bash
 curl -fsSL https://bun.sh/install | bash
-git clone https://github.com/lidge-jun/opencodex.git
+git clone -b dev https://github.com/lidge-jun/opencodex.git
 cd opencodex && ~/.bun/bin/bun install
+~/.bun/bin/bun run build:gui
 ~/.bun/bin/bun run src/cli/index.ts start
 ```
 
@@ -333,8 +230,9 @@ cd opencodex && ~/.bun/bin/bun install
 
 ```powershell
 irm bun.sh/install.ps1 | iex
-git clone https://github.com/lidge-jun/opencodex.git
+git clone -b dev https://github.com/lidge-jun/opencodex.git
 cd opencodex; bun install
+bun run build:gui
 bun run src/cli/index.ts start
 ```
 
@@ -366,13 +264,13 @@ when it is unreachable). `ocx status` / `ocx doctor` / `ocx health` report the r
 
 ## Supported platforms
 
-| OS | Status | Service manager |
-|---|---|---|
-| macOS (arm64 / x64) | Fully supported | launchd |
-| Linux (x64 / arm64) | Fully supported | systemd (user unit) |
-| Windows (x64) | Fully supported | Task Scheduler (hidden) / opt-in native service (`--native`, WinSW) |
+| OS | Status | Service manager | Desktop app (beta) |
+|---|---|---|---|
+| macOS (arm64 / x64) | Fully supported | launchd | Universal `.dmg` |
+| Linux (x64 / arm64) | Fully supported | systemd (user unit) | x86_64 `.AppImage` / `.deb` |
+| Windows (x64) | Fully supported | Task Scheduler (hidden) / opt-in native service (`--native`, WinSW) | x64 `.msi` |
 
-Requires [Node](https://nodejs.org) 18+. The Bun runtime is bundled on `npm install` — no separate
+The CLI install requires [Node](https://nodejs.org) 18+; the desktop app needs neither Node nor Bun. The Bun runtime is bundled on `npm install` — no separate
 Bun install needed, no WSL needed on Windows. If npm blocked the bundled runtime's install scripts,
 see the [installation docs](https://opencodex.me/getting-started/installation/).
 
@@ -410,14 +308,15 @@ see the [installation docs](https://opencodex.me/getting-started/installation/).
 <details>
 <summary>Memory ownership details</summary>
 
-OpenCodex tracks 36 categories of process-retained state. Each has a documented bound:
+OpenCodex tracks process-retained state in the categories below. Each has a documented bound:
 
-- **12 retained stores** (request log, debug rings, image cache, model cache, vision
+- **14 retained stores** (request log, debug rings, image cache, model cache, vision
   descriptions, cursor blobs, responses continuation, etc.) are byte-accounted and
-  evicted by the app-owned memory budget (default 256 MiB).
+  evicted by the app-owned memory budget (default 256 MiB), except the native control replay
+  store, which is pinned and never evicted.
 - **4 observed buffers** (translator accumulators, image/OAuth/Grok tails) are
   monitored for in-flight byte pressure without eviction.
-- **24 state-store registrations** handle expiry sweeps (60 s interval) and
+- **28 state-store registrations** handle expiry sweeps (60 s interval) and
   config-generation reconciliation so stale provider/account keys are removed.
 - **Path and fingerprint memos** (workspace metadata, hardened identities, installation
   salts, mode-hint capabilities) use insertion-order LRU caps (8–128 entries).
@@ -445,6 +344,20 @@ codex -m "ollama/llama3" "Refactor this function"
 Omit the `provider/` prefix to use the default provider or auto-match by model name pattern.
 Provider model ids containing `/` are exposed with inner slashes aliased to `-`; the raw
 full-slash form keeps working too. Details: [model routing docs](https://opencodex.me/guides/model-routing/).
+
+### JEV Auto routing (optional)
+
+TypeSafe JEV can choose the first model and reasoning effort for an opt-in Combo while the normal
+model picker and every direct route stay unchanged. Add the credential with `ocx login jev`, from
+**Providers → TypeSafe JEV → Add API key**, or through `TYPESAFE_API_KEY`/`JEV_API_KEY`. Then open
+**Models → Combos → Create JEV Auto**, choose the allowed target models, and check the exact efforts
+JEV may select for each target. Leaving a target's effort setting untouched allows all efforts that
+model currently advertises.
+
+JEV is consulted only for `jev-auto` and only once per logical model call. Missing credentials,
+network failures, or invalid decisions fail open to the first currently eligible target; caller
+cancellation still cancels the request. Automated tests use a mocked TypeSafe endpoint and do not
+validate a live JEV account.
 
 ## Providers & adapters
 

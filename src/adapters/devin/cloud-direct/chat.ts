@@ -1289,7 +1289,13 @@ export async function* streamChatEvents(req: CloudChatRequest): AsyncGenerator<C
     // The status line is carried on the error. A cap or an expired credential
     // delivered instead as a Connect EOS trailer is mapped by
     // connectTrailerHttpStatus at the trailer sites below.
-    throw new CloudChatError(`GetChatMessage failed (HTTP ${resp.status})`, undefined, undefined, resp.status);
+    const error = new CloudChatError(`GetChatMessage failed (HTTP ${resp.status})`, undefined, undefined, resp.status);
+    // No consumer will drain this body. Cancellation must neither replace the
+    // status error nor delay it if a transport's cancel promise never settles.
+    try {
+      void resp.body?.cancel(error).catch(() => undefined);
+    } catch { /* Non-conforming streams can throw synchronously from cancel. */ }
+    throw error;
   }
   if (!resp.body) {
     throw new CloudChatError('GetChatMessage response had no body stream');
@@ -1559,7 +1565,9 @@ export async function* streamChatEvents(req: CloudChatRequest): AsyncGenerator<C
     // trace id are the only upstream-controlled fields that reach the error.
     // The stated delay rides along in our own words so a client can still
     // tell how long to wait when local retry gives up, exceeds its cap, or
-    // is disabled; the `~` keeps it from re-parsing as a downstream hint.
+    // is disabled. The `~` marks the delay as approximate; the shared
+    // parser accepts it once after Retry-After, so the outer client cooldown
+    // reads this same delay back from the message.
     throw new CloudChatError(
       `Cognition chat failed${trailerError.code ? ` (${trailerError.code})` : ''} ` +
       `(cloud trace ID: ${trailerError.traceId ?? 'n/a'})` +

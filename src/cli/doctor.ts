@@ -12,7 +12,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { getConfigDir, getConfigPath, readConfigDiagnostics } from "../config";
 import { readPid } from "../config/process-state";
-import { probeUncleanExitState } from "./status";
+import { fetchLiveStartupHealth, probeUncleanExitState, selectStatusStartupHealth } from "./status";
 import { findLiveProxy, probeHostname, type LiveProxy } from "../server/proxy-liveness";
 import { directLocalHttpFetch } from "../server/direct-local-http";
 import { BUN_RUNTIME_SOURCES } from "../lib/bun-runtime";
@@ -42,7 +42,9 @@ import {
 } from "../codex/coordinator-doctor";
 import {
   inspectAbandonedResponseStateTemps,
+  inspectResponseSpillStorage,
   reclaimAbandonedResponseStateTemps,
+  type ResponseSpillDirInspection,
   type ResponseStateTempRecoveryResult,
 } from "../responses/state";
 import {
@@ -59,6 +61,7 @@ import {
   formatLegacyCodexConfigKeyDiagnosticsForDoctor,
 } from "../codex/legacy-config-keys";
 import { collectStartupHealth, formatStartupRoutingDetail, startupHealthSummary } from "../codex/autostart-health";
+import { collectDesktopSystemProxy, formatDesktopSystemProxyLines } from "../claude/desktop-system-proxy";
 import {
   displayCodexRuntimePath,
   effortClampAppliesToRuntime,
@@ -861,6 +864,34 @@ export function formatResponseTempLines(
   return lines;
 }
 
+/**
+ * Render the response-state spill section (testable without console capture).
+ *
+ * Always dry-run: doctor reports what the disk looks like, it never unlinks
+ * spill files. "Owned" counts union the live store and the persisted snapshot,
+ * so a file a restart would re-own is never reported as garbage.
+ */
+export function formatResponseSpillLines(result: ResponseSpillDirInspection): string[] {
+  // A truncated scan saw only a prefix of the directory, so zero orphans there is
+  // not a clean bill of health: the unscanned tail may still hold them.
+  if (result.orphanFiles === 0 && result.truncated) {
+    return [
+      `  !!  No orphaned response-state spill files in the first ${result.scanned} entries (${result.files} file(s), ${mb(result.bytes)} scanned).`,
+      "      Scan stopped at its entry budget; the rest of the directory was not checked.",
+    ];
+  }
+  if (result.orphanFiles === 0) {
+    return [`  ok  No orphaned response-state spill files (${result.files} file(s), ${mb(result.bytes)} on disk).`];
+  }
+  const lines = [
+    `  !!  ${result.orphanFiles} unreferenced response-state spill file(s), ${mb(result.orphanBytes)} reclaimable.`,
+    `      ${result.ownedFiles} file(s), ${mb(result.ownedBytes)} still owned by the store or the persisted snapshot.`,
+    "      The running proxy reclaims orphans on its periodic sweep; do not delete spill files manually.",
+  ];
+  if (result.truncated) lines.push("      Scan stopped at its entry budget; the real total is higher.");
+  return lines;
+}
+
 export function formatCoordinatorDoctorLines(diagnostic: CodexCoordinatorDiagnostic): string[] {
   const pathLine = diagnostic.path ? [`       path: ${diagnostic.path}`] : [];
   const evidenceLines = "evidence" in diagnostic && diagnostic.evidence
@@ -1299,6 +1330,9 @@ export async function runDoctor(args: string[] = []): Promise<void> {
     reclaimTemps,
   )) console.log(line);
 
+  console.log("\nResponse-state spill files");
+  for (const line of formatResponseSpillLines(inspectResponseSpillStorage())) console.log(line);
+
   const orcaHome = collectOrcaCodexHomeDiagnostic();
   console.log("\nCodex app home targeting");
   console.log(`  ${orcaHome.mismatch ? "!! " : "ok "} Effective Codex home: ${orcaHome.effectiveCodexHome}`);
@@ -1321,7 +1355,14 @@ export async function runDoctor(args: string[] = []): Promise<void> {
     diagnoseCodexShim(),
     serviceTokenPresent,
   );
-  const startup = collectStartupHealth(doctorConfig);
+  // Use the same attested live startup verdict as `ocx status` when the proxy is already
+  // identity-verified. A shell-local systemd probe can be a false negative for a system-wide
+  // service because the shell does not inherit the manager-owned environment.
+  const live = await findLiveProxy({
+    configFn: () => ({ port: doctorConfig.port, hostname: doctorConfig.hostname }),
+  });
+  const liveStartup = live ? await fetchLiveStartupHealth(live) : null;
+  const startup = selectStatusStartupHealth(liveStartup, () => collectStartupHealth(doctorConfig));
   console.log("\nCodex restart safety");
   console.log(`  ${startup.rebootSafe ? "ok " : "!! "} ${startupHealthSummary(startup)}`);
   console.log(`       ${formatStartupRoutingDetail(startup)}`);
@@ -1360,12 +1401,6 @@ export async function runDoctor(args: string[] = []): Promise<void> {
     }
   }
 
-  // #618: identity-verified liveness first so pid-file absence does not hide a live service.
-  // Reuse the diagnostics config already loaded above so doctor stays read-only on malformed JSON.
-  const live = await findLiveProxy({
-    configFn: () => ({ port: doctorConfig.port, hostname: doctorConfig.hostname }),
-  });
-
   // Mirrors `ocx status` through the same comparison rather than a second implementation:
   // two diagnostics disagreeing about whether an install is stale is worse than one (#2701).
   // No extra probe -- findLiveProxy already carried the version back.
@@ -1393,6 +1428,14 @@ export async function runDoctor(args: string[] = []): Promise<void> {
 
   console.log("\nConfigured proxy (value hidden)");
   console.log(`  ${configuredProxy.present ? "set    " : "unset  "} ${configuredProxy.key} (${configuredProxy.source}; ${configuredProxy.detail})`);
+
+  // Observe-only and warning-level: a bypassed Desktop first-party install still serves the
+  // CLI and every non-Desktop client, so this never records a doctor failure.
+  const desktopSystemProxyLines = formatDesktopSystemProxyLines(collectDesktopSystemProxy(doctorConfig));
+  if (desktopSystemProxyLines.length > 0) {
+    console.log("\nClaude Desktop first-party vs Windows system proxy");
+    for (const line of desktopSystemProxyLines) console.log(line);
+  }
 
   const providerApiKeys = collectProviderApiKeyDiagnostics(doctorConfig.providers);
   console.log("\nProvider API keys (value hidden)");

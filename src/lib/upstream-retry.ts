@@ -15,8 +15,6 @@
  * MUST stay a leaf module: imports nothing from server.ts or adapters (kiro-retry imports
  * the shared abort helpers from here).
  */
-import { withSsePreludeDeclineRetry } from "./sse-prelude-retry";
-
 import { clearableDeadline } from "./abort";
 import { redactSecretString } from "./redact";
 
@@ -442,6 +440,25 @@ function invitesResendAfterReplacement(status: number): boolean {
     || status === 307 || status === 308 || status === 413 || status >= 500;
 }
 
+/**
+ * The answer a request keeps once its one operator replacement has gone out.
+ *
+ * A status that invites another send settles as the refusal. Any other answer keeps its real
+ * status: no client retries it, and the caller needs the evidence (a 400 names the request
+ * defect). The marker still stops this process from using it as a recovery trigger, such as the
+ * opaque-blob rebuild of a 400 or a combo hop on a context overflow, because each of those checks
+ * it before sending again.
+ */
+export function settleOperatorReplacement(response: Response): Response {
+  if (response.ok) return response;
+  if (invitesResendAfterReplacement(response.status)) {
+    cancelResponseBodyBestEffort(response);
+    return replayRefusalResponse();
+  }
+  markResponseNonReplayable(response);
+  return response;
+}
+
 export async function fetchWithAttemptDeadline(
   url: string,
   init: RequestInit,
@@ -511,34 +528,6 @@ export interface ResetRetryOptions {
 export interface TransientRetryOptions extends ResetRetryOptions {
   /** Test seam: per-attempt slow budget override (defaults to TRANSIENT_RETRY_SLOW_ATTEMPT_MS). */
   slowAttemptMs?: number;
-  /**
-   * Allow ONE extra send when a 502/503/504 arrived after {@link slowAttemptMs}.
-   *
-   * The ChatGPT backend answers capacity pressure slowly, so the elapsed-time guard -- which exists
-   * to stop doubling the latency of a genuinely slow failure -- would otherwise suppress the retry
-   * exactly when it is most useful. Opt-in per caller; the send budget still bounds the total.
-   */
-  retrySlowCapacity?: boolean;
-  /**
-   * Paced extra sends for a CAPACITY verdict, as the waits before each one.
-   *
-   * `retrySlowCapacity` buys one send and only for a SLOW failure; the canonical backend also
-   * sheds a heavy turn in 1-4 seconds, and a run of sheds inside one window outlives a single
-   * retry. A caller that opts in hands over the ladder it is willing to wait (see
-   * {@link CAPACITY_RETRY_DELAYS_MS}); an empty or absent list keeps the previous behaviour
-   * exactly. These sends are additional to `attempts`, never a widening of it, and a
-   * non-capacity failure still returns on the first response.
-   */
-  retryCapacityDeferralsMs?: readonly number[];
-  /**
-   * Also retry a capacity decline that arrives INSIDE an already-200 SSE body.
-   *
-   * The transient ladder can only act on a status; the ChatGPT backend also declines *after* a 200,
-   * by emitting the prelude and then an overload event. `lib/sse-prelude-retry.ts` holds those
-   * prelude frames and splices a fresh attempt into the same body, so the client never sees the
-   * declined one. Opt-in, and bounded by the same ladder the caller passed above.
-   */
-  retrySsePreludeDecline?: boolean;
   /**
    * How long this caller can wait on an honoured `Retry-After`, defaulting to
    * {@link RETRY_AFTER_CEILING_MS}. It is a deadline, never a clamp: an instruction inside it
@@ -654,18 +643,7 @@ export async function fetchWithResetRetry(
     opts.onSendsConsumed?.(1);
     try {
       const response = await doFetch(attempt === 0 ? firstRecovery : "connection-reset");
-      if (spentOperatorReplacement && !response.ok) {
-        if (invitesResendAfterReplacement(response.status)) {
-          cancelResponseBodyBestEffort(response);
-          return replayRefusalResponse();
-        }
-        // Any other answer keeps its real status: no client retries it, and the caller needs the
-        // evidence (a 400 names the request defect). The marker still stops this process from
-        // using it as a recovery trigger, such as the opaque-blob rebuild of a 400 or a combo hop
-        // on a context overflow, because each of those checks it before sending again.
-        markResponseNonReplayable(response);
-      }
-      return response;
+      return spentOperatorReplacement ? settleOperatorReplacement(response) : response;
     } catch (err) {
       if (opts.abortSignal?.aborted) throw err;
       if (!isConnectionResetError(err)) {
@@ -721,40 +699,11 @@ export async function fetchWithResetRetry(
  * `opts.attempts` is ONE total-send budget covering this layer and the inner reset layer
  * together, so it bounds the real number of upstream requests rather than multiplying.
  */
-/**
- * Extra sends a caller may spend on a CAPACITY verdict, and the waits between them.
- *
- * The canonical backend answers a heavy turn "Our servers are currently overloaded" while the
- * SAME account serves a lighter conversation in the same minute (measured 2026-09-23: 8% shed on
- * one conversation, 0.6% on its sibling). Rejections cluster into windows of minutes, and inside
- * a window the very next attempt succeeds only about half the time, so a single retry cannot ride
- * one out. The waits are deliberately paced: they let a window close instead of spending the
- * client's own retry budget against it. Bounded by the array length, and spent only on a
- * 502/503/504 the caller opted into reading as capacity -- never on a request-shaped error.
- *
- * Measured again at 23:00-23:31 on the same day with the earlier three-rung ladder: every one of
- * the shedding conversation's five failures was PRE-content (absorbable), which is the class this
- * ladder exists for -- so the ladder, not the routing, was the binding constraint. Four rungs and
- * a longer tail cover roughly one more halving of the residual.
- */
-export const CAPACITY_RETRY_DELAYS_MS: readonly number[] = [5_000, 12_000, 25_000, 45_000];
-
 export async function fetchWithTransientRetry(
   doFetch: ReplayableFetch,
   opts: TransientRetryOptions = {},
 ): Promise<Response> {
   const budget = normalizeSendAttempts(opts.attempts, TRANSIENT_RETRY_MAX_ATTEMPTS);
-  /**
-   * Capacity sends are ADDITIONAL to the transient budget on purpose.
-   *
-   * That budget exists to stop per-request amplification of RETRIES against a provider that keeps
-   * answering the same way; a capacity verdict is the opposite case -- the provider just said
-   * "not now" about a turn nothing has started, and the operator's whole complaint is that the
-   * turn dies instead of progressing. Each one is still a real send and is reported as such.
-   */
-  const capacityDelays = opts.retryCapacityDeferralsMs ?? [];
-  let capacityRetriesUsed = 0;
-  const totalBudget = budget + capacityDelays.length;
   const slowAttemptMs = opts.slowAttemptMs ?? TRANSIENT_RETRY_SLOW_ATTEMPT_MS;
   const transientStatuses: number[] = [];
   // `attempts` is ONE total-send budget shared with the inner reset layer, not a per-layer
@@ -765,34 +714,6 @@ export async function fetchWithTransientRetry(
   // `transientRetryOn5xx` policy is the first one that does, and multiplying load against an
   // already-failing provider is worse than not retrying at all.
   let sent = 0;
-  /** Set once the opt-in extra send for a SLOW capacity verdict has been spent. */
-  let slowCapacityRetryUsed = false;
-  /**
-   * Wrap a response whose 200 body may turn out to BE the decline.
-   *
-   * This has to run at every return point that can hand an ok response back, not only at the end
-   * of the transient loop. The loop's first statement returns immediately on `res.ok`, so for a
-   * year the wrapper below it was unreachable in exactly the case it was written for: measured
-   * 2026-09-26 09:28/09:38, two native turns carried `Our servers are currently overloaded` inside
-   * a 200 and the wrapper never logged a line because it was never called.
-   */
-  const wrapSseDeclineRetry = (candidate: Response): Response => {
-    if (opts.retrySsePreludeDecline !== true || capacityDelays.length === 0
-      || !candidate.ok || !candidate.body) return candidate;
-    return withSsePreludeDeclineRetry(candidate, {
-      delaysMs: capacityDelays,
-      label: opts.label,
-      signal: opts.abortSignal,
-      // The caller opted in because it knows this endpoint speaks the Responses event protocol, so a
-      // decline that arrives with a wrong or missing content-type must still be caught.
-      acceptAnyContentType: true,
-      resend: async () => {
-        // One more physical send, counted exactly like every send this helper owns.
-        opts.onSendsConsumed?.(1);
-        return await fetchWithResetRetry(countedFetch, innerResetOptions(1), "transient-5xx");
-      },
-    });
-  };
   const countedFetch: ReplayableFetch = (recovery) => {
     // Incremented BEFORE the await so a rejected send still consumes budget; counting only
     // successes would let a reset storm loop without bound.
@@ -807,12 +728,9 @@ export async function fetchWithTransientRetry(
   // sends `countedFetch` already counts. Forwarding the reporter down the `remaining()` path
   // would report each of them twice, which is how a four-send cap becomes a two-send cap. One
   // send is counted once, by the outermost layer that owns the budget.
-  const innerResetOptions = (floor = 0): ResetRetryOptions => ({
+  const innerResetOptions = (): ResetRetryOptions => ({
     ...opts,
-    // `floor` is the capacity lane's one physical send: it is a NEW send the caller authorized,
-    // not a refund of a budget this helper already spent. A reset on that send is still refused
-    // by the inner layer, which is exactly the behaviour the missing allowance should keep.
-    attempts: Math.max(remaining(), floor),
+    attempts: remaining(),
     onSendsConsumed: undefined,
   });
   // Reported in `finally` rather than at each exit: this function returns from five places
@@ -822,57 +740,14 @@ export async function fetchWithTransientRetry(
   if (budget === 0) throw new SendBudgetExhaustedError(opts.label);
   let attemptStart = Date.now();
   let res = await fetchWithResetRetry(countedFetch, innerResetOptions());
-  for (let attempt = 0; sent < totalBudget; attempt++) {
+  for (let attempt = 0; sent < budget; attempt++) {
     // A non-replayable gateway status was settled after the request body had already left
     // for the origin; retrying it here is the automatic resend the marker exists to forbid.
-    if (res.ok || !isTransientUpstreamStatus(res.status) || isNonReplayableResponse(res)) {
-      return wrapSseDeclineRetry(res);
-    }
+    if (res.ok || !isTransientUpstreamStatus(res.status) || isNonReplayableResponse(res)) return res;
     // Checked before cancelResponseBodyBestEffort so an already-aborted caller never receives
     // a response whose body we just cancelled.
     if (opts.abortSignal?.aborted) return res;
-    // Capacity lane, checked BEFORE the slow gate: the canonical backend's shed answers arrive in
-    // anywhere from 1s to 36s (measured 2026-09-23), so gating on elapsed time missed the fast
-    // half of them entirely.
-    if ((res.status === 502 || res.status === 503 || res.status === 504)
-      && capacityRetriesUsed < capacityDelays.length) {
-      const waitMs = capacityDelays[capacityRetriesUsed]!;
-      capacityRetriesUsed += 1;
-      console.warn(
-        `[upstream-retry] capacity ${res.status}${opts.label ? ` (${opts.label})` : ""} — absorbing: waiting ${waitMs}ms before resend ${capacityRetriesUsed}/${capacityDelays.length}`,
-      );
-      cancelResponseBodyBestEffort(res);
-      await sleepWithAbort(waitMs, opts.abortSignal);
-      attemptStart = Date.now();
-      transientStatuses.push(res.status);
-      try {
-        res = await fetchWithResetRetry(countedFetch, innerResetOptions(1), "transient-5xx");
-      } catch (err) {
-        if (err instanceof SendBudgetExhaustedError) throw err;
-        throw new UpstreamRetryEvidenceError(transientStatuses, err);
-      }
-      continue;
-    }
-    // Everything that is NOT a capacity verdict keeps the caller's original budget, even when the
-    // capacity rungs below have not been spent: the extra sends exist for "the origin said not now"
-    // and must never widen the general transient ladder (a forward pool that retries its own 429s
-    // and 500s is the amplification the send budget was built to stop).
-    if (sent >= budget) return res;
-    if (Date.now() - attemptStart > slowAttemptMs) {
-      // The ChatGPT backend's capacity verdicts arrive SLOWLY: on 2026-09-23 one conversation was
-      // answered `Our servers are currently overloaded` after 8-57 seconds, every one of them past
-      // this 15s guard, so the transient layer never resent and the caller saw a bare 502/503 on a
-      // lane where the very next attempt usually succeeds. A caller that opted in gets exactly ONE
-      // extra send for a slow capacity status; the elapsed-time guard still stops everything else.
-      const capacityStatus = res.status === 502 || res.status === 503 || res.status === 504;
-      if (!(opts.retrySlowCapacity === true && capacityStatus && !slowCapacityRetryUsed && remaining() > 0)) {
-        return res;
-      }
-      slowCapacityRetryUsed = true;
-      console.warn(
-        `[upstream-retry] slow ${res.status}${opts.label ? ` (${opts.label})` : ""} treated as a capacity verdict - one extra send`,
-      );
-    }
+    if (Date.now() - attemptStart > slowAttemptMs) return res;
     const instructedDelay = retryAfterDelayMs(res.headers);
     // The deadline is the CALLER'S, not this module's default. Reading the constant directly
     // broke it in both directions: a caller with a 30s budget slept the full 45s an upstream
@@ -911,9 +786,8 @@ export async function fetchWithTransientRetry(
       throw new UpstreamRetryEvidenceError(transientStatuses, err);
     }
   }
-  // Any remaining ok response goes through the same wrapper as the early return above (the helper
-  // is idempotent about the gate); a budget-exhausted 5xx is returned with its body intact.
-  return wrapSseDeclineRetry(res);
+  // Budget exhausted: the last response is returned with its body intact.
+  return res;
   } finally {
     opts.onSendsConsumed?.(sent);
   }
@@ -973,6 +847,62 @@ export async function refetchAfterProtocolSafeReset(
     console.warn("[upstream-retry] protocol-safe refetch rejected" + label + "; preserving original stream error");
     return null;
   }
-  console.warn("[upstream-retry] pre-output Responses reset" + label + "; using one replacement stream");
+  console.warn("[upstream-retry] pre-output stream reset" + label + "; using one replacement stream");
   return replacement;
+}
+
+/**
+ * Wrap a streamed body so a reset that arrives before the downstream reader has consumed a single
+ * byte swaps in ONE replacement body.
+ *
+ * The zero-byte gate is the whole reason this wrapper exists: the caller observed nothing, which is
+ * the stage where a replacement may even be considered. Every other question -- whether the operator
+ * granted one, whether the request is replayable, whether the replacement is a fresh unlocked body
+ * that matches the contract already promised to the client -- belongs to
+ * {@link refetchAfterProtocolSafeReset}. Delegating rather than re-deciding is what keeps the chat
+ * lane from drifting away from the one the Responses stream already uses.
+ *
+ * Partial output is never masked: once a byte has reached the caller, the original failure stands.
+ */
+export function wrapWithZeroOutputRefetch(
+  body: ReadableStream<Uint8Array>,
+  doFetch: ProtocolSafeRefetch,
+  // `authorize` is optional on the shared options but required here: a zero-output replacement
+  // is always a post-header resend, so every caller must name the gate that weighs it.
+  opts: ProtocolSafeRefetchOptions & { authorize: () => boolean },
+): ReadableStream<Uint8Array> {
+  let reader = body.getReader();
+  let bytesRead = 0;
+  let retried = false;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      for (;;) {
+        try {
+          const { done, value } = await reader.read();
+          if (done) {
+            controller.close();
+            return;
+          }
+          bytesRead += value.byteLength;
+          controller.enqueue(value);
+          return;
+        } catch (err) {
+          if (!retried && bytesRead === 0 && !opts.abortSignal?.aborted) {
+            retried = true;
+            const replacement = await refetchAfterProtocolSafeReset(doFetch, err, { ...opts, authorize: opts.authorize });
+            if (replacement?.body) {
+              try { void reader.cancel().catch(() => {}); } catch { /* broken reader; the replacement won */ }
+              reader = replacement.body.getReader();
+              continue;
+            }
+          }
+          try { controller.error(err); } catch { /* already torn down */ }
+          return;
+        }
+      }
+    },
+    cancel(reason) {
+      try { void reader.cancel(reason).catch(() => {}); } catch { /* already torn down */ }
+    },
+  });
 }

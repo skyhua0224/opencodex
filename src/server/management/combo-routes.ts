@@ -52,7 +52,7 @@ import {
   setDebugSettings,
   type DebugFlag,
 } from "../../lib/debug-settings";
-import type { OcxClaudeCodeConfig, OcxComboConfig, OcxConfig, OcxCustomModel, OcxProviderConfig } from "../../types";
+import type { OcxClaudeCodeConfig, OcxComboConfig, OcxConfig, OcxCustomModel, OcxProviderConfig, OcxComboCooldownWaitPolicy } from "../../types";
 import { drainAndShutdown } from "../lifecycle";
 import { reconcileLiveStateStores } from "../../lib/state-store-registrations";
 import { filterRequestLogs, getRequestLogEntries, type RequestLogEntry } from "../request-log";
@@ -78,12 +78,14 @@ import { COMBO_DEFAULT_WAIT_FOR_COOLDOWN_MS } from "../../combos";
 function sparseComboConfig<T extends {
   cooldownMs?: number;
   waitForCooldownMs?: number;
+  cooldownWaitPolicy?: OcxComboCooldownWaitPolicy | null;
   imageInput?: "auto" | "disabled";
   reasoningEffortMode?: "strict" | "adaptive";
   defaultEffortMode?: "fallback" | "force";
-}>(combo: T): Omit<T, "cooldownMs" | "waitForCooldownMs" | "imageInput" | "reasoningEffortMode" | "defaultEffortMode"> & {
+}>(combo: T): Omit<T, "cooldownMs" | "waitForCooldownMs" | "cooldownWaitPolicy" | "imageInput" | "reasoningEffortMode" | "defaultEffortMode"> & {
   cooldownMs?: number;
   waitForCooldownMs?: number;
+  cooldownWaitPolicy?: OcxComboCooldownWaitPolicy;
   imageInput?: "disabled";
   reasoningEffortMode?: "adaptive";
   defaultEffortMode?: "force";
@@ -91,6 +93,7 @@ function sparseComboConfig<T extends {
   const {
     cooldownMs,
     waitForCooldownMs,
+    cooldownWaitPolicy,
     imageInput,
     reasoningEffortMode,
     defaultEffortMode,
@@ -99,6 +102,9 @@ function sparseComboConfig<T extends {
   return {
     ...rest,
     ...(cooldownMs !== undefined ? { cooldownMs } : {}),
+    // #5691: the normalizer yields null for "unset"; persisting that would put a
+    // meaningless key in every stored combo. Only the opt-in value is written.
+    ...(cooldownWaitPolicy ? { cooldownWaitPolicy } : {}),
     ...(waitForCooldownMs !== undefined && waitForCooldownMs !== COMBO_DEFAULT_WAIT_FOR_COOLDOWN_MS
       ? { waitForCooldownMs }
       : {}),
@@ -168,50 +174,52 @@ export async function handleComboRoutes(ctx: ManagementContext): Promise<Respons
     const requestedCombo: Record<string, unknown> = body.combo;
     const effectiveCombo = {
       ...requestedCombo,
-      // Per-target tuning is not part of the editor's form shape, so a save that carries the same
-      // provider/model pair must INHERIT the rung's configured deadline instead of silently
-      // resetting it. Without this, editing a combo in the dashboard wipes the slow-rung tuning and
-      // the ladder goes back to paying full patience on every cheap, congested row.
-      ...(Array.isArray(requestedCombo.targets) && Array.isArray(previous?.targets)
-        ? {
-          targets: (requestedCombo.targets as unknown[]).map(entry => {
-            if (!isPlainRecord(entry)) return entry;
-            if (entry.firstByteTimeoutMs !== undefined) return entry;
-            const match = (previous!.targets as unknown[]).find(candidate =>
-              isPlainRecord(candidate)
-              && candidate.provider === entry.provider
-              && candidate.model === entry.model);
-            return isPlainRecord(match) && match.firstByteTimeoutMs !== undefined
-              ? { ...entry, firstByteTimeoutMs: match.firstByteTimeoutMs }
-              : entry;
-          }),
-        }
-        : {}),
       ...(!Object.hasOwn(requestedCombo, "cooldownMs") && previous?.cooldownMs !== undefined
         ? { cooldownMs: previous.cooldownMs }
         : {}),
       ...(!Object.hasOwn(requestedCombo, "waitForCooldownMs") && previous?.waitForCooldownMs !== undefined
         ? { waitForCooldownMs: previous.waitForCooldownMs }
         : {}),
-      // The dashboard does not expose these advanced CLI/API policies. Preserve them when a
-      // GUI round-trip omits the fields instead of silently resetting ladder behavior.
+      // Same reason as defaultEffortMode below: the dashboard does not expose the
+      // last-resort policy, so a GUI round-trip that omits it must not delete it (#5736).
+      ...(!Object.hasOwn(requestedCombo, "cooldownWaitPolicy") && previous?.cooldownWaitPolicy !== undefined
+        ? { cooldownWaitPolicy: previous.cooldownWaitPolicy }
+        : {}),
+      // #5687: an API or CLI client that omits these must not reset them. The dashboard
+      // sends both explicitly, so switching back to auto/strict there still replaces them.
+      ...(!Object.hasOwn(requestedCombo, "reasoningEffortMode") && previous?.reasoningEffortMode !== undefined
+        ? { reasoningEffortMode: previous.reasoningEffortMode }
+        : {}),
+      ...(!Object.hasOwn(requestedCombo, "imageInput") && previous?.imageInput !== undefined
+        ? { imageInput: previous.imageInput }
+        : {}),
+      // `lastResort` rides on each target, so a GUI that re-sends the target list without the
+      // flag would strip it. Carry it over per target, matched on provider+model.
+      ...(Array.isArray(requestedCombo.targets) && Array.isArray(previous?.targets)
+        ? {
+            targets: requestedCombo.targets.map(target => {
+              // A non-record entry stays as the client sent it so comboConfigError reports it.
+              // Reading `lastResort` off it here would throw in place of that structured 400.
+              if (!isPlainRecord(target)) return target;
+              if (Object.hasOwn(target, "lastResort")) return target;
+              const rawProvider = target.provider;
+              const rawModel = target.model;
+              if (typeof rawProvider !== "string" || typeof rawModel !== "string") return target;
+              // Identity is trimmed on both sides: the normalizer trims too, so a re-sent
+              // " b " must still match the stored "b" instead of losing the flag.
+              const provider = rawProvider.trim();
+              const model = rawModel.trim();
+              const before = previous.targets.find(
+                candidate => candidate.provider === provider && candidate.model === model,
+              );
+              return before?.lastResort ? { ...target, lastResort: true } : target;
+            }),
+          }
+        : {}),
+      // The dashboard does not expose this advanced CLI/API policy. Preserve it when
+      // a GUI round-trip omits the field instead of silently downgrading to fallback.
       ...(!Object.hasOwn(requestedCombo, "defaultEffortMode") && previous?.defaultEffortMode !== undefined
         ? { defaultEffortMode: previous.defaultEffortMode }
-        : {}),
-      ...(!Object.hasOwn(requestedCombo, "firstByteTimeoutMs") && previous?.firstByteTimeoutMs !== undefined
-        ? { firstByteTimeoutMs: previous.firstByteTimeoutMs }
-        : {}),
-      ...(!Object.hasOwn(requestedCombo, "ladderBudgetMs") && previous?.ladderBudgetMs !== undefined
-        ? { ladderBudgetMs: previous.ladderBudgetMs }
-        : {}),
-      ...(!Object.hasOwn(requestedCombo, "breakerFailureThreshold") && previous?.breakerFailureThreshold !== undefined
-        ? { breakerFailureThreshold: previous.breakerFailureThreshold }
-        : {}),
-      ...(!Object.hasOwn(requestedCombo, "breakerSuccessThreshold") && previous?.breakerSuccessThreshold !== undefined
-        ? { breakerSuccessThreshold: previous.breakerSuccessThreshold }
-        : {}),
-      ...(!Object.hasOwn(requestedCombo, "breakerOpenMs") && previous?.breakerOpenMs !== undefined
-        ? { breakerOpenMs: previous.breakerOpenMs }
         : {}),
     };
     const error = comboConfigError(id, effectiveCombo, config.providers, {
@@ -232,6 +240,15 @@ export async function handleComboRoutes(ctx: ManagementContext): Promise<Respons
     } = sparseComboConfig(normalized);
     const stored: OcxComboConfig = {
       ...normalizedBase,
+      // The normalizer gives every target an explicit `lastResort: false`; persisting that
+      // would add a noise key to every target of every combo, including ones that never use
+      // the policy (#5736). Only the opt-in value is stored, matching how the combo-level
+      // policy is handled in sparseComboConfig.
+      targets: normalizedBase.targets.map(({ lastResort, modelProfile, ...target }) => ({
+        ...target,
+        ...(lastResort ? { lastResort: true } : {}),
+        ...(modelProfile ? { modelProfile } : {}),
+      })),
       ...(normalizedAlias ? { alias: normalizedAlias } : {}),
       ...(normalizedNativeAlias ? { nativeAlias: true } : {}),
       ...(normalizedDisplayName ? { displayName: normalizedDisplayName } : {}),
@@ -308,6 +325,14 @@ export async function handleComboRoutes(ctx: ManagementContext): Promise<Respons
           claudeCode.modelMap = Object.fromEntries(
             Object.entries(claudeCode.modelMap).map(([source, model]) => [source, migrateAgentReference(model)]),
           );
+        }
+        if (claudeCode.intercept?.modelMap) {
+          claudeCode.intercept = {
+            ...claudeCode.intercept,
+            modelMap: Object.fromEntries(
+              Object.entries(claudeCode.intercept.modelMap).map(([pickerId, route]) => [pickerId, migrateAgentReference(route)]),
+            ),
+          };
         }
         config.claudeCode = claudeCode;
       }

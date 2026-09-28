@@ -12,13 +12,15 @@ import {
   classifyKiroHttpError,
   classifyKiroStreamError,
   safeKiroErrorMessage,
+  safeKiroHttpErrorMessage,
   type KiroErrorClassification,
 } from "../kiro-errors";
 import { parseKiroEvent } from "../kiro-events";
 import { noteKiroTransientThrottle } from "../kiro-retry";
-import { KiroThinkingParser } from "../kiro-thinking";
+import { InlineThinkTagParser } from "../inline-think-tags";
 import { isCompleteKiroToolInput, kiroTruncationErrorMessage } from "../kiro-truncation";
 import { isValidKiroConversationId } from "../kiro-wire";
+import { readDisplaySafeErrorPayloadText } from "../upstream-http-error";
 import { tagKiroReasoningBlob } from "./reasoning";
 import { estimateKiroTokens, kiroUpstreamContextWindow } from "./usage";
 
@@ -74,6 +76,7 @@ function createKiroAttemptRetention(budget: TranslatorBudget): KiroAttemptRetent
 
 interface KiroFallbackAttempt {
   response: Response;
+  abortSignal?: AbortSignal;
   inputTokens: number;
   contextInputEstimate: number;
   nameMap: Map<string, string>;
@@ -173,6 +176,7 @@ function mergeKiroUsage(
     ...(sumOptional("cachedInputTokens") !== undefined ? { cachedInputTokens: sumOptional("cachedInputTokens") } : {}),
     ...(sumOptional("cacheReadInputTokens") !== undefined ? { cacheReadInputTokens: sumOptional("cacheReadInputTokens") } : {}),
     ...(sumOptional("cacheCreationInputTokens") !== undefined ? { cacheCreationInputTokens: sumOptional("cacheCreationInputTokens") } : {}),
+    ...(sumOptional("providerCredits") !== undefined ? { providerCredits: sumOptional("providerCredits") } : {}),
     ...(sumOptional("reasoningOutputTokens") !== undefined ? { reasoningOutputTokens: sumOptional("reasoningOutputTokens") } : {}),
     ...(first.estimated || second.estimated ? { estimated: true } : {}),
   };
@@ -317,9 +321,10 @@ async function* parseKiroAttemptEvents(
   let completionAnswer: string | undefined;
   let completionCalls = 0;
   let authoritativeUsage: OcxUsage | undefined;
+  let providerCredits: number | undefined;
   let stopReason: string | undefined;
   const fallbackEvents: AdapterEvent[] = [];
-  const thinking = new KiroThinkingParser(budget);
+  const thinking = new InlineThinkTagParser(budget);
 
   const retainedEventBytes = (event: AdapterEvent): number => Buffer.byteLength(JSON.stringify(event));
   const retainEvent = (event: AdapterEvent): void => {
@@ -377,7 +382,11 @@ async function* parseKiroAttemptEvents(
       contextUsageTotalFloor() ?? 0,
       authoritativeTurnTotal,
     );
-    return contextTotal > 0 ? { ...base, contextTotalTokens: contextTotal } : base;
+    return {
+      ...base,
+      ...(contextTotal > 0 ? { contextTotalTokens: contextTotal } : {}),
+      ...(providerCredits !== undefined ? { providerCredits } : {}),
+    };
   };
 
   const classifiedTerminal = (failure: KiroErrorClassification): AdapterEvent => {
@@ -597,6 +606,9 @@ async function* parseKiroAttemptEvents(
       const ev = parseKiroEvent(eventType, msg.payload);
       if (!ev) continue;
       switch (ev.type) {
+        case "metering":
+          if (ev.unit === "credit" || ev.unit === "credits") providerCredits = ev.usage;
+          break;
         case "metadata":
           if (ev.usage) authoritativeUsage = ev.usage;
           if (ev.contextUsagePercentage !== undefined && ev.contextUsagePercentage > 0) {
@@ -1092,11 +1104,11 @@ export async function* parseKiroStream(
     firstResult.releaseRetained();
     fallback.releaseRequestBody?.();
     if (!fallback.response.ok) {
-      const payload = await fallback.response.text().catch(() => "");
+      const payload = await readDisplaySafeErrorPayloadText(fallback.response, fallback.abortSignal);
       const failure = classifyKiroHttpError(fallback.response.status, fallback.response.headers, payload);
       yield {
         type: "error",
-        message: failure.message,
+        message: safeKiroHttpErrorMessage(fallback.response.status, fallback.response.headers, payload),
         status: failure.status,
         errorType: failure.errorType,
         code: failure.code,

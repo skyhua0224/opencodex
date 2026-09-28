@@ -1,4 +1,5 @@
 import { normalizeRoutedAgentMessages } from "../routed-agent-messages";
+import { nameRoutedIdentity, repairIdentityInResponsesBody, stripRoutedIdentity } from "../identity";
 import { stripBracketedModelSuffix } from "../openai-chat";
 import { normalizeOpenCodeGoAdditionalTools } from "../opencode-go-additional-tools";
 import { isXaiResponsesDestination } from "../../providers/xai-transport";
@@ -15,14 +16,13 @@ import {
   isOpenAiOperatedResponsesDestination,
 } from "../../providers/openai-tiers";
 import type { TranslatorBudget } from "../../lib/translator-budget";
-import { rewriteRoutedCustomToolsForUpstream } from "../../responses/custom-tool-compat";
+import { rewriteRoutedCustomToolsForUpstream, validateFinalCustomToolCompatibility } from "../../responses/custom-tool-compat";
 import { rewriteRoutedToolSearchForUpstream } from "../../responses/tool-search-compat";
 import { rewriteRoutedNamespaceToolsForUpstream } from "../../responses/namespace-tool-compat";
 import { repairLegacyDottedToolCallNames } from "../../responses/legacy-dotted-tool-name-repair";
 import { preparePlaintextV2AgentMessages } from "../../responses/plaintext-v2-agent-messages";
 import { isMetaAiResponsesDestination, rewriteMuseToolNamesForUpstream } from "../../responses/muse-tool-name-alias";
 import { openaiResponsesUrl } from "../openai-responses-url";
-import { conversationKeyFromHeaders, threadAffinityResetActive } from "../../server/ws-thread-transport";
 import { normalizeResponsesCodeMode } from "../responses-code-mode";
 import { injectXaiResponsesXSearch, normalizeXaiResponsesWebSearch } from "../xai-web-search";
 import {
@@ -34,7 +34,7 @@ import {
   createAdapterTierMetadata,
 } from "../../providers/fastwire";
 import { dropResponsesReasoningInputItems, mapRoutedResponsesReasoningEffort, normalizeConfiguredReasoningSummaryDelivery, sanitizeReasoningInputContent, stripDisabledReasoningSummaries, stripDisabledVerbosity, stripUnsupportedReasoningSummaryDelivery } from "./reasoning";
-import { scrubOcxCompactionItems, stripCanonicalOnlyToolFields, stripCanonicalOnlyTopLevelFields, stripInternalChatMessageMetadataPassthrough, stripInvalidItemIds, stripItemIdsWhenUnstored } from "./request-strips";
+import { scrubOcxCompactionItems, stripCanonicalOnlyToolFields, stripCanonicalOnlyTopLevelFields, stripInternalChatMessageMetadataPassthrough, stripInvalidItemIds, stripItemIdsWhenUnstored, stripRejectedSamplingParams } from "./request-strips";
 import { stripCanonicalForwardPromptCacheOptions, stripDeprecatedPromptCacheRetention } from "./prompt-cache";
 import { isPlainObject } from "./internal";
 import { normalizeToolSchemas, promoteClientLoadedTools, stripUnsupportedHostedTools } from "./tool-schema";
@@ -44,6 +44,7 @@ import { applyTierDecisionToResponsesBody, normalizeCanonicalForwardContinuation
 import { normalizeImageGenClientTools, preferConfiguredHostedTools } from "./image-gen";
 import { stripMuseSparkUnsupportedWebSearchFields, stripOpenAiOnlyWebSearchFields } from "./web-search";
 import { observeOutbound } from "../../usage/cache-diagnostic";
+import { normalizeMuseToolChoice } from "./muse-tool-choice";
 
 /**
  * Identifies DeepSeek's strict Responses replay contract: tool-bearing continuations need
@@ -232,19 +233,6 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
               headers[h] = v; // …so genuine forwarded fields win.
             }
           }
-          // A conversation the backend keeps serving slowly and shedding gets its routing identity
-          // re-rolled. Both per-conversation hints go: the client's window id AND the server-issued
-          // turn state (a token the backend handed back for this conversation, which the next
-          // request normally echoes). Dropping only the window id moved that conversation from
-          // 14-22s to 8.1-8.3s for about ten minutes and then it drifted back, so the second hint
-          // is dropped as well. Content, model, credential and cache prefix are untouched.
-          const affinityKey = conversationKeyFromHeaders(incoming?.headers);
-          if (affinityKey && threadAffinityResetActive(affinityKey)) {
-            for (const name of Object.keys(headers)) {
-              const lower = name.toLowerCase();
-              if (lower === "x-codex-window-id" || lower === "x-codex-turn-state") delete headers[name];
-            }
-          }
         }
         const override = runtimeProvider._codexAccountOverride;
         if (override && mayForwardCallerCredentials) {
@@ -282,6 +270,17 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
       if (!forward) outBody = normalizeRoutedAgentMessages(outBody, {
         allowStringContent: isXaiResponsesDestination(provider),
       });
+      // #5217: a sub-agent inherits the parent session's instruction block, so the identity
+      // sentence this proxy generated for the PARENT's model rides along to a worker running a
+      // different one. On a routed destination it is renamed to that destination — including the
+      // model-neutral catalog sentence, which this adapter never names itself; on a native/forward
+      // destination our sentence is dropped, because Codex's own identity wording (sent in the
+      // client's model_switch block) is the correct one there. Text the proxy did not generate —
+      // user turns, tool output, fenced code, provider-native blocks — is untouched.
+      outBody = repairIdentityInResponsesBody(
+        outBody,
+        forward ? stripRoutedIdentity : (text: string) => nameRoutedIdentity(text, parsed.modelId),
+      );
       outBody = mapRoutedResponsesReasoningEffort(outBody, provider, parsed.modelId);
       // stripPreviousResponseId() intentionally returns its input on a no-op. Detach before the
       // tier write so a force-fast/default decision can never mutate parsed._rawBody.
@@ -309,7 +308,15 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
       }
       const synthesizeMissingCallOutputs = !forward && (stateless || pairedToolResults);
       if (forward || stateless || pairedToolResults) {
-        outBody = repairOrphanedInputItems(outBody, unexpandedMiss, synthesizeMissingCallOutputs);
+        // A stateful destination can resolve an output-only delta against the call stored behind
+        // an unexpanded previous_response_id. All other shapes have no hidden call to preserve.
+        const repairOrphanOutputs = forward || stateless || !unexpandedMiss;
+        outBody = repairOrphanedInputItems(
+          outBody,
+          unexpandedMiss,
+          synthesizeMissingCallOutputs,
+          repairOrphanOutputs,
+        );
       }
       if (provider.dropResponsesReasoningItems === true) {
         outBody = dropResponsesReasoningInputItems(outBody);
@@ -318,9 +325,11 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
         outBody = normalizeResponsesToolResultAdjacency(outBody);
       }
       if (forward) {
-        outBody = stripUnsupportedForwardParams(outBody);
-        // Only the canonical ChatGPT backend rejects the retired field; a self-hosted or
-        // third-party forward gateway may still accept it, so this must not be widened.
+        // `metadata` is stripped on every forward route for compatibility with the canonical backend.
+        // `max_output_tokens` is stripped only when this provider is the canonical backend.
+        outBody = stripUnsupportedForwardParams(outBody, isCanonicalOpenAiForwardProvider(provider));
+        // Only the canonical ChatGPT backend rejects the canonical-only fields below; a self-hosted
+        // or third-party forward gateway may accept them, so this guard must not be widened.
         if (isCanonicalOpenAiForwardProvider(provider)) {
           outBody = stripCanonicalForwardSamplingParams(outBody);
           outBody = stripDeprecatedPromptCacheRetention(outBody, parsed.modelId);
@@ -329,6 +338,7 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
           outBody = normalizeCanonicalForwardContinuationEnvelope(outBody);
         }
       } else {
+        outBody = stripRejectedSamplingParams(outBody, provider, parsed.modelId);
         outBody = preferConfiguredHostedTools(
           outBody,
           provider,
@@ -402,8 +412,9 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
         outBody = rewritten.body;
         convertedRoutedNamespaceToolAliases = rewritten.aliases;
         // Preserve xAI's cached-only fail-closed semantics and image-search mapping before the
-        // generic capability fallback removes the private OpenAI fields.
-        outBody = normalizeXaiResponsesWebSearch(outBody, provider);
+        // generic capability fallback removes the private OpenAI fields. Grok relayed through
+        // OpenCode Go speaks the same dialect, which the final model id and URL identify.
+        outBody = normalizeXaiResponsesWebSearch(outBody, provider, { modelId: parsed.modelId, responseUrl: url });
         outBody = injectXaiResponsesXSearch(outBody, provider, parsed._replayPrefixLen);
         // xAI and explicitly classified compatible gateways reject these OpenAI web_search
         // extensions. Keep them for OpenAI API-key traffic and unclassified gateways.
@@ -464,11 +475,14 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
                   preserveRawReasoningContent: provider.preserveResponsesReasoningContent === true,
                   dropNullContentChannel: !isOpenAiOperatedResponsesDestination(provider),
                   stripEncryptedContent: threadServingIdentityChanged || requiresPlaintextReasoningReplay(provider),
+                  dropForeignItemId: parsed._dropForeignReasoningItemIds === true,
+                  requirePlaintextReasoning: requiresPlaintextReasoningReplay(provider),
                 },
               ),
               provider,
             ),
           ),
+          isXaiResponsesDestination(provider),
         ),
         isXaiSchemaTarget(provider),
       );
@@ -482,7 +496,7 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
         parsed.modelId,
       );
       // Normalize the wire model before deriving model-dependent transport metadata.
-      const finalBody =
+      let finalBody =
         provider.modelSuffixBracketStrip
           && unnormalizedBody !== null
           && typeof unnormalizedBody === "object"
@@ -490,6 +504,10 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
           && typeof (unnormalizedBody as { model?: unknown }).model === "string"
           ? { ...(unnormalizedBody as Record<string, unknown>), model: stripBracketedModelSuffix((unnormalizedBody as { model: string }).model) }
           : unnormalizedBody;
+      if (isMetaAiResponsesDestination(url)) {
+        const originalChoice = isPlainObject(parsed._rawBody) ? parsed._rawBody.tool_choice : undefined;
+        finalBody = normalizeMuseToolChoice(finalBody, originalChoice);
+      }
       if (isCanonicalOpenAiForwardProvider(provider)) {
         const routingHeaders = new Headers(headers);
         applyCodexRoutingHint(routingHeaders, finalBody);
@@ -517,6 +535,9 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
       // HTTP and the WebSocket outbound, because the WS path transports this same request
       // instead of rebuilding it.
       observeOutbound(parsed._rawBody, finalBody, headers);
+      if (!isCanonicalOpenAiForwardProvider(provider)) {
+        validateFinalCustomToolCompatibility(finalBody, provider.supportsResponsesCustomTools);
+      }
       const body = JSON.stringify(finalBody);
       const releaseBodyObservation = translatorBudget.observeExternallyCapped(
         "passthrough_serialization",

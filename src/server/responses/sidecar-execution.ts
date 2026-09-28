@@ -20,11 +20,16 @@ import type { ProviderAdapter } from "../../adapters/base";
 import type { OcxParsedRequest } from "../../types";
 import { rotateProviderTransportOn429, rateLimitRetryPolicyFor } from "../../providers/key-failover";
 import {
-  GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST,
   isGenericOAuthFailoverEnabled,
   rotateGenericOAuthAccountOn429,
+  rotateGenericOAuthAccountOnRefusal,
+  quarantineKiroSuspendedAccount,
   failoverAccountSnapshot,
 } from "../../oauth/generic-account-failover";
+import { classifyKiroRefusal } from "../../adapters/kiro-refusal";
+import { noteKiroMonthlyRefusal, noteKiroServedSuccess } from "../../providers/kiro-usage";
+import { persistKiroAccountState } from "../../providers/kiro-account-state-disk";
+import { readDisplaySafeErrorText } from "./core-errors";
 import {
   ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST,
   rotateAnthropicAccountOn429,
@@ -59,6 +64,8 @@ export async function executeResponsesSidecars(
     | "adapter"
     | "genericFailoverAccountId"
     | "genericFailovers"
+    | "genericFailoverLimit"
+    | "replayOAuthCredentialSnapshot"
     | "applyFailoverSnapshot"
     | "anthropicPoolAccountId"
     | "anthropicPoolFailovers"
@@ -104,6 +111,17 @@ export async function executeResponsesSidecars(
     cancelResponseCompletion,
   } = responseEffects;
 
+  // Resolving the OpenAI search credential may hold the account's sole
+  // cooldown-recovery probe lease. A streamed sidecar result keeps it until the
+  // stream settles — completion or client cancel — so a later in-stream search
+  // outcome can still clear the cooldown; a response with no live body is
+  // terminal, so the lease is handed back before returning it. A recorded
+  // search outcome already settled the lease, making each release a
+  // generation-bound no-op.
+  const releaseSearchProbeLease = (): void => {
+    openAiSidecar?.releaseProbeLease?.();
+  };
+
 
   // Tool results are PAIRED by call_id. parseRequest writes it into OcxToolResultMessage.toolCallId
   // (parser.ts:738/752) without validating it, because inputItemSchema's permissive catch-all
@@ -126,6 +144,8 @@ export async function executeResponsesSidecars(
           || (message as { toolCallId: string }).toolCallId.length === 0),
     );
     if (unpaired) {
+      // Local validation has no running sidecar body to own this lease.
+      releaseSearchProbeLease();
       // Never interpolate the tool output: this message reaches the client and the logs.
       return formatErrorResponse(
         400,
@@ -143,8 +163,11 @@ export async function executeResponsesSidecars(
   // Web-search's loop only supports buildRequest/fetch/parseStream — NOT adapter.runTurn. Sending
   // Cursor/runTurn requests into runWithWebSearch produces empty HTTP failures. So:
   //   - non-runTurn: web-search wins over image when both eligible (documented priority)
-  //   - runTurn: image bridge may run (it supports runTurn); web-search is skipped so runTurn
-  //     can proceed for web-search-only turns
+  //   - runTurn: a search plan takes priority over media bridges and is executed
+  //     by executeResponsesRunTurn; the fetch loop below remains fetch-only.
+  // LOCAL PATCH (runturn-websearch): runTurn adapters run their own web-search
+  // loop inside executeResponsesRunTurn (src/web-search/run-turn-loop.ts); the
+  // fetch-path loop below stays non-runTurn-only.
   const wsPlan = !routedCompaction
     ? planWebSearch(config, parsed, false, route.provider, route.modelId, openAiSidecar, {
       admission: options.admission, codexAuthPolicy: options.codexAuthPolicy, providerName: route.providerName,
@@ -157,13 +180,32 @@ export async function executeResponsesSidecars(
     retryAfter: string | null,
     responseHeaders?: Headers,
     retryParsed?: OcxParsedRequest,
-  ): Promise<ProviderAdapter | null> => {
-    const rotated = rotateProviderTransportOn429(config, route.providerName, route.provider, {
+    originalResponse?: Response,
+  ): Promise<{ adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind } | null> => {
+    if (route.providerName !== "kiro" && originalResponse && originalResponse.status !== 429) return null;
+    const refusal = route.providerName === "kiro" && originalResponse
+      ? classifyKiroRefusal(originalResponse.status,
+        await readDisplaySafeErrorText(originalResponse.clone(), options.abortSignal ?? new AbortController().signal, "")).kind
+      : "rate";
+    if (refusal === "other") return null;
+    const sent = transportState.replayOAuthCredentialSnapshot;
+    const monthlyCooldownMs = route.providerName === "kiro" && refusal === "monthly_quota" && sent
+      ? noteKiroMonthlyRefusal(sent.accountId, sent.generation, Date.now()) : undefined;
+    if (monthlyCooldownMs !== undefined) persistKiroAccountState();
+    if (route.providerName === "kiro" && refusal === "suspended" && transportState.genericFailoverAccountId)
+      quarantineKiroSuspendedAccount(transportState.genericFailoverAccountId, sent?.generation);
+    // Which credential axis actually moved. The main routed path already reports these three
+    // separately (`adapter-dispatch`: key-429 / anthropic-oauth-429 / oauth-account-429); the
+    // sidecar loops used to flatten all three to `key-429`, so an account rotation read as a key
+    // rotation in the attempt row and in the Logs UI.
+    let recoveryKind: AttemptRecoveryKind = "key-429";
+    const rotated = route.providerName !== "kiro" || originalResponse?.status === 429
+      ? rotateProviderTransportOn429(config, route.providerName, route.provider, {
       retryAfter,
       now: Date.now(),
       attemptedKey: route.provider.apiKey,
       promptCacheKey: parsed.options.promptCacheKey,
-    });
+      }) : null;
     if (rotated) {
       route.provider = rotated;
     } else if (
@@ -172,7 +214,7 @@ export async function executeResponsesSidecars(
       // excludes it), so its sidecar 429s died on this guard before the Anthropic arm below
       // could ever be considered.
       transportState.genericFailoverAccountId
-      && transportState.genericFailovers < GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST
+      && transportState.genericFailovers < transportState.genericFailoverLimit
       && isGenericOAuthFailoverEnabled(config, route.providerName)
     ) {
       // Intersection with the request's shared budget. The sidecar replay is dispatched by the
@@ -183,7 +225,10 @@ export async function executeResponsesSidecars(
         `${route.providerName}|${route.modelId}|sidecar-oauth-429`,
       );
       if (!hop.allowed) return null;
-      const nextAccountId = rotateGenericOAuthAccountOn429(
+      const nextAccountId = route.providerName === "kiro" ? rotateGenericOAuthAccountOnRefusal(
+        config, route.providerName, transportState.genericFailoverAccountId,
+        refusal, retryAfter, Date.now(), route.modelId, monthlyCooldownMs,
+      ) : rotateGenericOAuthAccountOn429(
         config,
         route.providerName,
         transportState.genericFailoverAccountId,
@@ -197,15 +242,17 @@ export async function executeResponsesSidecars(
       }
       try {
         const snapshot = await failoverAccountSnapshot(route.providerName, nextAccountId);
-        transportState.genericFailovers += 1;
+        if (route.providerName !== "kiro") transportState.genericFailovers += 1;
         if (!await applyFailoverSnapshot(snapshot, retryParsed)) {
           hop.permit?.release();
           return null;
         }
+        if (route.providerName === "kiro") transportState.genericFailovers += 1;
       } catch {
         hop.permit?.release();
         return null;
       }
+      recoveryKind = "oauth-account-429";
       hop.permit?.use();
     } else if (
       // Anthropic's pool is excluded from generic failover, so without this arm a 429 inside a
@@ -249,6 +296,7 @@ export async function executeResponsesSidecars(
         hop.permit?.release();
         return null;
       }
+      recoveryKind = "anthropic-oauth-429";
       hop.permit?.use();
     } else {
       // No key pool, no generic OAuth roster, no Anthropic pool could produce a replacement
@@ -278,9 +326,9 @@ export async function executeResponsesSidecars(
       provider: route.provider,
       adapterName: rotatedAdapter.name,
     });
-    return rotatedAdapter;
+    return { adapter: rotatedAdapter, recoveryKind };
   };
-  if ((imgPlan || vidPlan) && canRunWebSearch) {
+  if ((imgPlan || vidPlan) && wsPlan) {
     // Web search takes priority when both are active — the media bridge cannot run
     // alongside runWithWebSearch. Surface a runtime signal so the user knows their
     // configured video/image bridge was skipped for this turn, rather than silently
@@ -288,13 +336,14 @@ export async function executeResponsesSidecars(
     if (vidPlan) console.warn("[videos] video bridge skipped: web search is active for this turn");
     if (imgPlan) console.warn("[images] image bridge skipped: web search is active for this turn");
   }
-  if ((imgPlan || vidPlan) && (!wsPlan || transportState.adapter.runTurn)) {
+  if ((imgPlan || vidPlan) && !wsPlan) {
     // The image bridge detects a hosted image_generation tool and requires streaming.
     // The video bridge activates from config and injects a tool — it also needs streaming
     // (the loop returns SSE). For video-only (no imgPlan) on a non-streaming request, skip
     // the bridge entirely so enabling the feature doesn't break ordinary non-streaming traffic.
     if (!parsed.stream) {
       if (imgPlan) {
+        releaseSearchProbeLease();
         return formatErrorResponse(400, "invalid_request_error", "image bridge requires stream=true");
       }
       // Video-only: skip bridge for non-streaming requests
@@ -374,10 +423,14 @@ export async function executeResponsesSidecars(
         transportState.bindKeyUsageFromBridge(usage);
       },
       on429: rotateSidecarProviderOn429,
-      retryOn429Policy: rateLimitRetryPolicyFor(route.provider),
+      retryOn429Policy: route.providerName === "kiro" && isGenericOAuthFailoverEnabled(config, "kiro")
+        ? null : rateLimitRetryPolicyFor(route.provider),
       ...(options.onFirstOutput ? { onFirstOutput: options.onFirstOutput } : {}),
       ...(options.forceEmptyResponseId ? { forceEmptyResponseId: true } : {}),
       onCompletedResponse: (response, providerState) => {
+        const served = transportState.replayOAuthCredentialSnapshot;
+        if (route.providerName === "kiro" && response.status === "completed" && served
+          && noteKiroServedSuccess(served.accountId, served.generation)) persistKiroAccountState();
         commitReasoningReplayServingRoute();
         rememberKiroDeliveredFinalAnswer(transportState.adapter.name, response);
         rememberResponseState(
@@ -392,11 +445,12 @@ export async function executeResponsesSidecars(
     if (imgResponse.body) {
       const imgTurnAc = new AbortController();
       imgTurnAc.signal.addEventListener("abort", cancelResponseCompletion, { once: true });
-      return new Response(trackStreamLifetime(imgResponse.body, imgTurnAc, undefined, options.turnAdmissionLease), {
+      return new Response(trackStreamLifetime(imgResponse.body, imgTurnAc, releaseSearchProbeLease, options.turnAdmissionLease), {
         status: imgResponse.status,
         headers: imgResponse.headers,
       });
     }
+    releaseSearchProbeLease();
     return imgResponse;
     } // end else (streaming bridge)
   }
@@ -457,8 +511,12 @@ export async function executeResponsesSidecars(
       stallTimeoutSec: wsPlan.stallTimeoutSec,
       streamRoutedModelOutput: wsPlan.streamRoutedModelOutput,
       on429: rotateSidecarProviderOn429,
-      retryOn429Policy: rateLimitRetryPolicyFor(route.provider),
+      retryOn429Policy: route.providerName === "kiro" && isGenericOAuthFailoverEnabled(config, "kiro")
+        ? null : rateLimitRetryPolicyFor(route.provider),
       onCompletedResponse: response => {
+        const served = transportState.replayOAuthCredentialSnapshot;
+        if (route.providerName === "kiro" && response.status === "completed" && served
+          && noteKiroServedSuccess(served.accountId, served.generation)) persistKiroAccountState();
         commitReasoningReplayServingRoute();
         notifyResponseComplete(response);
       },
@@ -468,11 +526,12 @@ export async function executeResponsesSidecars(
     if (wsResponse.body) {
       const wsTurnAc = new AbortController();
       wsTurnAc.signal.addEventListener("abort", cancelResponseCompletion, { once: true });
-      return new Response(trackStreamLifetime(wsResponse.body, wsTurnAc, undefined, options.turnAdmissionLease), {
+      return new Response(trackStreamLifetime(wsResponse.body, wsTurnAc, releaseSearchProbeLease, options.turnAdmissionLease), {
         status: wsResponse.status,
         headers: wsResponse.headers,
       });
     }
+    releaseSearchProbeLease();
     return wsResponse;
   }
 

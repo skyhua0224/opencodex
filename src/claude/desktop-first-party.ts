@@ -3,23 +3,30 @@
  *
  * Desktop has two ways to reach opencodex:
  *
- *   - `first-party` (default): the app keeps its ordinary claude.ai login, Chat tab, connectors
- *     and remote control. Only the Claude Code process it spawns for the Code tab (and that
- *     process's subagents) is redirected, through the `HTTPS_PROXY`/`NODE_EXTRA_CA_CERTS` env
- *     in `~/.claude/settings.json` (src/claude/intercept/settings.ts) and the server's intercept
- *     pair (src/claude/intercept/runtime.ts). Nothing is written under Desktop's config library.
- *   - `gateway`: the historical third-party deployment profile (src/claude/desktop-3p.ts). The
+ *   - `gateway` (default): the third-party deployment profile (src/claude/desktop-3p.ts). The
  *     whole app is switched to a gateway build; picker entries are opencodex aliases.
+ *   - `first-party`: the app keeps its ordinary claude.ai login, Chat tab, connectors and remote
+ *     control. Only the Claude Code process it spawns for the Code tab (and that process's
+ *     subagents) is redirected, through the `HTTPS_PROXY`/`NODE_EXTRA_CA_CERTS` env in
+ *     `~/.claude/settings.json` (src/claude/intercept/settings.ts) and the server's intercept pair
+ *     (src/claude/intercept/runtime.ts). It sends Claude subscription traffic through a local
+ *     interception proxy, so every first-party surface carries the account-risk notice in
+ *     src/claude/desktop-risk.ts.
  *
  * The two are mutually exclusive on disk: applying one removes the other. The mode is persisted
- * in `claudeCode.desktopMode`; installs that predate the field but already carry an applied
- * gateway profile keep `gateway` until they explicitly re-apply, so an update never flips a
- * working Desktop under the operator.
+ * in `claudeCode.desktopMode`. Installs that predate the field keep what they run: a selected
+ * gateway row or a gateway apply marker keeps `gateway`, and first-party env that opencodex wrote
+ * into Claude Code's settings keeps `first-party` (observeClaudeDesktopMode), so moving the default
+ * to gateway never flips a working Desktop under the operator.
  */
 import { getConfigDir } from "../config/paths";
+import { join } from "node:path";
 import type { OcxConfig } from "../types";
+import { claudeConfigDir } from "./auth-detect";
+import { inspectDesktop3pConfigLibrary } from "./desktop-3p";
 import { claudeInterceptCaCertPath, ensureLocalInterceptCa } from "./intercept/local-ca";
 import { claudeInterceptEnabled, claudeInterceptProxyPort } from "./intercept/runtime";
+import { ensureClaudeInterceptProxyToken, readClaudeInterceptProxyToken } from "./intercept/proxy-auth";
 import {
   applyClaudeInterceptSettings,
   buildClaudeInterceptEnv,
@@ -33,7 +40,7 @@ import {
 
 export const CLAUDE_DESKTOP_MODES = ["first-party", "gateway"] as const;
 export type ClaudeDesktopMode = typeof CLAUDE_DESKTOP_MODES[number];
-export const DEFAULT_CLAUDE_DESKTOP_MODE: ClaudeDesktopMode = "first-party";
+export const DEFAULT_CLAUDE_DESKTOP_MODE: ClaudeDesktopMode = "gateway";
 
 export function isClaudeDesktopMode(value: unknown): value is ClaudeDesktopMode {
   return typeof value === "string" && (CLAUDE_DESKTOP_MODES as readonly string[]).includes(value);
@@ -41,15 +48,30 @@ export function isClaudeDesktopMode(value: unknown): value is ClaudeDesktopMode 
 
 type DesktopModeConfig = Pick<OcxConfig, "claudeCode">;
 
+/** What the resolver may learn from disk. Only rows and settings opencodex owns count. */
+export interface ClaudeDesktopModeObservation {
+  /** Desktop's selected config-library row is our gateway (current or drifted). */
+  ownedGatewaySelected?: boolean;
+  /** Claude Code's settings carry first-party env that opencodex wrote (applied or stale). */
+  ownedFirstPartySettings?: boolean;
+}
+
 /**
- * Effective Desktop mode. An explicit `claudeCode.desktopMode` wins; otherwise a persisted
- * gateway apply marker (`desktopProfile.appliedFingerprint`) means a pre-existing gateway
- * install and keeps `gateway`; everything else is the first-party default.
+ * Effective Desktop mode. An explicit `claudeCode.desktopMode` wins. Without one, what is on disk
+ * decides for installs that predate the field: a selected owned gateway row or a persisted gateway
+ * apply marker keeps `gateway`, owned first-party settings keep `first-party`. Everything else is
+ * the gateway default. Pure: callers that decide an apply or a write pass
+ * `observeClaudeDesktopMode(config)`.
  */
-export function resolveClaudeDesktopMode(config: DesktopModeConfig): ClaudeDesktopMode {
+export function resolveClaudeDesktopMode(
+  config: DesktopModeConfig,
+  observed: ClaudeDesktopModeObservation = {},
+): ClaudeDesktopMode {
   const explicit = config.claudeCode?.desktopMode;
   if (isClaudeDesktopMode(explicit)) return explicit;
+  if (observed.ownedGatewaySelected) return "gateway";
   if (config.claudeCode?.desktopProfile?.appliedFingerprint) return "gateway";
+  if (observed.ownedFirstPartySettings) return "first-party";
   return DEFAULT_CLAUDE_DESKTOP_MODE;
 }
 
@@ -78,18 +100,16 @@ export function recordClaudeDesktopMode(
 }
 
 /**
- * Mode an *apply* without an explicit choice should use. The first-party default only holds
- * where the intercept proxy actually runs; with it disabled (or on a client role) an implied
- * first-party apply would point Claude Code at a proxy that never starts, so fall back to the
- * gateway profile. An explicit `desktopMode: "first-party"` is still honoured (and refused
- * later with `intercept_disabled`, which names the fix).
+ * Mode an *apply* without an explicit choice should use. With gateway as the default, first-party
+ * only comes from an explicit choice or an observed first-party install; both are honoured even
+ * when the intercept is disabled, and the apply is then refused with `intercept_disabled`, which
+ * names the fix, instead of silently replacing the operator's mode.
  */
 export function resolveClaudeDesktopApplyMode(
   config: Pick<OcxConfig, "claudeCode" | "runtimeRole">,
+  observed: ClaudeDesktopModeObservation = {},
 ): ClaudeDesktopMode {
-  const resolved = resolveClaudeDesktopMode(config);
-  if (resolved === "gateway" || isClaudeDesktopMode(config.claudeCode?.desktopMode)) return resolved;
-  return claudeInterceptEnabled(config) ? "first-party" : "gateway";
+  return resolveClaudeDesktopMode(config, observed);
 }
 
 export interface DesktopFirstPartyTarget {
@@ -98,14 +118,22 @@ export interface DesktopFirstPartyTarget {
   env: ClaudeInterceptEnv;
 }
 
-/** The settings env a first-party apply on this machine writes (CA is created on demand). */
+function firstPartyTarget(
+  config: Pick<OcxConfig, "claudeCode" | "port">,
+  opencodexConfigDir: string,
+  authToken: string,
+): DesktopFirstPartyTarget {
+  const proxyPort = claudeInterceptProxyPort(config, config.port ?? 10100);
+  const caCertPath = claudeInterceptCaCertPath(opencodexConfigDir);
+  return { proxyPort, caCertPath, env: buildClaudeInterceptEnv(proxyPort, caCertPath, authToken) };
+}
+
+/** The settings env a first-party apply on this machine writes (CA and token are created on demand). */
 export function desktopFirstPartyTarget(
   config: Pick<OcxConfig, "claudeCode" | "port">,
   opencodexConfigDir = getConfigDir(),
 ): DesktopFirstPartyTarget {
-  const proxyPort = claudeInterceptProxyPort(config, config.port ?? 10100);
-  const caCertPath = claudeInterceptCaCertPath(opencodexConfigDir);
-  return { proxyPort, caCertPath, env: buildClaudeInterceptEnv(proxyPort, caCertPath) };
+  return firstPartyTarget(config, opencodexConfigDir, ensureClaudeInterceptProxyToken(opencodexConfigDir));
 }
 
 export interface DesktopFirstPartyInspection {
@@ -130,8 +158,11 @@ export function captureDesktopFirstPartyRollback(
   config: Pick<OcxConfig, "claudeCode" | "port">,
   options: DesktopFirstPartyOptions = {},
 ): () => boolean {
+  // The expected env resolves at rollback time: the apply mints the proxy token, so capturing it
+  // here would both mint on a path that may never apply and throw when the intercept directory is
+  // unavailable — a failure the apply already reports as ca_unavailable.
   return captureClaudeInterceptSettingsRollback(
-    desktopFirstPartyTarget(config, options.opencodexConfigDir).env, options.claudeConfigDir,
+    () => desktopFirstPartyTarget(config, options.opencodexConfigDir).env, options.claudeConfigDir,
   );
 }
 
@@ -139,7 +170,11 @@ export function inspectDesktopFirstParty(
   config: Pick<OcxConfig, "claudeCode" | "port" | "runtimeRole">,
   options: DesktopFirstPartyOptions = {},
 ): DesktopFirstPartyInspection {
-  const target = desktopFirstPartyTarget(config, options.opencodexConfigDir);
+  const opencodexConfigDir = options.opencodexConfigDir ?? getConfigDir();
+  // Inspection is read-only: a missing token means no apply or runtime start produced one,
+  // so an owned env can never match the empty credential — it classifies stale, and a real
+  // apply is what refreshes it.
+  const target = firstPartyTarget(config, opencodexConfigDir, readClaudeInterceptProxyToken(opencodexConfigDir) ?? "");
   const settings = inspectClaudeInterceptSettings(target.env, options.claudeConfigDir);
   return {
     interceptEnabled: claudeInterceptEnabled(config),
@@ -149,6 +184,31 @@ export function inspectDesktopFirstParty(
     applied: settings.kind === "applied",
     stale: settings.kind === "stale",
   };
+}
+
+/**
+ * Observe what Desktop runs today for the resolver. Never throws: an unreadable library or
+ * settings file is no evidence, and a foreign proxy env is never mistaken for ours.
+ */
+export function observeClaudeDesktopMode(
+  config: Pick<OcxConfig, "claudeCode" | "port" | "runtimeRole">,
+  options: DesktopFirstPartyOptions = {},
+): ClaudeDesktopModeObservation {
+  const observed: ClaudeDesktopModeObservation = {};
+  try {
+    const library = inspectDesktop3pConfigLibrary({ appliedFingerprint: config.claudeCode?.desktopProfile?.appliedFingerprint ?? null });
+    observed.ownedGatewaySelected = library.kind === "gateway_ours" || library.kind === "gateway_drifted";
+  } catch { // no-excuse-ok: catch -- an unreadable library is no gateway evidence.
+    observed.ownedGatewaySelected = false;
+  }
+  try {
+    const kind = inspectDesktopFirstParty(config, options).settings.kind;
+    observed.ownedFirstPartySettings = config.claudeCode?.cliFirstParty === true
+      ? false : kind === "applied" || kind === "stale";
+  } catch { // no-excuse-ok: catch -- unreadable settings are no first-party evidence.
+    observed.ownedFirstPartySettings = false;
+  }
+  return observed;
 }
 
 export type DesktopFirstPartyApplyResult =
@@ -164,20 +224,27 @@ export function applyDesktopFirstParty(
   options: DesktopFirstPartyOptions = {},
 ): DesktopFirstPartyApplyResult {
   const opencodexConfigDir = options.opencodexConfigDir ?? getConfigDir();
-  const target = desktopFirstPartyTarget(config, opencodexConfigDir);
   if (!claudeInterceptEnabled(config)) return { ok: false, reason: "intercept_disabled", path: "" };
+  let target: DesktopFirstPartyTarget;
   try {
     ensureLocalInterceptCa(opencodexConfigDir);
+    target = desktopFirstPartyTarget(config, opencodexConfigDir);
   } catch {
-    return { ok: false, reason: "ca_unavailable", path: target.caCertPath };
+    return { ok: false, reason: "ca_unavailable", path: claudeInterceptCaCertPath(opencodexConfigDir) };
   }
   const written = applyClaudeInterceptSettings(target.env, options.claudeConfigDir);
   if (!written.ok) return { ok: false, reason: written.reason, path: written.path };
   return { ok: true, changed: written.changed, path: written.path, env: target.env, proxyPort: target.proxyPort };
 }
 
-/** Remove the first-party env. Only values anchored on our CA path are touched. */
-export function removeDesktopFirstParty(options: DesktopFirstPartyOptions = {}): ClaudeInterceptSettingsWrite {
+/** Remove Desktop's share of the env, retaining the shared pair for a desired CLI. */
+export function removeDesktopFirstParty(
+  config: Pick<OcxConfig, "claudeCode" | "runtimeRole">,
+  options: DesktopFirstPartyOptions = {},
+): ClaudeInterceptSettingsWrite & { retainedFor?: "cli" } {
+  if (config.claudeCode?.cliFirstParty === true) {
+    return { ok: true, changed: false, path: join(options.claudeConfigDir ?? claudeConfigDir(), "settings.json"), retainedFor: "cli" };
+  }
   const caCertPath = claudeInterceptCaCertPath(options.opencodexConfigDir ?? getConfigDir());
   return removeClaudeInterceptSettings(caCertPath, options.claudeConfigDir);
 }

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import * as z from "zod/v4";
+import { compactionRecoveryConfigError } from "./schema/compaction-recovery";
 import type { OcxConfig } from "../types";
 import { configReasoningPinsConfigError } from "./provider-validation";
 import { loopbackCompanionAllowed } from "../codex/loopback-target";
@@ -52,6 +53,7 @@ import {
   clientConnectionSchema,
   CODEX_ACCOUNT_PIN_PATTERN,
   codexAccountPrioritiesSchema,
+  codexAccountAutoSwitchThresholdsSchema,
   codexPoolSchema,
   codexQuotaAutoRefreshSchema,
   credentialGroupsSchema,
@@ -61,6 +63,8 @@ import {
   runtimeRoleSchema,
   spendSchema,
   compactionRoutingSchema,
+  skillsConfigSchema,
+  memoryModelsSchema,
 } from "./schema/leaf-validators";
 
 export type ConfigDiagnostics = {
@@ -347,6 +351,13 @@ function codexAccountPrioritiesError(value: unknown): string | null {
       return schemaDiagnosticsError(parsed.error).replace("schema_invalid: ", "schema_invalid: codexAccountPriorities.");
     }
   }
+  if (raw.codexAccountAutoSwitchThresholds !== undefined) {
+    const parsed = codexAccountAutoSwitchThresholdsSchema.safeParse(raw.codexAccountAutoSwitchThresholds);
+    if (!parsed.success) {
+      return schemaDiagnosticsError(parsed.error)
+        .replace("schema_invalid: ", "schema_invalid: codexAccountAutoSwitchThresholds.");
+    }
+  }
   // Tested as a string rather than coerced: `String(123)` matches the id pattern, so a
   // coercing guard waves a non-string pin through to the schema, where `.catch(undefined)`
   // drops it and reports the write as a success — the exact silent-degrade this guards.
@@ -355,6 +366,14 @@ function codexAccountPrioritiesError(value: unknown): string | null {
     return "schema_invalid: activeCodexAccountPinned: must be an account id";
   }
   return null;
+}
+
+function codexAccountPriorityFailbackError(value: unknown): string | null {
+  const raw = rawConfigRecord(value);
+  if (!raw || !Object.hasOwn(raw, "codexAccountPriorityFailback")) return null;
+  const enabled = raw.codexAccountPriorityFailback;
+  if (enabled === undefined || typeof enabled === "boolean") return null;
+  return "schema_invalid: codexAccountPriorityFailback: must be a boolean or omitted";
 }
 
 /**
@@ -577,12 +596,27 @@ export function metricsExportConfigError(value: unknown): string | null {
   return null;
 }
 
+
+function skillsConfigError(value: unknown): string | null {
+  const raw = rawConfigRecord(value);
+  if (!raw || !Object.hasOwn(raw, "skills") || raw.skills === undefined) return null;
+  const result = skillsConfigSchema.safeParse(raw.skills);
+  if (result.success) return null;
+  const issue = result.error.issues[0];
+  const field = issue?.path.join(".");
+  return "schema_invalid: skills" + (field ? "." + field : "") + ": " + (issue?.message ?? "invalid configuration");
+}
+
 export function validateConfigCandidate(value: unknown): { ok: true; config: OcxConfig } | { ok: false; error: string } {
   const compactionRouting = rawConfigRecord(value)?.compactionRouting;
   if (compactionRouting !== undefined && !compactionRoutingSchema.safeParse(compactionRouting).success) {
     return { ok: false, error: "schema_invalid: compactionRouting: requires a nonblank model, an optional valid reasoningEffort, and optional non-repeating triggers drawn from \"manual\" and \"auto\"" };
   }
-  const boundaryError = configReasoningPinsConfigError(value)
+  const memoryModels = rawConfigRecord(value)?.memoryModels;
+  if (memoryModels !== undefined && !memoryModelsSchema.safeParse(memoryModels).success) {
+    return { ok: false, error: "schema_invalid: memoryModels: requires a nonblank model and an optional declared reasoningEffort per configured phase, and no other fields" };
+  }
+  const boundaryError = compactionRecoveryConfigError(value) ?? configReasoningPinsConfigError(value)
     ?? blankHostnameError(value)
     ?? claudeSubagentEffortError(value)
     ?? appOwnedMemoryBudgetError(value)
@@ -595,6 +629,7 @@ export function validateConfigCandidate(value: unknown): { ok: true; config: Ocx
     ?? codexPoolError(value)
     ?? googleAntigravityStaticCatalogVersionError(value)
     ?? codexAccountPrioritiesError(value)
+    ?? codexAccountPriorityFailbackError(value)
     ?? poolCredentialGroupsError(value)
     ?? codexQuotaAutoRefreshError(value)
     ?? codexAccountPickerEnabledError(value)
@@ -607,7 +642,8 @@ export function validateConfigCandidate(value: unknown): { ok: true; config: Ocx
     ?? clientRolePairError(value)
     ?? loopbackListenerPortError(value)
     ?? managementIngressConfigError(value)
-    ?? metricsExportConfigError(value);
+    ?? metricsExportConfigError(value)
+    ?? skillsConfigError(value);
   if (boundaryError) return { ok: false, error: boundaryError };
   const result = configSchema.safeParse(value);
   if (result.success) {

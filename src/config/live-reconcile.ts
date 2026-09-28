@@ -1,8 +1,12 @@
 import type { OcxConfig, OcxProviderConfig } from "../types";
 import { configReasoningPinsConfigError } from "./provider-validation";
 import { adoptCustomModelCatalogMigration, projectCustomModelCatalogMigration } from "../codex/custom-model-catalog-migration";
-import { refreshPreservedProviderOwner, refreshUserCostOverlays } from "../usage/user-cost-overlays";
+import { refreshPreservedProviderOwner } from "../usage/user-cost-overlays";
+import { refreshConfigDerivedRegistries } from "./derived-registries";
 import {
+  applyConfigObjectChildDeletions,
+  clearPendingConfigObjectChildDeletions,
+  prepareConfigObjectChildDeletionRebase,
   clearPendingConfigTopLevelDeletions,
   configHasRebaseProvenance,
   configRebaseDeletionKeys,
@@ -10,7 +14,7 @@ import {
   projectConfigRebaseProvenance,
 } from "./rebase-provenance";
 import { withConfigMutationLockSync, bumpGenerationForCooperatingConfigWrite } from "./mutation-lock";
-import { persistConfigUnlocked, readRawConfigJson } from "./persist-unlocked";
+import { ConfigWritePublishedError, persistConfigUnlocked, readRawConfigJson } from "./persist-unlocked";
 import { configDiagnosticsFromRaw, readConfigDiagnostics } from "./diagnostics";
 import { normalizePersistedClaudeCode } from "./load-degrade";
 
@@ -357,12 +361,14 @@ export function reconcileLiveConfigFromDisk(config: OcxConfig, persistedBaseline
     ...(persisted.hostname !== undefined ? { hostname: persisted.hostname } : {}),
   });
 
+  const childDeletions = prepareConfigObjectChildDeletionRebase(config);
   reconcileConfigRecord(
     config as unknown as Record<string, unknown>,
     persistedBaseline as unknown as Record<string, unknown>,
     persisted as unknown as Record<string, unknown>,
     new Set(["hostname", "port", ...(claudeGuardArmed ? ["claudeCode"] : [])]),
   );
+  applyConfigObjectChildDeletions(config, childDeletions);
 
   if (claudeGuardArmed && !pendingLiveClaudeMutation) {
     if (persisted.claudeCode === undefined) delete config.claudeCode;
@@ -372,7 +378,7 @@ export function reconcileLiveConfigFromDisk(config: OcxConfig, persistedBaseline
   // The reconciliation may have adopted a providers.<name>.modelCosts edit made
   // by a cooperating process while the OAuth login was pending; keep the overlay
   // registry (and the usage-cache overlay version) in sync with the live config.
-  refreshUserCostOverlays(config);
+  refreshConfigDerivedRegistries(config);
 }
 
 /**
@@ -419,7 +425,14 @@ function readPersistedServerBinding(
 export function saveConfigPreservingClaudeCode(config: OcxConfig): void {
   const pinError = configReasoningPinsConfigError(config);
   if (pinError) throw new Error(pinError);
-  withConfigMutationLockSync(() => {
+  let published = false;
+  const persist = (candidate: OcxConfig): void => {
+    const changed = persistConfigUnlocked(candidate);
+    published = true;
+    if (changed) bumpGenerationForCooperatingConfigWrite();
+  };
+  const save = () => withConfigMutationLockSync(() => {
+    const childDeletions = prepareConfigObjectChildDeletionRebase(config);
     const bindingBaseline = persistedLiveServerBinding.get(config);
     // One authoritative pre-write read feeds both the live-config reconciliation and
     // custom-model deletion migration. A second read could observe different bytes.
@@ -477,6 +490,7 @@ export function saveConfigPreservingClaudeCode(config: OcxConfig): void {
         }
       }
     }
+    applyConfigObjectChildDeletions(config, childDeletions);
     if (claudeCodeBaseline.has(config)) {
       if (onDisk !== undefined) {
         const baseline = claudeCodeBaseline.get(config);
@@ -502,10 +516,10 @@ export function saveConfigPreservingClaudeCode(config: OcxConfig): void {
       const persistedConfig: OcxConfig = { ...projectedConfig, port: persistedBinding.port };
       if (persistedBinding.hostname === undefined) delete persistedConfig.hostname;
       else persistedConfig.hostname = persistedBinding.hostname;
-      if (persistConfigUnlocked(persistedConfig)) bumpGenerationForCooperatingConfigWrite();
+      persist(persistedConfig);
       persistedLiveServerBinding.set(config, persistedBinding);
     } else {
-      if (persistConfigUnlocked(projectedConfig)) bumpGenerationForCooperatingConfigWrite();
+      persist(projectedConfig);
     }
     adoptCustomModelCatalogMigration(config, projectedConfig);
     if (claudeCodeBaseline.has(config)) {
@@ -516,6 +530,17 @@ export function saveConfigPreservingClaudeCode(config: OcxConfig): void {
       else config.configRebaseProvenance = structuredClone(projectedConfig.configRebaseProvenance);
       liveConfigBaseline.set(config, structuredClone(projectedConfig));
     }
+    clearPendingConfigObjectChildDeletions(config);
     clearPendingConfigTopLevelDeletions(config);
   });
+  try {
+    save();
+  } catch (error) {
+    // Generation/baseline updates and the lock's COMMIT run after publication.
+    // They may fail, but the file replacement cannot be undone by a live rollback.
+    if (published && !(error instanceof ConfigWritePublishedError)) {
+      throw new ConfigWritePublishedError(error);
+    }
+    throw error;
+  }
 }

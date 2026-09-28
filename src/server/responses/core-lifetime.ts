@@ -1,11 +1,5 @@
 import type { TranslatorBudget } from "../../lib/translator-budget";
 import {
-  createTurnStateSniffer,
-  observeTurnStateResponseHeaders,
-  observeTurnStateUpstreamStatus,
-  type TurnStateWhere,
-} from "../turn-state-observer";
-import {
   isNativePassthroughSseResponse,
   markNativePassthroughSseResponse,
   isEagerRelaySseResponse,
@@ -41,17 +35,12 @@ export const UPSTREAM_JSON_BODY_READ_OPTIONS = {
 
 
 
-export function finalizeOwnedTranslatorBudget(response: Response, budget: TranslatorBudget, turnStateWhere?: TurnStateWhere): Response {
+export function finalizeOwnedTranslatorBudget(response: Response, budget: TranslatorBudget): Response {
   if (!response.body) {
     budget.dispose();
     return response;
   }
   const reader = response.body.getReader();
-  const turnStateSniffer = turnStateWhere ? createTurnStateSniffer(turnStateWhere) : undefined;
-  if (turnStateWhere) {
-    observeTurnStateUpstreamStatus(response.status, turnStateWhere);
-    observeTurnStateResponseHeaders(response.headers, turnStateWhere);
-  }
   let finalized = false;
   const finalize = () => {
     if (finalized) return;
@@ -63,21 +52,17 @@ export function finalizeOwnedTranslatorBudget(response: Response, budget: Transl
       try {
         const result = await reader.read();
         if (result.done) {
-          try { turnStateSniffer?.finish(); } catch { /* observer never breaks the relay */ }
           finalize();
           controller.close();
         } else {
-          try { turnStateSniffer?.feed(result.value); } catch { /* observer never breaks the relay */ }
           controller.enqueue(result.value);
         }
       } catch (error) {
-        try { turnStateSniffer?.finish(); } catch { /* observer never breaks the relay */ }
         finalize();
         controller.error(error);
       }
     },
     async cancel(reason) {
-      try { turnStateSniffer?.finish(); } catch { /* observer never breaks the relay */ }
       try { await reader.cancel(reason); } finally { finalize(); }
     },
   });
@@ -93,6 +78,28 @@ export function finalizeOwnedTranslatorBudget(response: Response, budget: Transl
     markEagerRelaySseResponse(finalizedResponse);
   }
   return finalizedResponse;
+}
+
+/** Release a serving-account slot when the client body ends, errors or is cancelled. */
+export function finalizeAccountLease(response: Response, release: () => void): Response {
+  if (!response.body) { release(); return response; }
+  const reader = response.body.getReader();
+  let done = false;
+  const finish = () => { if (!done) { done = true; release(); } };
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const next = await reader.read();
+        if (next.done) { finish(); controller.close(); }
+        else controller.enqueue(next.value);
+      } catch (error) { finish(); controller.error(error); }
+    },
+    async cancel(reason) { try { await reader.cancel(reason); } finally { finish(); } },
+  });
+  const wrapped = new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+  if (isNativePassthroughSseResponse(response)) markNativePassthroughSseResponse(wrapped);
+  if (isEagerRelaySseResponse(response)) markEagerRelaySseResponse(wrapped);
+  return wrapped;
 }
 
 

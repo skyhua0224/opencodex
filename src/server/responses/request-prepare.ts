@@ -13,6 +13,14 @@ import {
 } from "./core-errors";
 import { parseSyntheticRowId } from "../fast-row";
 import { resolveComboId, comboIdFromRawBody, NoAvailableComboTargetsError } from "../../combos";
+import { INTERCEPT_TARGET_UNAVAILABLE_CODE, interceptTargetUnavailableResponse, resolveChosenTarget, resolveShadowCallTarget } from "./shadow-target-availability";
+import {
+  MEMORY_MODEL_TARGET_UNAVAILABLE_CODE,
+  configuredMemoryModel,
+  detectMemoryModelPhase,
+  memoryModelRouteReason,
+  memoryModelTargetUnavailableResponse,
+} from "./memory-models";
 import { recallComboForLane } from "./combo-session-recall";
 import {
   sessionLaneIdFromRequest,
@@ -21,6 +29,7 @@ import {
   reasoningReplayConversationIdFromResponsesRequest,
 } from "../request-log-conversation";
 import { resolveContextPrincipal } from "../auth-cors";
+import { resolveSkillsSnapshotScopeKey, snapshotSkillsCatalogInBody } from "./skills-snapshot";
 import {
   isShadowSourceModel,
   shadowSourceModelPrefix,
@@ -38,6 +47,7 @@ import {
   applyCodexAuthContextToProvider,
   hasCallerCodexBearer,
   requestOwnedMainPinState,
+  requestOwnedMainCredentialIsLive,
 } from "../../codex/auth-context";
 import {
   copyPreviousResponseReplayProvenance,
@@ -50,7 +60,6 @@ import { formatErrorResponse } from "../../bridge";
 import type { OcxParsedRequest } from "../../types";
 import { buildToolBridgeMaps } from "./collaboration";
 import { parseRequest } from "../../responses/parser";
-import { observeTurnStateRequestBody } from "../turn-state-observer";
 import { anthropicSessionKeyFromParts } from "../../oauth/anthropic-routing";
 import { isTranslatorBudgetExceededError } from "../../lib/translator-budget";
 import { bindTurnTerminationScope, rememberDeliveredFinalAnswer } from "../../responses/turn-termination";
@@ -173,6 +182,20 @@ export async function prepareResponsesRequest(
       transport: options.inboundTransport,
     });
   }
+  // Codex's memory pipeline names a destination per phase. The phase is read from Codex's own turn
+  // metadata, never from the model id: Phase 1 shares `gpt-5.6-luna` with the app's title/commit
+  // helper calls. Read here, ahead of the shadow intercept below, because the phase decision is the
+  // more specific of the two settings and must be the one that survives when both match one request.
+  const memoryModelPhase = options.memoryModelPhase
+    ?? ((config.memoryModels?.extract || config.memoryModels?.consolidation)
+      && !options.comboAttempt && !options.compactionRoutingOverride && inboundWire === "responses"
+      ? detectMemoryModelPhase(body, req.headers, { transport: options.inboundTransport }) ?? undefined
+      : undefined);
+  const memoryModelTarget = memoryModelPhase ? configuredMemoryModel(config, memoryModelPhase) : undefined;
+  // A combo child is a synthetic replay of the parent's decision: its model is already the target's
+  // concrete provider/model, so neither site below may rewrite or re-resolve it. It keeps the phase
+  // through `options.memoryModelPhase` instead, which is what applies the phase effort.
+  const memoryModelApplies = memoryModelTarget !== undefined && options.comboAttempt !== true;
   options.onRequestBodyParsed?.(body);
   // An effort row naming a table-less combo (`combo/x--high`) must reach the combo dispatcher
   // as its base id, so the selector is normalized here, before comboIdFromRawBody reads model.
@@ -227,13 +250,29 @@ export async function prepareResponsesRequest(
   // hops — which only exist inside that loop — are unreachable (#4129). Rewrite the selector
   // here instead, before comboIdFromRawBody reads `model`, and identify the combo by CONFIG
   // LOOKUP so the check can never observe a one-candidate collapse.
-  if (!options.comboAttempt && !options.compactionRoutingOverride && body && typeof body === "object" && !Array.isArray(body)) {
+  // A memory target that names a combo has to reach the combo dispatcher as `model`, or its own
+  // failover loop is unreachable (#4129) — the same reason the shadow intercept rewrites its combo
+  // target here. Every other target is resolved at the late site, where the admission scope exists.
+  let memoryModelComboRouted = false;
+  if (memoryModelApplies && memoryModelTarget && body && typeof body === "object" && !Array.isArray(body)) {
+    const memoryComboId = resolveComboId(config, memoryModelTarget.model);
+    if (memoryComboId && Object.hasOwn(config.combos ?? {}, memoryComboId)) {
+      memoryModelComboRouted = true;
+      (body as Record<string, unknown>).model = memoryModelTarget.model;
+    }
+  }
+  let shadowCallIntercepted = false;
+  // A spawned sub-agent turn names its model on purpose; gpt-6-luna is both the helper
+  // slug and a default sub-agent model, so neither intercept site may rewrite that turn.
+  const threadSpawn = isThreadSpawnRequest(req.headers);
+  if (!options.comboAttempt && !options.compactionRoutingOverride && !threadSpawn && !memoryModelApplies && body && typeof body === "object" && !Array.isArray(body)) {
     const shadowIntercept = config.shadowCallIntercept;
     const rawShadowModel = (body as { model?: unknown }).model;
     if (shadowIntercept?.enabled && shadowIntercept.model && typeof rawShadowModel === "string"
       && isShadowSourceModel(rawShadowModel, shadowIntercept.sourceModels)) {
       const shadowComboId = resolveComboId(config, shadowIntercept.model);
       if (shadowComboId && Object.hasOwn(config.combos ?? {}, shadowComboId)) {
+        shadowCallIntercepted = true;
         (body as Record<string, unknown>).model = shadowIntercept.model;
         // Same rule as the late intercept site: record the operator-configured prefix that
         // matched, never the caller's raw model string. Matching is by prefix, so the raw
@@ -249,6 +288,12 @@ export async function prepareResponsesRequest(
     options.onRequestBodyRead?.();
     return requestDispatchers.handleComboResponses(req, body, comboId, config, logCtx, {
       ...options,
+      // Concrete combo child selectors no longer match the shadow source model. Carry the
+      // interception decision explicitly so provider-specific helper isolation still applies.
+      shadowCallIntercepted,
+      // Same handoff for a memory phase whose target is a combo: the child keeps the phase's effort
+      // override and stays out of the parent conversation.
+      memoryModelPhase: memoryModelComboRouted ? memoryModelPhase : undefined,
       // The original request body was accepted above. Combo children are synthetic
       // replays and must not repeat the caller-owned timeout transition.
       onRequestBodyRead: undefined,
@@ -305,18 +350,19 @@ export async function prepareResponsesRequest(
       );
   }
 
+  const skillsSnapshotScopeKey = resolveSkillsSnapshotScopeKey({
+    req,
+    config,
+    admission: options.admission,
+        promptCacheKeyIsSharedCohort: options.promptCacheKeyIsSharedCohort,
+  });
+  // Substitutes a known snapshot now; a new catalog is only stored once the request is prepared.
+  const commitSkillsSnapshot = snapshotSkillsCatalogInBody(body, skillsSnapshotScopeKey, config);
+
   let parsed: OcxParsedRequest;
   let toolBridgeMaps: ReturnType<typeof buildToolBridgeMaps>;
   try {
     parsed = parseRequest(body);
-    if (!options.comboAttempt) {
-      observeTurnStateRequestBody(body, req.headers, {
-        provider: logCtx.provider,
-        model: parsed.modelId,
-        direction: "request",
-        transport: options.inboundTransport ?? "http",
-      });
-    }
     parsed._promptCacheKeyIsSharedCohort = options.promptCacheKeyIsSharedCohort;
     // The body may have been rebuilt since the inbound observation (previous-response
     // expansion); alias the parsed raw body to the same draft so the outbound
@@ -379,6 +425,11 @@ export async function prepareResponsesRequest(
       }
     }
     if (cursorClientThreadId) parsed._cursorClientThreadId = cursorClientThreadId;
+    if (options.shadowCallIntercepted === true) parsed._cursorIsolateConversation = true;
+    if (options.memoryModelPhase !== undefined) {
+      parsed._memoryModelPhase = options.memoryModelPhase;
+      parsed._cursorIsolateConversation = true;
+    }
   } catch (err) {
     if (isTranslatorBudgetExceededError(err)) {
       return formatErrorResponse(413, "request_too_large", "request translation buffer exceeded the safe limit", {
@@ -482,16 +533,43 @@ export async function prepareResponsesRequest(
       : parsed._compactionRequest === true
         ? routeCompactionModel(config, modelId, evidenceFromBody(parsed._rawBody))
         : routeModel(config, modelId, evidenceFromBody(parsed._rawBody)));
+    // The phase's destination. Resolved through the admission-scoped resolver every other route
+    // uses, and it fails closed exactly like the shadow target: falling back to the native model
+    // would spend the quota the operator routed away from, without their choosing it.
+    let memoryRoute: RouteResult | undefined;
+    if (memoryModelApplies && memoryModelPhase && memoryModelTarget) {
+      const memoryTarget = resolveChosenTarget(memoryModelTarget.model, resolveRoute);
+      if ("unavailable" in memoryTarget) {
+        logCtx.errorCode = MEMORY_MODEL_TARGET_UNAVAILABLE_CODE;
+        return memoryModelTargetUnavailableResponse(memoryModelPhase);
+      }
+      credentialDomainWasRewritten = true;
+      parsed.modelId = memoryModelTarget.model;
+      if (parsed._rawBody && typeof parsed._rawBody === "object") {
+        (parsed._rawBody as { model?: string }).model = memoryModelTarget.model;
+      }
+      parsed._memoryModelPhase = memoryModelPhase;
+      parsed._cursorIsolateConversation = true;
+      memoryRoute = memoryTarget.route;
+    }
     const _sci = config.shadowCallIntercept;
     let shadowRoute: RouteResult | undefined;
-    if (!options.compactionRoutingOverride && _sci?.enabled && _sci.model && isShadowSourceModel(parsed.modelId, _sci.sourceModels)) {
+    if (!memoryRoute && !options.memoryModelPhase && !options.compactionRoutingOverride && !threadSpawn && _sci?.enabled && _sci.model && isShadowSourceModel(parsed.modelId, _sci.sourceModels)) {
       const sourcePrefix = shadowSourceModelPrefix(parsed.modelId, _sci.sourceModels)!;
       let sourceIdentity = { providerName: OPENAI_CODEX_PROVIDER_ID, modelId: sourcePrefix };
       try {
         const resolvedSource = routeConcreteModel(config, parsed.modelId);
         sourceIdentity = { providerName: resolvedSource.providerName, modelId: sourcePrefix };
       } catch { /* Native Codex helper calls remain OpenAI-owned without an enabled OpenAI route. */ }
-      const targetRoute = resolveRoute(_sci.model);
+      // A dead target fails this helper call once, before any send; it never falls through to
+      // the native source model or to the default provider (#5618).
+      const target = resolveShadowCallTarget(_sci.model, resolveRoute);
+      if ("unavailable" in target) {
+        logCtx.shadowCallRewrittenFrom = sanitizeLogMetadataString(sourcePrefix);
+        logCtx.errorCode = INTERCEPT_TARGET_UNAVAILABLE_CODE;
+        return interceptTargetUnavailableResponse(_sci.model, target.unavailable);
+      }
+      const targetRoute = target.route;
       if (shouldInterceptShadowCall(parsed.modelId, _sci.sourceModels, sourceIdentity, targetRoute)) {
         credentialDomainWasRewritten = true;
         const _sciOriginal = parsed.modelId;
@@ -513,7 +591,20 @@ export async function prepareResponsesRequest(
       }
     }
     if (parsed._compactionRequest === true || options.compactionRoutingOverride) parsed._cursorIsolateConversation = true;
-    route = shadowRoute ?? resolveRoute(parsed.modelId);
+    route = memoryRoute ?? shadowRoute ?? resolveRoute(parsed.modelId);
+    // Name the phase in the persisted route decision, so the request log says why this turn went to
+    // the memory destination instead of leaving it looking like a plain user selection. Set here, on
+    // the resolved route, so a combo child's own route carries it too.
+    if (parsed._memoryModelPhase) {
+      const reason = memoryModelRouteReason(parsed._memoryModelPhase);
+      route.routeReason = reason;
+      if (route.routeDecision) {
+        route.routeDecision = {
+          ...route.routeDecision,
+          selected: { ...route.routeDecision.selected, reason },
+        };
+      }
+    }
     if (options.compactionRoutingOverride && !compactionRoutingKeepsProviderIdentity(config, options.compactionRoutingOverride, route)) {
       credentialDomainWasRewritten = true;
       // The destination does not share the conversation's credential domain, so it can neither
@@ -542,7 +633,6 @@ export async function prepareResponsesRequest(
   // Exact account selectors are isolated from Pool-wide quota work. A canonical replay miss must
   // also fail closed without polling quota upstream. Cached fallback state can still select a
   // provider with native continuation support below.
-  const threadSpawn = isThreadSpawnRequest(req.headers);
   const initialSubagentFallbackChain = threadSpawn && !options.comboAttempt
     ? resolveSubagentFallbackChain(parsed, config)
     : null;
@@ -589,7 +679,19 @@ export async function prepareResponsesRequest(
     options.codexAuthPolicy ?? config,
     previewRequestScopedMainCredential,
     route.codexAccountId,
+    codexQuotaScopeForModel(route.modelId),
   ).preserve;
+  // Final auth's own liveness answer for a request-owned bearer, from its own shared expression
+  // (#5019). Predicting the pin alone dropped main here and handed subagent fallback a different
+  // account than the one that serves.
+  const previewRequestOwnedMainCredentialLive = requestOwnedMainCredentialIsLive({
+    preserveRequestOwnedMainPin: previewRequestOwnedMainPin,
+    requestScopedMainCredential: previewRequestScopedMainCredential,
+    nativeMainTrafficBlocked: nativeMainRecoveryBlocked,
+    mainProfileDraining: previewSelectionAdmission?.mainProfileDraining === true,
+    // Final-auth-only, and stated rather than defaulted: see the field's own note.
+    callerOwnsCooledPoolSubscription: false,
+  });
   // Deliberately NOT fenced on ownership: final auth derives `nativeMainSelectionOnly` from the
   // drain alone, and adding a term here would diverge from it in the other direction.
   const previewSelectionOptions = {
@@ -601,12 +703,13 @@ export async function prepareResponsesRequest(
     // spawn, because subagent fallback re-enters the preview through the callback below.
     //
     // Scoped to ownership, and carrying final auth's value rather than a constant, because
-    // preview exists to predict final auth. Under an effective main pin the request really is
-    // served by its own main credential, so main must stay eligible; without the pin final auth
-    // scores main `main_credential_unavailable` and drops it, so preview has to drop it too. A
-    // hardcoded `true` would be wrong in the second case and `false` in the first.
+    // preview exists to predict final auth. The request really is served by its own main
+    // credential whenever that bearer is forwardable, so main stays eligible; while retained
+    // recovery or a profile drain fences the physical identity, final auth drops main and preview
+    // has to drop it too. A hardcoded `true` would be wrong in the second case and `false` in
+    // the first.
     isMainAccountTokenLive: previewRequestScopedMainCredential
-      ? () => previewRequestOwnedMainPin
+      ? () => previewRequestOwnedMainCredentialLive
       : undefined,
     // Preview must reach the same answer as the final resolution, including the uploaded-file
     // retention (#4778): a preview that reported a quota move the request will not make would
@@ -845,12 +948,22 @@ export async function prepareResponsesRequest(
                 options.codexAuthPolicy ?? config,
                 recoveryRequestScopedMainCredential,
                 route.codexAccountId,
+                codexQuotaScopeForModel(route.modelId),
               ).preserve;
+              // Same shared expression as the first preview and as final auth (#5019), recomputed
+              // against the route recovery may have moved to.
+              const recoveryRequestOwnedMainCredentialLive = requestOwnedMainCredentialIsLive({
+                preserveRequestOwnedMainPin: recoveryRequestOwnedMainPin,
+                requestScopedMainCredential: recoveryRequestScopedMainCredential,
+                nativeMainTrafficBlocked: recoveryNativeMainBlocked,
+                mainProfileDraining: recoverySelectionAdmission?.mainProfileDraining === true,
+                callerOwnsCooledPoolSubscription: false,
+              });
               const recoverySelectionOptions = {
                 nativeMainSelectionOnly: !recoveryNativeMainBlocked
                   && recoverySelectionAdmission?.mainProfileDraining === true,
                 isMainAccountTokenLive: recoveryRequestScopedMainCredential
-                  ? () => recoveryRequestOwnedMainPin
+                  ? () => recoveryRequestOwnedMainCredentialLive
                   : undefined,
                 // #4778, same reason as `previewSelectionOptions` above: this preview decides
                 // which account subagent fallback scores against, and final auth passes the
@@ -1231,6 +1344,7 @@ export async function prepareResponsesRequest(
     ? admissionState.authCtx.accountId
     : config.activeCodexAccountId ?? null;
 
+  commitSkillsSnapshot?.();
   return {
     inboundWire,
     translatorBudget,

@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 import { getValidAccessTokenForAccount } from "../../oauth";
-import { getAccountCredential, getAccountSet } from "../../oauth/store";
+import { getAccountCredential, getAccountCredentialWithStatus, getAccountSet } from "../../oauth/store";
 import type { GenerationContext } from "../../lib/state-store-sweeper";
 import { ACCOUNT_QUOTA_TTL_MS, toFiniteNumber } from "../quota-wire";
-import { clearKiroAccountUsageState, reconcileKiroAccountUsageState } from "../kiro-usage";
-import { cancelPendingAccountQuotaPersist, readPersistedAccountQuotas, schedulePersistAccountQuotas } from "../account-quota-disk";
+import { clearKiroAccountUsageState, hydrateKiroUsageVerdict, kiroPersistableVerdicts, reconcileKiroAccountUsageState } from "../kiro-usage";
+import { kiroEvidenceIdentity, sanitizeKiroQuota, type KiroPersistedQuota } from "../kiro-account-state-disk";
+import { cancelPendingAccountQuotaPersist, readPersistedAccountQuotas, readPersistedKiroVerdicts, schedulePersistAccountQuotas } from "../account-quota-disk";
+import type { ProviderAccount } from "../../oauth/types";
 import { replaceCachedProviderQuotas } from "../quota-routing-cache";
 import { getProviderRegistryEntry } from "../registry";
 import { getProviderQuotaReportCache, hasQuotaRows, routingEvidence, setProviderQuotaReportCache } from "./report-cache";
@@ -102,26 +104,51 @@ let diskHydrated = false;
 export function hydrateAccountQuotaCache(): void {
   if (diskHydrated) return;
   diskHydrated = true;
-  for (const [key, quota] of readPersistedAccountQuotas()) {
+  const now = Date.now();
+  const liveKiro = new Map<string, ProviderAccount>(getAccountSet("kiro")?.accounts.map(account =>
+    [accountCacheKey("kiro", account.id), account]) ?? []);
+  for (const [key, quota] of readPersistedAccountQuotas(now)) {
+    if (key.startsWith("kiro\0")) {
+      const account = liveKiro.get(key);
+      if (!account || (quota as KiroPersistedQuota).identity !== kiroEvidenceIdentity(account)
+        || typeof quota.monthlyPercent !== "number" || !Number.isFinite(quota.monthlyPercent)
+        || quota.monthlyPercent < 0 || quota.monthlyPercent > 100
+        || now - quota.updatedAt >= ACCOUNT_QUOTA_TTL_MS
+        || (quota.monthlyResetAt !== undefined && (typeof quota.monthlyResetAt !== "number"
+          || !Number.isFinite(quota.monthlyResetAt) || quota.monthlyResetAt <= now
+          || !Number.isFinite(new Date(quota.monthlyResetAt).getTime())))) continue;
+    }
     // Disk stores observation time, not the Anthropic usage probe's clock.
     if (!accountQuotaCache.has(key)) {
       const anthropic = key.startsWith("anthropic\u0000");
       accountQuotaCache.set(key, {
         ts: anthropic ? 0 : quota.updatedAt,
-        quota: anthropic ? normalizeAnthropicQuota(quota, Date.now()) : quota,
+        quota: anthropic ? normalizeAnthropicQuota(quota, now)
+          : key.startsWith("kiro\0") ? sanitizeKiroQuota(quota) : quota,
+        ...(key.startsWith("kiro\0") ? { identity: (quota as KiroPersistedQuota).identity } : {}),
       });
     }
+  }
+  for (const [key, verdict] of readPersistedKiroVerdicts(now)) {
+    const account = liveKiro.get(key);
+    if (account && verdict.identity === kiroEvidenceIdentity(account)) hydrateKiroUsageVerdict(key, verdict, account);
   }
 }
 
 export function persistAccountQuotaCache(): void {
   schedulePersistAccountQuotas(function* () {
     const now = Date.now();
+    const liveKiro = new Map<string, ProviderAccount>(getAccountSet("kiro")?.accounts.map(account =>
+      [accountCacheKey("kiro", account.id), account]) ?? []);
     for (const [key, entry] of accountQuotaCache) {
       const quota = key.startsWith("anthropic\u0000") ? normalizeAnthropicQuota(entry.quota, now) : entry.quota;
-      if (quota) yield [key, quota] as [string, ProviderQuota];
+      if (quota && key.startsWith("kiro\0")) {
+        const account = liveKiro.get(key);
+        if (account && entry.identity === kiroEvidenceIdentity(account))
+          yield [key, { ...sanitizeKiroQuota(quota), identity: entry.identity } as KiroPersistedQuota] as [string, KiroPersistedQuota];
+      } else if (quota) yield [key, quota] as [string, ProviderQuota];
     }
-  });
+  }, () => kiroPersistableVerdicts());
 }
 export const accountQuotaInflight = new Map<string, Promise<AccountQuotaCacheEntry>>();
 let lastReconciledGeneration = 0;
@@ -170,6 +197,10 @@ export function accountCacheKey(provider: string, accountId: string): string {
  */
 export function getCachedProviderAccountQuota(provider: string, accountId: string): ProviderQuota | null {
   const entry = accountQuotaCache.get(accountCacheKey(provider, accountId));
+  if (provider === "kiro") {
+    const account = getAccountSet("kiro")?.accounts.find(row => row.id === accountId);
+    if (!account || entry?.identity !== kiroEvidenceIdentity(account)) return null;
+  }
   if (entry?.isCurrent && !entry.isCurrent()) return null;
   return provider === "anthropic" ? normalizeAnthropicQuota(entry?.quota, Date.now()) : entry?.quota ?? null;
 }
@@ -185,7 +216,9 @@ export function setCachedProviderAccountQuotaForTests(
     accountQuotaCache.delete(key);
     return;
   }
-  accountQuotaCache.set(key, { ts: Date.now(), quota });
+  const account = provider === "kiro" ? getAccountSet("kiro")?.accounts.find(row => row.id === accountId) : undefined;
+  accountQuotaCache.set(key, { ts: Date.now(), quota,
+    ...(account ? { identity: kiroEvidenceIdentity(account) } : {}) });
 }
 
 /** Unified headers report utilization fractions and epoch-second reset times. */
@@ -335,6 +368,7 @@ export function sweepExpiredProviderAccountQuotaRows(now = Date.now()): number {
 
 export function reconcileProviderAccountQuotaRows(context: GenerationContext): number {
   if (context.generation <= lastReconciledGeneration) return 0;
+  hydrateAccountQuotaCache();
   let removed = 0;
   for (const key of accountQuotaCache.keys()) {
     if (context.oauthAccountKeys.has(key)) continue;
@@ -354,6 +388,7 @@ export function reconcileProviderAccountQuotaRows(context: GenerationContext): n
   liveAccountQuotaKeys = new Set(context.oauthAccountKeys);
   liveProviderQuotaKeys = new Set(context.providerNames);
   lastReconciledGeneration = context.generation;
+  if (removed > 0) persistAccountQuotaCache();
   return removed;
 }
 
@@ -377,6 +412,7 @@ export function clearAccountQuotaCache(provider?: string): void {
     cancelPendingAccountQuotaPersist();
     return;
   }
+  hydrateAccountQuotaCache();
   const prefix = `${provider}\u0000`;
   for (const key of [...accountQuotaCache.keys()]) {
     if (key.startsWith(prefix)) accountQuotaCache.delete(key);
@@ -401,14 +437,28 @@ export function clearAccountQuotaCache(provider?: string): void {
  *   Anthropic's lock only adopts disk credentials for `local-cli` rows.
  */
 export async function getTokenForAccountQuotaProbe(provider: string, accountId: string): Promise<string> {
-  const stored = getAccountCredential(provider, accountId);
-  if (!stored) throw new Error("account credential missing");
+  const row = getAccountCredentialWithStatus(provider, accountId);
+  if (!row) throw new Error("account credential missing");
+  // An operator-paused account is excluded from every automatic upstream use, quota reads included.
+  if (row.paused) throw new Error("account is paused; quota probe skipped");
+  const stored = row.credential;
   if (stored.expires > Date.now() + ACCOUNT_TOKEN_SKEW_MS) return stored.access;
   const activeId = getAccountSet(provider)?.activeAccountId;
   if (activeId !== accountId && stored.source === "local-cli") {
     throw new Error("background local-cli token expired; skip CLI-adopting refresh for quota probe");
   }
   return getValidAccessTokenForAccount(provider, accountId);
+}
+
+/**
+ * Rows that must not be probed: an unsupported provider reads as unavailable, and a paused
+ * account returns its last reading unchanged (its `ts` shows the age) or an unavailable row,
+ * without writing the cache. Undefined means "probe normally".
+ */
+export function accountQuotaProbeSkip(provider: string, accountId: string): AccountQuotaCacheEntry | undefined {
+  if (!supportsPerAccountQuota(provider)) return { ts: Date.now(), quota: null, unavailable: true };
+  if (getAccountCredentialWithStatus(provider, accountId)?.paused !== true) return undefined;
+  return accountQuotaCache.get(accountCacheKey(provider, accountId)) ?? { ts: Date.now(), quota: null, unavailable: true };
 }
 
 export function explicitQuotaConfig(provider: string, configured?: OcxProviderConfig): OcxProviderConfig | undefined {

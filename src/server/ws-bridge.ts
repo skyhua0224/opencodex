@@ -376,19 +376,7 @@ export function sendResponsesJsonAsEvents(
   onTerminal?.(finalStatus);
 }
 
-/**
- * Error payload for a WebSocket client when the upstream refused the request.
- *
- * The client renders whatever message it finds, and an upstream that refuses with an EMPTY body used
- * to surface as a bare "Upstream request failed" -- no status, no origin, nothing to correlate with
- * the proxy log. Name the status and the body class instead, so the operator can tell a refusal
- * from a transport fault without re-running the turn.
- */
-function errorPayloadFromText(
-  text: string,
-  status?: number,
-  contentType?: string | null,
-): Record<string, unknown> {
+function errorPayloadFromText(text: string): Record<string, unknown> {
   try {
     const json = JSON.parse(text) as { error?: unknown };
     if (json.error && typeof json.error === "object" && !Array.isArray(json.error)) {
@@ -397,11 +385,9 @@ function errorPayloadFromText(
   } catch {
     /* fall through */
   }
-  const mediaType = typeof contentType === "string" ? contentType.split(";")[0]!.trim() : "";
-  const emptyBodyHint = `${status === undefined ? "HTTP unknown" : `HTTP ${status}`}${mediaType ? `, ${mediaType}` : ", empty body"}`;
   return {
     type: "upstream_error",
-    message: text ? text.slice(0, 500) : `Upstream request failed (${emptyBodyHint})`,
+    message: text ? text.slice(0, 500) : "Upstream request failed",
   };
 }
 
@@ -423,11 +409,7 @@ export async function sendResponseToWebSocket(
   if (!response.ok) {
     const text = await response.text().catch(() => "");
     if (!isCurrent()) return;
-    sendJsonFrame(ws, buildWsErrorFrame(
-      response.status,
-      errorPayloadFromText(text, response.status, response.headers.get("content-type")),
-      response.headers,
-    ));
+    sendJsonFrame(ws, buildWsErrorFrame(response.status, errorPayloadFromText(text), response.headers));
     return;
   }
 

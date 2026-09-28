@@ -1,5 +1,6 @@
 import {
   CliUsageError,
+  desktopSwitchApplyReason,
   printData,
   rejectArgs,
   runCliAction,
@@ -56,14 +57,6 @@ function desktopSwitchInertReason(reason: unknown): string {
   return "the stored setting is not effective in the current runtime configuration";
 }
 
-function desktopSwitchApplyReason(reason: unknown): string {
-  if (reason === "not_requested") return "no desktop switch rewrite was requested";
-  if (reason === "proxy_not_running") return "the proxy is not running";
-  if (reason === "integration_disabled") return "Codex integration is disabled";
-  if (reason === "write_lock_busy") return "the Codex config write lock is busy";
-  if (reason === "injection_refused") return "Codex config injection was refused";
-  return "the rewrite could not be completed";
-}
 
 function settingsUpdateLines(
   result: unknown,
@@ -76,8 +69,19 @@ function settingsUpdateLines(
   const lines: string[] = [];
   const appendSwitch = (key: string, label: string): boolean => {
     const state = recordValue(switches[key]);
-    if (!state || typeof state.stored !== "boolean" || typeof state.effective !== "boolean") return false;
+    if (!state || typeof state.stored !== "boolean"
+      || (typeof state.effective !== "boolean" && state.effective !== null)) return false;
     lines.push(`${label}: stored ${state.stored ? "on" : "off"}.`);
+    if (state.effective === null) {
+      // `null` is reported for both withheld cases; the apply reason is the only place
+      // that still distinguishes them, so the line has to read it rather than claim
+      // external control over an ownership the server could not determine.
+      const withheld = recordValue(switches.apply)?.reason === "ownership_undetermined"
+        ? "effective state could not be determined"
+        : "effective state is controlled by the external model provider";
+      lines.push(`${label}: ${withheld}.`);
+      return true;
+    }
     // The effective value is always stated, even when it matches. Printing it only on a
     // mismatch would make silence ambiguous — the reader could not tell "the stored value is
     // in force" from "this build does not report effective state", and that ambiguity is a
@@ -104,7 +108,14 @@ function settingsUpdateLines(
     lines.push("Codex config: ~/.codex/config.toml was rewritten.");
   } else {
     const detail = typeof apply.detail === "string" && apply.detail.length > 0 ? ` Details: ${apply.detail}` : "";
-    lines.push(`Codex config: ~/.codex/config.toml was not rewritten because ${desktopSwitchApplyReason(apply.reason)}.${detail} Run 'ocx sync' to apply the stored settings.`);
+    const retry = apply.reason === "external_provider"
+      ? ""
+      : apply.reason === "ownership_undetermined"
+      ? " Resolve the reported config.toml read error, then inspect 'ocx system settings --json'."
+      : apply.reason === "integration_disabled"
+      ? " Enable Codex integration before applying the stored settings."
+      : " Run 'ocx sync' to apply the stored settings.";
+    lines.push(`Codex config: ~/.codex/config.toml was not rewritten because ${desktopSwitchApplyReason(apply.reason)}.${detail}${retry}`);
   }
   lines.push(`Auth source: ${authSource.summary}`);
   return lines;
@@ -202,13 +213,20 @@ export async function handleSystemCommand(argv: string[], deps: RuntimeApiDeps =
       printData(await runtimeRequest("/api/system/codex-app-server", {}, deps), wantsJson);
     } else if (sub === "codex-restart") {
       // --yes required: this fully quits and relaunches the user's Codex desktop app as well as
-      // restarting app-servers; an agent guessing a subcommand must not interrupt that session.
+      // restarting app-servers, which can discard unsaved drafts, selections, and approval prompts.
       const args = [...rest];
       const wantsJson = takeFlag(args, "--json");
       const yes = takeFlag(args, "--yes");
-      if (!yes) throw new CliUsageError("system codex-restart requires --yes: this fully quits and relaunches the Codex desktop app and restarts its app-servers", USAGE);
+      if (!yes) throw new CliUsageError(
+        "system codex-restart requires --yes: this fully quits and relaunches the Codex desktop app, so unsaved composer drafts, model-picker selections, and pending approval prompts may be lost; it also restarts the app-servers",
+        USAGE,
+      );
       rejectArgs(args, USAGE);
-      printData(await runtimeRequest("/api/system/codex-restart", { method: "POST" }, deps), wantsJson, ["Codex desktop app and app-server restart requested."]);
+      printData(
+        await runtimeRequest("/api/system/codex-restart", { method: "POST" }, deps),
+        wantsJson,
+        ["Codex desktop app and app-server restart requested. Unsaved composer drafts, model-picker selections, and pending approval prompts may be lost."],
+      );
     } else if (sub === "update") await update(rest, deps);
     else throw new CliUsageError(`unknown system command ${sub}`, USAGE);
   });

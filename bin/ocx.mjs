@@ -36,12 +36,13 @@ import { fileURLToPath } from "node:url";
 import { isRealBunBinary } from "../src/lib/bun-binary-validator.mjs";
 import { npmInvocation } from "../src/update/npm-invocation.mjs";
 import { pnpmInvocationForPath, resolvePnpmCommands } from "../src/update/pnpm-invocation.mjs";
-import { detectInstallFromPath } from "../src/update/install-detection.mjs";
+import { detectInstallOwnershipFromPath } from "../src/update/install-detection.mjs";
 import {
   pnpmOwnerInvocation,
   resolvePnpmGlobalOwner,
   runPnpmGlobalUpdate,
 } from "../src/update/pnpm-global-install.mjs";
+import { PNPM_READ_CWD, withPnpmCommandCwd, pnpmReadEnvironment } from "../src/update/pnpm-read-policy.mjs";
 import { checkRegistryPackageIntegrity } from "../src/update/registry-integrity.mjs";
 import { hasPendingTeardownIn } from "../src/config/pending-teardown-names.mjs";
 import {
@@ -49,7 +50,8 @@ import {
   runNpmCachePreflight,
 } from "../src/update/npm-cache-preflight.mjs";
 import { handoffWindowsTrayForUpdate, planWindowsTrayUpdate } from "../src/update/tray-update-plan.mjs";
-import { bootRestoreProbe, transactionalNpmUpdate } from "../src/update/transactional-install.mjs";
+import { bootRestoreProbe, launcherUsableAfterNpmUpdate, transactionalNpmUpdate } from "../src/update/transactional-install.mjs";
+import { npmUpdateFailureGuidance } from "../src/update/update-failure-guidance.mjs";
 import {
   CODEX_CLI_VERSION_MANAGER_ROOT_ENV_SLOTS,
   isCodexCliUpdateInspectionArgv,
@@ -70,7 +72,8 @@ try {
 }
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
-const installMethod = detectInstallFromPath(here, { exists: existsSync });
+const installOwnership = detectInstallOwnershipFromPath(here, { exists: existsSync });
+const installMethod = installOwnership.installer;
 const cliPath = join(here, "..", "src", "cli", "index.ts");
 const NODE_LAUNCH_CONTEXT_ENV = "OCX_NODE_LAUNCH_CONTEXT";
 const NODE_LAUNCH_PROOF_PREFIX = "--ocx-internal-launch-proof=";
@@ -206,6 +209,8 @@ function runPackageManagerSelfUpdate(manager) {
           encoding: "utf8",
           timeout: 20_000,
           windowsHide: true,
+          cwd: PNPM_READ_CWD,
+          env: pnpmReadEnvironment(unprivilegedOwnershipMutationEnvironment(process.env)),
           ...invocation.options,
         });
       },
@@ -219,6 +224,20 @@ function runPackageManagerSelfUpdate(manager) {
   const managerInvocation = args => manager === "pnpm"
     ? pnpmOwnerInvocation(owner, args)
     : npmInvocation(args);
+  // Read-only pnpm probes run from the installed package directory with project pnpmfiles
+  // disabled, so an attacker-controlled cwd cannot execute hooks during the update check.
+  const readProbeOptions = invocation => ({
+    encoding: "utf8",
+    timeout: 12000,
+    windowsHide: true,
+    ...(manager === "pnpm"
+      ? {
+        cwd: PNPM_READ_CWD,
+        env: pnpmReadEnvironment(unprivilegedOwnershipMutationEnvironment(invocation.env ?? process.env)),
+      }
+      : invocation.env ? { env: invocation.env } : {}),
+    ...invocation.options,
+  });
   const latestInvocation = managerInvocation(["view", `${PKG}@${tag}`, "version"]);
   const installArgs = manager === "pnpm"
     ? ["add", "-g", "--allow-build=bun", `${PKG}@${tag}`]
@@ -228,13 +247,7 @@ function runPackageManagerSelfUpdate(manager) {
     console.error(`opencodex: could not resolve ${manager} from a trusted absolute PATH entry; aborting before stopping the proxy.`);
     process.exit(1);
   }
-  const latestResult = spawnSync(latestInvocation.file, latestInvocation.args, {
-    encoding: "utf8",
-    timeout: 12000,
-    windowsHide: true,
-    ...(latestInvocation.env ? { env: latestInvocation.env } : {}),
-    ...latestInvocation.options,
-  });
+  const latestResult = spawnSync(latestInvocation.file, latestInvocation.args, readProbeOptions(latestInvocation));
   const latest = latestResult.status === 0 && typeof latestResult.stdout === "string" ? latestResult.stdout.trim() : "";
 
   console.log(`opencodex v${current} (installed via ${manager}, tag ${tag})`);
@@ -246,13 +259,7 @@ function runPackageManagerSelfUpdate(manager) {
   const integrity = checkRegistryPackageIntegrity(PKG, latest || null, args => {
     const invocation = managerInvocation(args);
     if (!invocation) return { status: 1 };
-    return spawnSync(invocation.file, invocation.args, {
-      encoding: "utf8",
-      timeout: 12000,
-      windowsHide: true,
-      ...(invocation.env ? { env: invocation.env } : {}),
-      ...invocation.options,
-    });
+    return spawnSync(invocation.file, invocation.args, readProbeOptions(invocation));
   });
   if (integrity.ok === false) {
     console.error(`opencodex: ${integrity.reason}; aborting before stopping the proxy.`);
@@ -445,6 +452,9 @@ function runPackageManagerSelfUpdate(manager) {
     }
     const env = mutationChildEnvironment();
     delete env.OCX_SERVICE;
+    // The restarted proxy is an ordinary owner; only a sibling's own replacement carries this.
+    delete env.OCX_SIBLING_OF_PORT;
+    delete env.OCX_SIBLING_HANDOFF_NONCE;
     console.log(`Attempting to restart the proxy on port ${bakePort}.`);
     const child = spawn(process.execPath, [postUpdateLauncher, "start", "--port", String(bakePort)], {
       detached: true,
@@ -549,6 +559,7 @@ function runPackageManagerSelfUpdate(manager) {
   };
 
   let res;
+  let npmFailure = null;
   try {
     // Stop authority is decided under the same lease the child joins. A takeover between the
     // earlier preflight and this boundary therefore blocks stop before it is sent.
@@ -588,17 +599,30 @@ function runPackageManagerSelfUpdate(manager) {
     let stopAttempted = false;
 
     function recoverStoppedRuntimeAfterFailure(reason) {
-      const recoveryOwnership = readOwnership();
-      const recoveryLiveness = currentPackageRuntimeLiveness();
-      const recovery = planStoppedRuntimeRecovery({
-        stopAttempted,
-        ...recoveryOwnership,
-        sameOwner: ownershipIdentity(recoveryOwnership) === stoppedOwnershipIdentity,
-        liveness: recoveryLiveness,
-        serviceInstalled: serviceWasInstalled,
-        launcherUsable: postUpdateLauncherUsable,
-        hadRuntimeState: hasRuntimeState,
-      });
+      const planRecovery = () => {
+        const recoveryOwnership = readOwnership();
+        const liveness = currentPackageRuntimeLiveness();
+        return {
+          liveness,
+          plan: planStoppedRuntimeRecovery({
+            stopAttempted,
+            ...recoveryOwnership,
+            sameOwner: ownershipIdentity(recoveryOwnership) === stoppedOwnershipIdentity,
+            liveness,
+            serviceInstalled: serviceWasInstalled,
+            launcherUsable: postUpdateLauncherUsable,
+            hadRuntimeState: hasRuntimeState,
+          }),
+        };
+      };
+      let { liveness: recoveryLiveness, plan: recovery } = planRecovery();
+      if (recovery.action === "service") {
+        // The service manager starts the proxy outside this process tree, so it cannot join this
+        // lease, and holding the lease through the repair's health wait keeps that proxy from
+        // starting (#5760). Release it as the successful path does, then decide again.
+        releaseUpdateLease();
+        ({ liveness: recoveryLiveness, plan: recovery } = planRecovery());
+      }
       if (recovery.reason === "ownership-unknown") {
         console.error(`opencodex: ${reason}; runtime ownership is unknown, so automatic recovery was refused. Run 'ocx status --json' and repair the service-state record before retrying.`);
       } else if (recovery.reason === "ownership-transferred") {
@@ -726,9 +750,8 @@ function runPackageManagerSelfUpdate(manager) {
           },
           log: (line) => console.log(line),
         });
-        postUpdateLauncherUsable = tx.ok
-          || tx.rolledBack === true
-          || ["stage", "verify", "swap-backup"].includes(tx.phase);
+        postUpdateLauncherUsable = launcherUsableAfterNpmUpdate(tx);
+        if (!tx.ok) npmFailure = tx;
         if (tx.ok) {
           res = { status: 0 };
         } else if (tx.phase === "stage" || tx.phase === "verify") {
@@ -750,14 +773,17 @@ function runPackageManagerSelfUpdate(manager) {
           runPnpm: (args, capture = false) => {
             const invocation = pnpmOwnerInvocation(owner, args);
             if (!invocation) return { status: 1 };
-            return spawnSync(invocation.file, invocation.args, {
+            return withPnpmCommandCwd(args, cwd => spawnSync(invocation.file, invocation.args, {
               ...invocation.options,
               stdio: capture ? "pipe" : "inherit",
               encoding: "utf8",
               timeout: 180000,
               windowsHide: true,
-              env: unprivilegedOwnershipMutationEnvironment(invocation.env ?? process.env),
-            });
+              // Reads probe from the package dir; mutations (add -g, rollback) must not
+              // keep a cwd handle inside the package Windows is replacing.
+              cwd,
+              env: pnpmReadEnvironment(unprivilegedOwnershipMutationEnvironment(invocation.env ?? process.env)),
+            }));
           },
           log: line => console.log(line),
         });
@@ -820,6 +846,13 @@ function runPackageManagerSelfUpdate(manager) {
     process.exit(0);
   }
   if (trayBeforeUpdate.restoreOnFailure && postUpdateLauncherUsable) runTrayLifecycle(postUpdateLauncher, "start");
+  if (npmFailure) {
+    // Phase-specific next step (#5624): whether the previous version is still in place decides
+    // between "retry" and "restore", and a bare reinstall must follow a stop (#5496).
+    const guidance = npmUpdateFailureGuidance({ ...npmFailure, pkgName: PKG, version: latest || undefined, tag });
+    console.error(`\nUpdate failed (npm ${npmFailure.phase}). ${guidance.lines.join(" ")}`);
+    process.exit(1);
+  }
   const manual = manager === "pnpm"
     ? `pnpm add -g --allow-build=bun ${PKG}@${tag}`
     : `npm install -g --allow-scripts=bun ${PKG}@${tag}`;
@@ -913,6 +946,19 @@ if (updateHelpRequested) {
 const codexCliUpdateInspection = isCodexCliUpdateInspectionArgv(process.argv);
 if (codexCliUpdateInspection && typeof process.versions.bun === "string") {
   console.error("opencodex: codex-cli-update inspection must use the published Node launcher.");
+  process.exit(1);
+}
+
+if (process.argv[2] === "update" && installMethod === "mise") {
+  if (installOwnership.owner) {
+    console.error(
+      `opencodex: this installation is externally managed by mise; update it with: mise upgrade ${installOwnership.owner.tool}`,
+    );
+  } else {
+    console.error(
+      "opencodex: this installation appears to be managed by mise, but its ownership metadata is unreadable or inconsistent; repair the mise installation metadata before updating.",
+    );
+  }
   process.exit(1);
 }
 

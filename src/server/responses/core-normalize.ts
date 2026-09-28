@@ -12,12 +12,15 @@ import { subagentFallbackNeedsModelEntitlements } from "../../codex/subagent-mod
 import { MAIN_CODEX_ACCOUNT_ID } from "../../codex/main-account";
 import type { RequestLogContext } from "../request-log";
 import type { HandleResponsesOptions } from "./core-options";
-import { prepareEffortNormalization } from "../effort-policy";
+import { prepareEffortNormalization, stripEmptyLadderEffort, supportedLadderFor } from "../effort-policy";
 import { resolveOpenCodeGoTransport } from "../../providers/opencode-go-transport";
 import { getOrAllocateRequestSessionLane } from "../request-log-conversation";
 import { shouldPreparePlaintextV2AgentMessages } from "../../responses/plaintext-v2-agent-messages";
+import { hasValidatedActiveReasoningEffort } from "../../responses/parser";
+import { responseTierAuthorityForProvider } from "../../providers/openai-tiers-destination";
 import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
 import { applyOpenAiVirtualModel } from "../../providers/openai-virtual-models";
+import { renameRoutedIdentityInContext } from "../../adapters/identity";
 import {
   fastPolicyForModel,
   serviceTierSupportFromPolicy,
@@ -136,6 +139,12 @@ export async function applyFinalRouteRequestNormalization(args: {
     }
     parsed.modelId = route.modelId;
   }
+  // #5221: the parser named the identity sentence from the CLIENT selector, because routing had
+  // not run when it read the body, and only the adapters that build their own system text rename
+  // it afterwards. Settle it on the id this request really sends, here where that id is final —
+  // every dispatch path (passthrough, runTurn, adapter request build) reads the context after
+  // this, and a combo child runs this for its own target.
+  parsed.context = renameRoutedIdentityInContext(parsed.context, route.modelId);
   // Transport-neutral reliability policy (#875): applies to any Responses
   // upstream whose final adapter is openai-responses, not only WS turns.
   const responsesUpstreamStreaming = route.staticPolicy.model.responsesUpstreamStreaming;
@@ -164,7 +173,8 @@ export async function applyFinalRouteRequestNormalization(args: {
   if (inboundWire === "responses" && parsed._rawBody) {
     const summary = (parsed._rawBody as { reasoning?: { summary?: unknown } }).reasoning?.summary;
     parsed.options.hideThinkingSummary = summary === "none"
-      || (!summary && route.provider.showThinkingSummary !== true);
+      || (!summary && !hasValidatedActiveReasoningEffort(parsed.options)
+        && route.provider.showThinkingSummary !== true);
   }
   if (preserveAnthropicResponseModel) parsed._responseModelId = responseModelId;
   logCtx.model = virtualModel?.selectedModelId ?? route.modelId;
@@ -195,6 +205,8 @@ export async function applyFinalRouteRequestNormalization(args: {
 
   if (parsed._responseModelId !== undefined && parsed._responseModelId !== parsed.modelId) {
     logCtx.resolvedModel = route.modelId;
+    logCtx.wireModel = route.modelId;
+    logCtx.responseModelEcho = parsed._responseModelId;
     logCtx.preserveResolvedModelFromRoute = true;
   }
 
@@ -209,14 +221,12 @@ export async function applyFinalRouteRequestNormalization(args: {
   );
   const modelServiceTierSupport = serviceTierSupportFromPolicy(fastPolicy);
   const callerTier = parsed.options.serviceTier;
-  // The ChatGPT-internal Codex backend echoes `service_tier: "default"` even on turns it
-  // scheduled as priority, so its echo cannot confirm OR deny Fast. Believing it reported every
-  // Fast request as `response-declined` (#2558). The public API's echo stays authoritative.
+  // Capture destination evidence policy separately from the unchanged outbound Fast decision.
   parsed.options.tierObservation = tierObservationContext(
     fastPolicy,
     config.fastMode,
     callerTier,
-    isCanonicalOpenAiForwardProvider(route.provider) ? false : undefined,
+    responseTierAuthorityForProvider(route.provider),
   );
   parsed.options.tierDecision = decideTier(fastPolicy, config.fastMode, callerTier);
   parsed.options.serviceTier = tierValueAfterDecision(parsed.options.tierDecision, callerTier);
@@ -269,6 +279,22 @@ export async function applyFinalRouteRequestNormalization(args: {
   }
 
   {
+    // Last word on a memory turn's effort: the phase setting is more specific than a provider-wide
+    // pin, and Codex hard-codes the phase effort with no config key of its own.
+    const phase = parsed._memoryModelPhase;
+    if (phase) {
+      const { applyMemoryModelEffort } = await import("./memory-models");
+      const applied = applyMemoryModelEffort(parsed, config, phase);
+      if (applied) {
+        logCtx.requestedEffort = applied.from ? `${applied.from}->${applied.to}` : applied.to;
+        if (isInjectionDebugEnabled()) {
+          injectionDebugLog(`[opencodex] ${route.modelId}: memory ${phase} effort applied (${applied.from ?? "none"} -> ${applied.to})`);
+        }
+      }
+    }
+  }
+
+  {
     const { applyEffortCap, effortCapAppliesTo, supportedLadderFor } = await import("../effort-policy");
     const surface = collabSurface(parsed);
     if (effortCapAppliesTo(surface, req.headers, config, parsed._compactionRequest === true)) {
@@ -294,6 +320,18 @@ export async function applyFinalRouteRequestNormalization(args: {
       const raw = parsed._rawBody as { reasoning?: { effort?: string } } | undefined;
       if (raw?.reasoning && typeof raw.reasoning === "object") raw.reasoning.effort = clamped;
       logCtx.requestedEffort = `${logCtx.requestedEffort ?? "max"}->${clamped}`;
+    }
+  }
+  // Chat ingress cannot strip effort against a provisional policy pick. Apply the
+  // concrete target's restriction to BOTH adapter options and the raw wire copy;
+  // policy-fallback retains the original body before this attempt-local mutation.
+  if (inboundWire === "chat" && supportedLadderFor(route)?.length === 0) {
+    parsed.options.reasoning = undefined;
+    const raw = parsed._rawBody as { reasoning?: unknown } | undefined;
+    if (raw) {
+      const reasoning = stripEmptyLadderEffort(raw.reasoning, []);
+      if (reasoning === undefined) delete raw.reasoning;
+      else raw.reasoning = reasoning;
     }
   }
   recordAttemptRequestedEffort(logCtx);

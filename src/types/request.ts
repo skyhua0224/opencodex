@@ -90,6 +90,16 @@ export interface OcxParsedRequest {
    * prepareOpaqueBlobRecovery after an authoritative rejection; consumers strip replayed blobs.
    */
   _stripReasoningEncryptedContent?: boolean;
+  /**
+   * Set when replayed reasoning item ids name items in a store this destination cannot read: by
+   * prepareOpaqueBlobRecovery before the one recovery rebuild, and by bindRouteReasoningReplayScope
+   * while the rejection memo is live or after a proven switch to a different destination or
+   * credential. The Responses passthrough then removes the `id` of every replayed reasoning item,
+   * whether or not it carries a blob. A stateful destination resolves a replayed id against its own
+   * store, so keeping it turns the send into `Item with id 'rs_…' not found` (#5583). A model
+   * change on the same destination and credential does not set this.
+   */
+  _dropForeignReasoningItemIds?: boolean;
   /** Final-route opt-in: emit v2 collaboration message arguments as plaintext on ChatGPT. */
   _plaintextV2AgentMessages?: boolean;
   /**
@@ -133,6 +143,12 @@ export interface OcxParsedRequest {
   _compactionRequest?: boolean;
   /** Manual compaction moved to another provider: summarize portably even on a canonical ChatGPT target. */
   _portableCompaction?: boolean;
+  /**
+   * Codex memory pipeline phase this turn belongs to, when `memoryModels` routes it
+   * (src/server/responses/memory-models.ts). Read at the effort choke point, which runs after the
+   * route is known.
+   */
+  _memoryModelPhase?: "extract" | "consolidation";
   /**
    * True when the current request newly introduced a stored compaction summary/marker. Historical
    * markers restored by previous_response_id expansion were already acknowledged and do not reset
@@ -211,8 +227,17 @@ export interface OcxImageContent {
 
 export interface OcxVideoContent {
   type: "video";
-  /** A base64 `data:` URL from an OpenAI-compatible `video_url` part. */
+  /**
+   * A base64 `data:` URL from an OpenAI-compatible `video_url` part, or a URI
+   * the upstream can fetch itself (a YouTube watch URL, a Files API uri).
+   */
   videoUrl: string;
+  /**
+   * Gemini's agentic video mode, carried verbatim from the caller's
+   * `video_url.processing` (#3271). Absent for every request that does not ask
+   * for it, so no existing traffic gains a field.
+   */
+  processing?: string;
 }
 
 /**
@@ -351,7 +376,7 @@ export interface OcxProviderContinuationState {
 }
 
 export type AdapterEvent =
-  | { type: "heartbeat"; replayUnsafe?: true }
+  | { type: "heartbeat"; replayUnsafe?: true; preflightReady?: true }
   | { type: "text_delta"; text: string; phase?: OcxMessagePhase }
   | { type: "thinking_delta"; thinking: string }
   // Anthropic extended-thinking round-trip: signature_delta for the current thinking block, and
@@ -428,6 +453,8 @@ export interface OcxUrlCitation {
  * - `totalTokens` = inputTokens + outputTokens. Never re-add cache detail on top.
  */
 export interface OcxUsage {
+  /** Provider-reported credit spend, independent of token estimates and USD pricing. */
+  providerCredits?: number;
   inputTokens: number;
   outputTokens: number;
   /**

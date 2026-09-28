@@ -21,7 +21,9 @@ import {
   localClientSkipMessage,
   setIntegrationEnabled,
   shouldSyncCodexOnStart,
+  type LocalClientSkipReason,
 } from "../codex/desired-state";
+import { siblingSkipMessage } from "../codex/sibling-start";
 import { syncModelsToCodex } from "../codex/sync";
 import { collectOrcaCodexHomeDiagnostic } from "../codex/home";
 import { restoreNativeCodexAsync, type CodexNativeRestoreResult } from "../codex/inject";
@@ -30,6 +32,7 @@ import { handleRestartScopeAfterWrite, readRestartScope, type RestartScope } fro
 import { normalizeUpdateChannel, runGuiUpdateWorker } from "../update/job";
 import { isJsonOption, takeFlag, terminalSafeError } from "./runtime-api";
 import { printStopSummary, type StopOutcome } from "./stop-report";
+import { parseStopApproval, type StopApproval } from "./stop-approval";
 import type { ResolveArgs } from "./resolve";
 import type { ClientConnectionState } from "../client/state";
 import { OCX_NATIVE_REPLAY_RECOVERY_NOTE } from "../responses/compaction";
@@ -46,7 +49,7 @@ export interface CliDispatchDeps {
   /** Spawn a detached proxy child (stdio ignore, unref'd, provenance env). */
   spawnDetached: (argv: readonly string[]) => void;
   handleStart: () => Promise<void>;
-  handleStop: () => Promise<StopOutcome>;
+  handleStop: (approval?: StopApproval) => Promise<StopOutcome>;
   handleEnsure: (options?: { existingIsSuccess?: boolean }) => Promise<boolean>;
   handleResolve: (args: ResolveArgs) => Promise<number>;
   handleTrayProxyStart: (existingIsSuccess?: boolean) => Promise<boolean>;
@@ -99,10 +102,15 @@ const commandRunners: Record<string, CommandRunner> = {
     return Number(process.exitCode ?? 0);
   },
   stop: async deps => {
+    const parsed = parseStopApproval(deps.args.slice(1));
+    if (!parsed.ok) {
+      console.error("Usage: ocx stop [--json [--expect-pid <pid> --expect-port <port> --expect-hostname <host> --expect-config-home <home> --expect-cli-version <version> --expect-compatibility-token <hex>]]");
+      return 64;
+    }
     // Downtime warning lives HERE, not in handleStop: `restart`/tray-restart callers
     // re-start the proxy immediately, so warning there would contradict the next line.
     const warning = "⚠️  Codex/Claude requests through the proxy will fail until it is restarted ('ocx start' or 'ocx service start').";
-    if (!takeFlag(deps.args.slice(1), "--json")) {
+    if (!parsed.json) {
       // handleStop returns the structured outcome now; an object is always truthy, so
       // the warning must key on .ok — otherwise a failed stop would still claim downtime.
       if ((await deps.handleStop()).ok) console.log(warning);
@@ -117,7 +125,7 @@ const commandRunners: Record<string, CommandRunner> = {
     console.log = console.error;
     let outcome: StopOutcome | undefined;
     try {
-      outcome = await deps.handleStop();
+      outcome = await deps.handleStop(parsed.approval ?? undefined);
       if (outcome.ok) console.log(warning);
     } finally {
       console.log = humanLog;
@@ -125,7 +133,9 @@ const commandRunners: Record<string, CommandRunner> = {
     // A throw above propagates after the finally restores the console, so reaching here
     // with an undefined outcome cannot happen; the guard keeps the assignment provable.
     if (outcome) printStopSummary(outcome.summary);
-    return Number(process.exitCode ?? 0);
+    // A guarded refusal never reaches the code that records process.exitCode, so the
+    // approval-bound form answers with its summary's code; plain stop keeps its contract.
+    return parsed.approval ? (outcome?.summary.exitCode ?? 1) : Number(process.exitCode ?? 0);
   },
   resolve: async deps => {
     // Same fail-closed shape as `ready`: parseCliHead pre-parsed the verb before any
@@ -502,7 +512,7 @@ const commandRunners: Record<string, CommandRunner> = {
             },
             config,
             port: live.port,
-          }, ["mcode", "pi", "raycast", "omo", "cline"]));
+          }, ["mcode", "pi", "raycast", "omo", "cline", "droid"]));
         } catch (error) {
           console.warn(`Client integrations were not refreshed: ${error instanceof Error ? error.message : String(error)}`);
         }
@@ -531,6 +541,10 @@ const commandRunners: Record<string, CommandRunner> = {
     const { handleConnectCommand } = await import("./connect");
     return await handleConnectCommand(deps.args.slice(1));
   },
+  link: async deps => {
+    const { runLinkCommand } = await import("./link");
+    return await runLinkCommand(deps.args.slice(1), { findLiveProxy: deps.findLiveProxy });
+  },
   "remote-workspace": async deps => {
     const { runRemoteWorkspaceCommand } = await import("./remote-workspace");
     return await runRemoteWorkspaceCommand(deps.args.slice(1));
@@ -547,24 +561,24 @@ const commandRunners: Record<string, CommandRunner> = {
     const cacheArgs = deps.args.slice(1);
     const restartScope = readRestartScope(cacheArgs, console);
     const { withCatalogWriteSerialization } = await import("../codex/catalog-write-serialization");
-    const { invalidateCodexModelsCacheWithPermit } = await import("../codex/catalog/sync");
+    const { invalidateCodexModelsCacheWithPermitOutcome } = await import("../codex/catalog/sync");
     const { getCodexHome } = await import("../codex/paths");
-    const { readCodexCatalogPathForHome } = await import("../codex/catalog/parsing");
-    const { existsSync } = await import("node:fs");
     const owningCodexHome = getCodexHome();
     const cacheGateSnapshot = deps.loadConfig();
     const desiredDisabled = !shouldSyncCodexOnStart(cacheGateSnapshot);
     const invalidated = withCatalogWriteSerialization(owningCodexHome, permit =>
-      invalidateCodexModelsCacheWithPermit(permit, owningCodexHome, { allowWhenDesiredDisabled: true }));
+      invalidateCodexModelsCacheWithPermitOutcome(permit, owningCodexHome, { allowWhenDesiredDisabled: true }));
     const cacheJson = cacheArgs.includes("--json");
     const jsonSafeLog = cacheJson
       ? { log: (...values: unknown[]) => console.error(...values), error: (...values: unknown[]) => console.error(...values) }
       : console;
     // Only warn/restart when models_cache was actually rewritten from a readable catalog.
-    if (invalidated.kind === "completed" && invalidated.value) {
+    if (invalidated.kind === "completed" && invalidated.value === "written") {
       await handleRestartScopeAfterWrite(restartScope, jsonSafeLog);
-    } else if (desiredDisabled && !cacheJson) {
-      // Worth saying in the human path, because it explains why nothing was written.
+    } else if (!cacheJson && invalidated.kind === "completed" && invalidated.value === "desired_disabled") {
+      // Only when the OFF gate itself stopped the write does OFF explain the outcome. An
+      // explicit sync-cache refreshes regardless of the toggle, so an unchanged cache, a
+      // missing catalog, or a contended writer is reported below on its own terms.
       // Under --json this belongs on the envelope, not as a second stdout line.
       console.log(localClientSkipMessage(
         cacheGateSnapshot,
@@ -572,8 +586,8 @@ const commandRunners: Record<string, CommandRunner> = {
         "No catalog or cache write resulted.",
       ));
     }
-    // `completed` with a falsy value means the cache was NOT rewritten. Previously every
-    // outcome exited 0, so a script could not tell a refreshed cache from a skipped one.
+    // An identical cache is a successful no-op, not a failed refresh. Only a real write
+    // should restart Codex; a missing catalog or contended writer is also a benign skip.
     //
     // Losing the catalog write lock to another process is a skip, not a failure:
     // serialization working as designed is the expected outcome under concurrency, and a
@@ -588,30 +602,25 @@ const commandRunners: Record<string, CommandRunner> = {
     // means the user asked for it regardless of the toggle. Treating OFF as automatic success
     // would report exit 0 and `skipped: true` for a refresh that actually failed.
     //
-    // But `invalidateCodexModelsCacheWithPermit` returns a bare boolean for four different
-    // situations -- wrote it, no catalog file exists, the OFF gate fired, or it threw -- so
-    // `false` alone cannot be read as failure either. `!existsSync(catalogPath)` is a
-    // legitimate nothing-to-do: with no catalog there is no cache to derive, which is the
-    // normal state of a fully native home and the case
-    // `codex-composed-acceptance.test.ts` pins at exit 0. It is checked here rather than by
-    // widening that function's return type, because its boolean is consumed by a dozen
-    // management routes that have no use for the distinction.
-    const wrote = invalidated.kind === "completed" && Boolean(invalidated.value);
+    // The detailed outcome distinguishes an unchanged cache from a failed rewrite while
+    // the boolean wrapper remains available to callers that only care whether bytes changed.
+    const wrote = invalidated.kind === "completed" && invalidated.value === "written";
+    const unchanged = invalidated.kind === "completed" && invalidated.value === "unchanged";
     const contended = invalidated.kind === "unavailable" && invalidated.reason === "busy";
-    const noCatalog = !wrote && !existsSync(readCodexCatalogPathForHome(owningCodexHome));
-    const ok = wrote || contended || noCatalog;
+    const noCatalog = invalidated.kind === "completed" && invalidated.value === "missing_catalog";
+    const ok = wrote || unchanged || contended || noCatalog;
     if (cacheJson) {
       console.log(JSON.stringify({
         schemaVersion: 1,
         ok,
         wrote,
-        skipped: contended || noCatalog,
+        skipped: unchanged || contended || noCatalog,
         outcome: invalidated.kind,
         // `outcome` alone cannot separate a contended lock from a hard serialization
         // failure -- both are `unavailable`. Carry the reason so a caller can.
         reason: invalidated.kind === "unavailable" ? invalidated.reason : undefined,
-        // Which of the two benign skips this was, so `skipped: true` is never opaque.
-        skippedReason: contended ? "contended" : noCatalog ? "no_catalog" : undefined,
+        // Which of the three benign skips this was, so `skipped: true` is never opaque.
+        skippedReason: unchanged ? "unchanged" : contended ? "contended" : noCatalog ? "no_catalog" : undefined,
         desiredDisabled,
         codexHome: owningCodexHome,
       }, null, 2));
@@ -619,6 +628,8 @@ const commandRunners: Record<string, CommandRunner> = {
       console.log("Another process owns the catalog write; cache sync skipped.");
     } else if (noCatalog) {
       console.log("No Codex catalog to derive a cache from; nothing to sync.");
+    } else if (unchanged) {
+      console.log("Codex model cache is already current; nothing to sync.");
     } else if (!ok) {
       console.error(`Cache refresh did not complete (${invalidated.kind}). The Codex model cache was not rewritten.`);
     }
@@ -683,13 +694,15 @@ const commandRunners: Record<string, CommandRunner> = {
     switch (deps.args[1]) {
       case "install": {
         const r = installCodexShim();
+        const { healthy, summary } = diagnoseCodexShim();
         const { collectCodexShimReadinessWarnings } = await import("./codex-shim-readiness");
-        const warnings = diagnoseCodexShim().healthy
+        const warnings = healthy
           ? collectCodexShimReadinessWarnings()
           : [];
         console.log(`${r.installed && warnings.length === 0 ? "✅ " : "⚠️  "}${r.message}`);
         for (const warning of warnings) console.warn(`   ${warning}`);
-        break;
+        if (!healthy) console.error(`Codex shim installation is unhealthy: ${summary}`);
+        return healthy ? 0 : 1;
       }
       case "status":
         console.log(codexShimStatus());
@@ -723,6 +736,15 @@ const commandRunners: Record<string, CommandRunner> = {
     const { refreshVersionCache } = await import("../update/notify");
     const channel = deps.args[1] === "preview" ? "preview" : "latest";
     await refreshVersionCache(channel);
+    return 0;
+  },
+  "__update-badge": async deps => {
+    if (deps.args.length !== 1) {
+      console.error("Usage: ocx __update-badge");
+      return 64;
+    }
+    const { readUpdateBadge } = await import("../update/badge");
+    console.log(JSON.stringify(readUpdateBadge()));
     return 0;
   },
   "__tray-start": async deps => {
@@ -878,6 +900,10 @@ const commandRunners: Record<string, CommandRunner> = {
     const { handleAccessCommand } = await import("./access");
     return await handleAccessCommand(["key", ...deps.args.slice(1)]);
   },
+  api: async deps => {
+    const { handleApiCommand } = await import("./api-protocols");
+    return await handleApiCommand(deps.args.slice(1));
+  },
   export: async deps => {
     const { handleExportCommand } = await import("./export-command");
     return await handleExportCommand(deps.args.slice(1));
@@ -977,7 +1003,7 @@ export const DISPATCH_ALIASES: ReadonlyMap<string, string> = aliasTargets;
 /** Resolve the runner key for a command, following registry aliases to the
  * canonical runner. Returns undefined when the command is unknown. */
 /** What `handleStart` does about a live proxy it found before binding. */
-export type StartOwnerDecision = "refuse" | "service-stay-out" | "sibling";
+export type StartOwnerDecision = "refuse" | "service-stay-out" | "sibling" | "await-parent";
 
 /**
  * Pure decision for `handleStart` when the pre-bind probe found a live proxy.
@@ -989,19 +1015,72 @@ export type StartOwnerDecision = "refuse" | "service-stay-out" | "sibling";
  * decision allows isolated homes on one machine to remain independent.
  * The service wrapper always passes the configured port and keeps its exact
  * stay-out-of-the-way semantics: it never takes the sibling path.
+ *
+ * `"await-parent"` comes first and only for an exact pid match: the live proxy is the draining
+ * process that spawned this start as its restart replacement (`OCX_RESTART_PARENT_PID`, already
+ * checked against the real parent pid). Refusing it would leave no proxy once that parent exits,
+ * so the caller waits for it instead (`src/cli/restart-handoff.ts`). Every other owner, and a
+ * live proxy whose pid could not be verified, keeps the table above.
  */
 export function decideStartWithLiveOwner(input: {
   livePort: number;
   requestedPort: number | undefined;
   ocxService: string | undefined;
+  livePid?: number | null;
+  restartParentPid?: number | null;
 }): StartOwnerDecision {
+  if (input.restartParentPid != null && input.livePid === input.restartParentPid) return "await-parent";
   const sibling = input.requestedPort !== undefined
     && input.requestedPort !== input.livePort
-    // Only the exact "1" sentinel is service context — the same check syncCleanup
+    // Only the exact "1" sentinel is service context — the same check the exit teardown
     // uses — so an env value like "0" or "false" cannot reach the stay-out path.
     && input.ocxService !== "1";
   if (sibling) return "sibling";
   return input.ocxService === "1" ? "service-stay-out" : "refuse";
+}
+
+/** Which shared client state `handleStart`'s exit cleanup tears down. */
+export interface StartExitTeardown {
+  revertSystemEnv: boolean;
+  restoreNativeCodex: boolean;
+  stripGrokConfig: boolean;
+}
+
+/**
+ * Pure exit-teardown decision for `handleStart`'s `syncCleanup`.
+ *
+ * A sibling instance tears down nothing: the Codex routing, the Grok fence and the system env
+ * belong to the live proxy it runs beside, and restoring them would take Codex off a proxy that
+ * is still serving it (`src/codex/sibling-start.ts`). A dashboard drain-and-restart (#563) keeps
+ * everything for the replacement process. Under a service manager — only the exact `"1"`
+ * sentinel — a crash/respawn keeps routing and the fence, and only the environment comes down.
+ * The caller still applies its own external-provider and service-ownership checks.
+ */
+export function decideStartExitTeardown(input: {
+  sibling: boolean;
+  recycling: boolean;
+  ocxService: string | undefined;
+}): StartExitTeardown {
+  if (input.sibling || input.recycling) {
+    return { revertSystemEnv: false, restoreNativeCodex: false, stripGrokConfig: false };
+  }
+  const preserveRouting = input.ocxService === "1";
+  return { revertSystemEnv: true, restoreNativeCodex: !preserveRouting, stripGrokConfig: !preserveRouting };
+}
+
+/**
+ * The one startup line for "nothing was written to Codex".
+ *
+ * Three very different facts reach it: the user's own OFF switch, a hub declining to rewrite its
+ * own local clients, and a sibling instance leaving the live proxy's routing alone. Printing the
+ * toggle's wording for the gate is what made operators hunt for a switch they never set (#4236).
+ * `port` is the sibling's own bound port, named in its line.
+ */
+export function startupLeftCodexNativeLine(reason: LocalClientSkipReason, port?: number): string {
+  if (reason === "sibling") return `   ${siblingSkipMessage(port)}`;
+  return reason === "hub-gated"
+    ? `   ${HUB_GATED_SKIP_MESSAGE} Startup left Codex native.`
+    : "   Codex integration OFF; startup left Codex native.";
 }
 
 /** What `chooseListenPort` does when the preferred port stayed busy through prefer-retry. */
@@ -1035,7 +1114,7 @@ export type BusyPreferredPortDecision =
  *
  * Service-wrapper context keeps the semantics `decideStartWithLiveOwner` gives it: a
  * healthy proxy on the port means the port is served, and the wrapper's
- * `if %ERRORLEVEL% NEQ 0` loop must see a zero exit rather than respawn every 5 seconds.
+ * retry loop must receive the intentional stay-out signal rather than respawn every 5 seconds.
  */
 export function decideBusyPreferredPort(input: {
   preferredPort: number;

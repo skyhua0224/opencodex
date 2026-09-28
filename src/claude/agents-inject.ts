@@ -23,6 +23,7 @@ import { effectiveBlockedSkillNames, resolveInboundModel } from "./inbound";
 import { AnthropicRequestError } from "./inbound-records";
 import { knownModelIdsForProvider } from "../router";
 import { decodeRoutedModelIdOrThrow } from "../providers/slug-codec";
+import { siblingOfLivePort } from "../codex/sibling-start";
 
 export interface ClaudeAgentDef {
   file: string;
@@ -36,6 +37,7 @@ export interface ClaudeAgentDef {
 const OWNED_PREFIX = "ocx-";
 /** Ownership proof (audit 071 #2): a file without this marker is NEVER touched. */
 const GENERATED_MARKER = "generated-by: opencodex";
+const SAFE_AGENT_MODEL_ID = /^[a-z0-9][a-z0-9._:/@+\[\]~-]*$/i;
 
 function sanitizeName(value: string): string {
   const cleaned = value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
@@ -156,7 +158,7 @@ export function buildClaudeAgentDefs(
   const roster = rosterOverride
     ?? (config.subagentModels === undefined ? DEFAULT_SUBAGENT_MODELS : config.subagentModels);
   for (const entry of roster.slice(0, 5)) {
-    if (typeof entry !== "string" || entry.trim() === "") continue;
+    if (typeof entry !== "string" || !SAFE_AGENT_MODEL_ID.test(entry.trim())) continue;
     const { alias, id, provider } = entryParts(entry.trim(), config);
     push(sanitizeName(id), alias, `Delegate work to ${id} (${provider}) via opencodex routing. General-purpose worker/explorer on that model. ${NO_MODEL_ARG}`);
   }
@@ -284,6 +286,9 @@ export function injectClaudeAgentDefs(
   /** Hub-sourced roster on a connected client; see `buildClaudeAgentDefs`. */
   rosterOverride?: readonly string[],
 ): string[] | null {
+  // `~/.claude/agents` is shared with the live proxy a sibling instance runs beside, which owns
+  // both its roster and its pruning (`src/codex/sibling-start.ts`).
+  if (siblingOfLivePort() !== null) return null;
   if (config.claudeCode?.enabled === false || config.claudeCode?.injectAgents === false) {
     // Disabled: prune verified-owned files so stale definitions stop loading
     // in future sessions (audit 071 #3). The roster override is irrelevant here by

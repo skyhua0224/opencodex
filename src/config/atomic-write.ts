@@ -73,6 +73,8 @@ export interface AtomicWriteHooks {
   afterTempWrite?: (tempPath: string, targetPath: string) => void;
   beforeRename?: (tempPath: string, targetPath: string) => void;
   validateBeforeRename?: (targetPath: string) => void;
+  /** Publication receipt; runs before any post-rename cleanup can fail. */
+  afterRename?: (targetPath: string) => void;
 }
 
 export class AtomicWriteResidualTempError extends Error {
@@ -277,8 +279,9 @@ function atomicWriteFileToTarget(
   target: string,
   io?: AtomicWriteIO,
   hooks: AtomicWriteHooks = {},
+  recordOwnership = true,
 ): void {
-  recordOwnedConfigPath(getConfigDir(), path);
+  if (recordOwnership) recordOwnedConfigPath(getConfigDir(), path);
   assertResolvedTargetAllowed(path, target);
   const tmp = `${target}.ocx.${process.pid}.${nextAtomicTempSequence()}.tmp`;
   let hardened = false;
@@ -313,6 +316,7 @@ function atomicWriteFileToTarget(
     hooks.beforeRename?.(tmp, target);
     hooks.validateBeforeRename?.(target);
     effective.rename(tmp, target);
+    hooks.afterRename?.(target);
     // The rename is only as durable as the directory entry recording it. Fsyncing the temp's
     // CONTENT and then losing the entry in a power cut leaves the old file in place, or the
     // directory in an indeterminate state, while the caller was told the replacement landed.
@@ -397,6 +401,16 @@ export function atomicWriteFileNoFollow(
   // OS alias above the configured root (a home junction, /tmp) is legitimate
   // and Windows cannot exclusive-create a temp through a junction.
   atomicWriteFileToTarget(path, content, join(resolveWriteTarget(dirname(path)), basename(path)), io, hooks);
+}
+
+/**
+ * The no-follow replacement above, for rewriting a file whose uninstall ownership must stay as
+ * it was: it does not record the path in the owner manifest. Used to rewrite the OAuth downgrade
+ * backup, which a pre-registration install may have left deliberately unclaimed; claiming it
+ * here would let a later uninstall delete recovery data it never owned.
+ */
+export function atomicWriteFileNoFollowUnclaimed(path: string, content: string): void {
+  atomicWriteFileToTarget(path, content, join(resolveWriteTarget(dirname(path)), basename(path)), undefined, {}, false);
 }
 
 export interface AtomicWriteAsyncIO {

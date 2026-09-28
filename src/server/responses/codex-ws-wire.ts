@@ -94,12 +94,6 @@ export type CodexWsStageRecord = Omit<CodexWsFailureStage, "requestBytes"> & {
   closeCode: number | null;
   /** True when the exchange ran on a pooled, previously used session. */
   reused: boolean;
-  /**
-   * True when that pooled session was opened by an EARLIER turn of the same conversation, i.e. the
-   * exchange ran on the cross-turn half of the pool. Persisted so the two halves of the lane can be
-   * compared on failures and first bytes instead of being argued about.
-   */
-  crossTurn: boolean;
   /** OpenCodex version that produced this record. */
   ocxVersion: string;
   /** Bun runtime version the exchange gated on. */
@@ -154,49 +148,6 @@ export function codexWsPreResponseFailure(status: 502 | 504, message: string, pr
   return response;
 }
 
-/**
- * A capacity decline the origin stated outright, settled so the caller MAY send the turn again.
- *
- * {@link codexWsPreResponseFailure} is deliberately non-replayable: a socket that died mid-send is
- * ambiguous and the turn may be running. A DECLINE is not ambiguous -- the backend answered "not
- * now" before producing anything -- and the difference is the whole reason this helper exists.
- * Measured 2026-09-23/24: every shed that reached the client arrived as a decline after the
- * prelude, was absorbed once by an in-socket resend, and then settled as a failure anyway (12 of 12
- * absorbs in the log stopped at rung 1), because the second decline is not always an \`error\` frame
- * and the socket is not always still open. Returning a replayable 503 instead lets the caller's
- * capacity ladder re-dial a FRESH socket with its own pacing, which is the path that has been
- * proven to work end to end.
- */
-export function codexWsCapacityDeclineFailure(status: 502 | 503, message: string, prelude: Headers): Response {
-  const headers = new Headers(prelude);
-  headers.set("content-type", "application/json");
-  headers.set("cache-control", "no-store");
-  return new Response(JSON.stringify({
-    error: { type: "server_error", code: "server_is_overloaded", message },
-  }), { status, headers });
-}
-
-/** A socket that was reused for a later turn did not serve it. */
-export const CODEX_WS_REUSED_SOCKET_CODE = "reused_socket_declined";
-
-/**
- * The settlement for a reused socket that answered the new turn with a verdict, or with nothing.
- *
- * Not the overload shape {@link codexWsCapacityDeclineFailure} carries: the socket, not the origin's
- * capacity, is what failed here, and a decline that said nothing about capacity must not be counted
- * as one. It IS replayable, exactly like the capacity decline -- the whole point of giving up on a
- * reused socket is that the caller's ladder immediately re-dials a fresh one, which is the path
- * that has always worked.
- */
-export function codexWsReusedSocketFailure(message: string, prelude: Headers): Response {
-  const headers = new Headers(prelude);
-  headers.set("content-type", "application/json");
-  headers.set("cache-control", "no-store");
-  return new Response(JSON.stringify({
-    error: { type: "upstream_error", code: CODEX_WS_REUSED_SOCKET_CODE, message },
-  }), { status: 502, headers });
-}
-
 const CLOSED_BEFORE_TERMINAL = "codex websocket closed before a Responses terminal event";
 
 /**
@@ -225,6 +176,14 @@ export type CodexWsFailureStage = {
   relayedEvents: number;
   /** Milliseconds from send to the first upstream frame; null when none arrived. */
   firstFrameMs: number | null;
+  /**
+   * Milliseconds from send to the first non-control Responses event (a
+   * `response.*` or `error` frame the relay would hand downstream); null when
+   * none arrived. `firstFrameMs` alone cannot separate "the peer answered with
+   * quota metadata and went quiet" from "the peer was still working": the
+   * first measures any frame, this one measures the turn's own start (#4191).
+   */
+  firstResponseMs: number | null;
   /** Milliseconds from send to this failure; null when the failure predates the send. */
   elapsedMs: number | null;
   /** Liveness pings the exchange sent while waiting for the first response event. */
@@ -263,10 +222,10 @@ export function classifyCodexWsFailure(stage: CodexWsFailureStage): CodexWsFailu
  * whose failures cannot be compared with anything else, which is the reported symptom -- every
  * such failure reached the user as one of two bare sentences.
  *
- * It does not relax the transport's own rule. The no-replay-after-send contract in
- * `codex-ws-exchange.ts` holds regardless of what this returns, and the stage below is
- * deliberately not consulted as a fallback-eligibility signal; it reports where the exchange got
- * to, and `resendPermission` happens to agree that everything past `before-send` is refused.
+ * It does not relax the transport's own rule. The stage below reports where the exchange got to,
+ * and `resendPermission` agrees that everything past `before-send` is refused. When a socket dies
+ * under the send, this stage is what the resend gate is asked with (#4191), so the operator's
+ * `retryOnReset` grant is the only way past that refusal, as it is for an HTTP reset.
  */
 export const CODEX_WS_FAILURE_PROJECTION = {
   /** The create frame never left, so the origin provably never saw this turn. */
@@ -285,6 +244,29 @@ export function projectCodexWsFailure(
   return CODEX_WS_FAILURE_PROJECTION[classifyCodexWsFailure(stage)];
 }
 
+const socketDeathStages = new WeakMap<Response, RequestFailureStage>();
+
+/**
+ * Record that a pre-response settle came from the socket closing or failing under the send (#4191),
+ * rather than from silence, a refused frame or a local limit.
+ *
+ * A fact about how the exchange ended, not a grant. The settle is the same non-replayable 502
+ * either way; whether the turn may go out once more is the resend gate's question, and only the
+ * operator's `retryOnReset` grant can answer it yes.
+ */
+export function markCodexWsSocketDeath(response: Response, stage: CodexWsFailureStage): void {
+  socketDeathStages.set(response, projectCodexWsFailure(stage).stage);
+}
+
+/**
+ * Where the send stood when its socket died: `pre-header` when nothing came back and
+ * `protocol-prelude` when frames arrived but none was a Responses event. Undefined for every other
+ * response.
+ */
+export function codexWsSocketDeathStage(response: Response): RequestFailureStage | undefined {
+  return socketDeathStages.get(response);
+}
+
 /**
  * Render the stage as a suffix appended to an existing failure message.
  *
@@ -297,7 +279,8 @@ export function codexWsFailureDetail(stage: CodexWsFailureStage): string {
   return ` [cause=${classifyCodexWsFailure(stage)} request=${stage.requestBytes}B`
     + ` sent=${stage.sent ? "yes" : "no"} frames=${stage.upstreamFrames}`
     + ` control=${stage.controlFrames} relayed=${stage.relayedEvents}`
-    + ` first-frame=${duration(stage.firstFrameMs)} elapsed=${duration(stage.elapsedMs)}`
+    + ` first-frame=${duration(stage.firstFrameMs)} first-response=${duration(stage.firstResponseMs)}`
+    + ` elapsed=${duration(stage.elapsedMs)}`
     + ` pings=${stage.pings} pongs=${stage.pongs}]`;
 }
 

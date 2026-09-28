@@ -6,6 +6,13 @@ import {
   type OwnershipInspection,
 } from "../../integrations/native/ownership-preflight";
 import { registerCodexQuotaAutoRefreshWorker } from "../../codex/quota-auto-refresh";
+import type {
+  ObservePackageTree,
+  PackageTreeIntegrityOptions,
+  PackageTreeRuntimeInstall,
+} from "../../lib/package-tree-integrity";
+import type { PackageTreeRetargetOptions } from "../../lib/package-tree-retarget";
+import type { MiseLauncherTargetWatchPlan } from "../../update/mise-launcher-target";
 import {
   consumeForInspection,
   relaySseWithHeartbeat,
@@ -141,6 +148,22 @@ export interface StartServerDeps {
   readinessGate?: ReadinessGate;
   /** Test-only package-tree observation; production captures package.json identity at boot. */
   packageTreeIntegrity?: PackageTreeIntegrityGuard;
+  /** Test-only default-guard options; production observes the installed package manifest. */
+  packageTreeIntegrityOptions?: PackageTreeIntegrityOptions;
+  /** Test-only installed-package identity; production detects the current install. */
+  packageTreeInstaller?: PackageTreeRuntimeInstall;
+  /** Test-only manifest observer; production stats the installed package.json. */
+  observePackageTree?: ObservePackageTree;
+  /** Test-only restart acceptor; production uses the normal drain-and-restart path. */
+  acceptSystemRestart?: typeof import("../management/system-restart").acceptSystemRestart;
+  /** Test-only: whether this process is a service child, for the package-tree restart. */
+  packageTreeServiceChild?: () => boolean;
+  /** Test-only: whether this service child still owns its service home. */
+  packageTreeServiceHomeOwned?: () => boolean;
+  /** Test-only launcher plan; production plans from the mise owner and service state. Null disables. */
+  packageTreeLauncherTarget?: MiseLauncherTargetWatchPlan | null;
+  /** Test-only retarget-watch timing and version seams. */
+  packageTreeRetargetOptions?: PackageTreeRetargetOptions;
   /** Test-only seam for observing quota-worker registration ownership. */
   registerCodexQuotaAutoRefreshWorker?: typeof registerCodexQuotaAutoRefreshWorker;
 }

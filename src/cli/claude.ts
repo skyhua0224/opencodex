@@ -10,7 +10,7 @@
 import { spawn } from "node:child_process";
 import { loadConfig } from "../config";
 import { injectClaudeAgentDefs } from "../claude/agents-inject";
-import { CLAUDE_ALIAS_PREFIX_V1, CLAUDE_ALIAS_PREFIX_V2 } from "../claude/alias";
+import { CLAUDE_ALIAS_PREFIX_CURRENT, CLAUDE_ALIAS_PREFIX_CURRENT_V2, CLAUDE_ALIAS_PREFIX_V1, CLAUDE_ALIAS_PREFIX_V2 } from "../claude/alias";
 import { claudeToolSearchEnv, effectiveModelEnv, resolveAutoContext } from "../claude/context-windows";
 import { claudeConfigDir, refreshGatewayModelCacheFromProxy } from "../claude/gateway-cache";
 import { commandInvocation } from "../lib/win-exec";
@@ -30,8 +30,11 @@ import { readServiceApiTokenState, type ServiceApiTokenState } from "../lib/serv
 import { DEFAULT_CATALOG_PATH } from "../codex/paths";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { aliasForNative, aliasForRoute } from "../claude/alias";
+import { aliasForNative, aliasForRoute, legacyAliasForNative, legacyAliasForRoute } from "../claude/alias";
 import { desktop3pAlias } from "../claude/desktop-3p";
+import { inspectDesktopFirstParty } from "../claude/desktop-first-party";
+import { isClaudeInterceptProxyUrl, type ClaudeInterceptSettingsState } from "../claude/intercept/settings";
+import { withoutSiblingMarker } from "../codex/sibling-start";
 
 export interface ClaudeLaunchEnv {
   [key: string]: string | undefined;
@@ -52,6 +55,8 @@ export type ClaudeEnvDeps = {
   preBunAnthropicSlots?: readonly AnthropicParentEnvSlot[] | null;
   /** Explicit unsafe opt-in from a root `--dangerously-skip-permissions` launch. */
   allowRootSkipPermissions?: boolean;
+  ownedInterceptSettings?: ClaudeInterceptSettingsState;
+  warn?: (line: string) => void;
 };
 
 function deleteUntrustedAnthropicSlots(env: ClaudeLaunchEnv, deps: ClaudeEnvDeps): void {
@@ -373,12 +378,13 @@ export function buildClaudeEnv(
   // worse than the problem. So this stays opt-in per config rather than
   // unconditional, and setDefault keeps an operator's own export.
   setDefault("ENABLE_TOOL_SEARCH", claudeToolSearchEnv(config.claudeCode?.toolSearch));
-  // Context-window override: the official pair — MAX_CONTEXT_TOKENS alone is ignored
-  // for recognized claude-shaped ids unless DISABLE_COMPACT=1 rides along (devlog 135).
   const maxCtx = config.claudeCode?.maxContextTokens;
   if (typeof maxCtx === "number" && Number.isFinite(maxCtx) && maxCtx > 0) {
     setDefault("CLAUDE_CODE_MAX_CONTEXT_TOKENS", String(Math.floor(maxCtx)));
-    setDefault("DISABLE_COMPACT", "1");
+    // Claude Code 2.1.278 honors this without DISABLE_COMPACT when the model id
+    // does not start with "claude-" (gF). Current ocx-claude aliases qualify.
+    // A persisted claude-ocx id is still claude-shaped, so that one session keeps
+    // the 200k accounting until the picker is moved to the new id.
   }
   // Auto-context (devlog 260712 020): min(believed window, env) inside the CLI means
   // one global env acts as a per-model floor — [1m]-marked models compact here while
@@ -464,10 +470,15 @@ export function readConnectedClaudeContextWindows(path = DEFAULT_CATALOG_PATH): 
         const id = slug.slice(slash + 1);
         const routeAlias = aliasForRoute(provider, id);
         if (routeAlias) put(routeAlias, contextWindow);
+        // A selector saved under the legacy claude-ocx spelling keeps its window here too.
+        const legacyRoute = legacyAliasForRoute(provider, id);
+        if (legacyRoute) put(legacyRoute, contextWindow);
         put(desktop3pAlias(provider, id), contextWindow);
       } else {
         const nativeAlias = aliasForNative(slug);
         if (nativeAlias) put(nativeAlias, contextWindow);
+        const legacyNative = legacyAliasForNative(slug);
+        if (legacyNative) put(legacyNative, contextWindow);
         put(desktop3pAlias("native", slug), contextWindow);
       }
     }
@@ -485,7 +496,8 @@ export async function ensureProxyForClaude(deps: ClaudeProxyEnsureDeps = {}): Pr
   // A proxy that has only just bound can miss a single probe while its event loop
   // is still settling startup work — the same just-started race the stop paths
   // already retry for (#764, SERVICE_STOP_LIVENESS). Only the attempts budget is
-  // borrowed here; the probe timeout remains DEFAULT_PROBE_TIMEOUT_MS (750 ms).
+  // borrowed here; the probe timeout remains DEFAULT_PROBE_TIMEOUT_MS (750 ms unless
+  // OCX_PROBE_TIMEOUT_MS raises it).
   // Without this, `ocx claude` can spawn a second proxy while the first is serving.
   const live = await (deps.findLiveProxy ?? findLiveProxy)({ attempts: 3 });
   if (live) return live.port;
@@ -495,7 +507,8 @@ export async function ensureProxyForClaude(deps: ClaudeProxyEnsureDeps = {}): Pr
     detached: true,
     stdio: "ignore",
     windowsHide: true,
-    env: withProcessRuntimeProvenance({ ...process.env, OCX_SERVICE: "1" }),
+    // An ordinary owner: a stray sibling marker would otherwise mark it before any probe.
+    env: withProcessRuntimeProvenance(withoutSiblingMarker({ ...process.env, OCX_SERVICE: "1" })),
   });
   child.unref();
   const deadline = Date.now() + 8_000;
@@ -572,7 +585,6 @@ export function claudeLaunchPreflight(
  */
 const NATIVE_STRIPPED_LEVERS = [
   "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
-  "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
   "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
   "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
   "CLAUDE_CODE_ALWAYS_ENABLE_EFFORT",
@@ -593,7 +605,8 @@ const DESKTOP_3P_ALIAS = /^claude-opus-4(?:-8)?-[a-z][0-9a-z]{2}$/;
 export function isProxyOnlyModelId(value: string, providerNames: readonly string[] = []): boolean {
   const id = value.trim().replace(/\[1m\]$/, "");
   if (!id) return false;
-  if (id.startsWith(CLAUDE_ALIAS_PREFIX_V1) || id.startsWith(CLAUDE_ALIAS_PREFIX_V2) || DESKTOP_3P_ALIAS.test(id)) {
+  const aliasPrefixes = [CLAUDE_ALIAS_PREFIX_CURRENT, CLAUDE_ALIAS_PREFIX_CURRENT_V2, CLAUDE_ALIAS_PREFIX_V1, CLAUDE_ALIAS_PREFIX_V2];
+  if (aliasPrefixes.some(prefix => id.startsWith(prefix)) || DESKTOP_3P_ALIAS.test(id)) {
     return true;
   }
   const slash = id.indexOf("/");
@@ -606,6 +619,23 @@ export function buildNativeClaudeEnv(
   deps: ClaudeEnvDeps = {},
 ): ClaudeLaunchEnv {
   const env: ClaudeLaunchEnv = { ...base };
+  const owned = deps.ownedInterceptSettings;
+  // A CA-only stale entry does not override an inherited proxy.
+  if ((owned?.kind === "applied" || owned?.kind === "stale") && isClaudeInterceptProxyUrl(owned.env.HTTPS_PROXY)) {
+    const expected = owned.env.HTTPS_PROXY;
+    const foreignInheritedProxy = [env.HTTPS_PROXY, env.https_proxy].some(value =>
+      value !== undefined && value !== "" && value !== expected);
+    if (foreignInheritedProxy) {
+      deps.warn?.("⚠ Claude settings-owned intercept proxy still applies. Turn Desktop/CLI first-party off or unset the foreign HTTPS_PROXY/https_proxy to use native Claude.");
+    } else {
+      env.NO_PROXY = "*";
+      env.no_proxy = "*";
+      if (env.HTTPS_PROXY === expected) delete env.HTTPS_PROXY;
+      if (env.https_proxy === expected) delete env.https_proxy;
+      if (owned.env.NODE_EXTRA_CA_CERTS !== undefined && env.NODE_EXTRA_CA_CERTS === owned.env.NODE_EXTRA_CA_CERTS)
+        delete env.NODE_EXTRA_CA_CERTS;
+    }
+  }
   deleteUntrustedAnthropicSlots(env, deps);
 
   const admissionSlots = ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"] as const;
@@ -632,6 +662,9 @@ export function buildNativeClaudeEnv(
   }
 
   for (const name of NATIVE_STRIPPED_LEVERS) delete env[name];
+  // An explicit caller-owned guard must follow a caller-owned gateway and credential;
+  // otherwise settings.env can replace the destination while retaining the credential.
+  if (hasOwnedAdmission) delete env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST;
   const providerNames = Object.keys(config.providers);
   for (const name of MODEL_ENV_SLOT_NAMES) {
     const value = env[name];
@@ -812,7 +845,10 @@ async function launchNativeClaude(config: OcxConfig, args: string[], notice: str
   );
   if (override.warning) console.error(override.warning);
   const allowRootSkipPermissions = shouldAllowRootSkipPermissions(args);
-  const env = buildNativeClaudeEnv(config, process.env, { allowRootSkipPermissions });
+  const env = buildNativeClaudeEnv(config, process.env, {
+    allowRootSkipPermissions, ownedInterceptSettings: inspectDesktopFirstParty(config).settings,
+    warn: line => console.error(line),
+  });
   if (allowRootSkipPermissions) console.error(rootSkipPermissionsNotice(env));
   return spawnClaude([...(override.flag ?? []), ...args], env);
 }

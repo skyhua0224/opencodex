@@ -6,6 +6,8 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync } from 
 import { delimiter, dirname, join, resolve } from "node:path";
 import { atomicWriteFile, expandUserPath, getConfigDir, websocketsEnabled } from "../../config";
 import { resolveProviderApiKey } from "../../providers/key-store";
+import { getAccountSet } from "../../oauth/store";
+import { readKiroAccountModels, kiroObservedContextWindow } from "../../providers/kiro-model-catalog";
 import { CODEX_CONFIG_PATH, CODEX_MODELS_CACHE_PATH, DEFAULT_CATALOG_PATH, readRootTomlString, resolveCodexConfigPath } from "../paths";
 import {
   clearModelCache,
@@ -55,7 +57,11 @@ import { fetchCursorUsableModels } from "../../adapters/cursor/live-models";
 import { cursorLiveRosterScope, recordLiveCursorClaudeModels, recordLiveCursorMaxModeModels } from "../../adapters/cursor/catalog";
 import { fetchQoderModels } from "../../adapters/qoder/live-models";
 import { resolveQoderProfile } from "../../adapters/qoder/profiles";
+import { CODEBUDDY_PROFILES, type CodeBuddyProfile } from "../../adapters/codebuddy/profiles";
+import { fetchCodeBuddyModels } from "../../adapters/codebuddy/live-models";
+import { resolveProfileByBaseUrl } from "../../adapters/coding-agent/profile";
 import { fetchDevinUsableModels } from "../../adapters/devin/live-models";
+import { resolveDevinApiBaseUrl } from "../../oauth/devin/api-base";
 import { isCanonicalOpenAiForwardProvider, OPENAI_API_PROVIDER_ID, OPENAI_CODEX_PROVIDER_ID } from "../../providers/openai-tiers";
 import {
   COMBO_NAMESPACE,
@@ -104,8 +110,13 @@ import type {
 import type { CapturedProviderGather, CatalogGatherProviderAuthOutcome, CatalogGatherProviderModelOutcome, ModelsAuthResolution, ModelsAuthResolver } from "./gather-capture";
 import { QUIET_AUTHORITATIVE_CATALOG_PROVIDERS, applyConfigHintsToCachedModels, applyProviderConfigHints, boundedOwnedBy, catalogHintsFromModelsApiItem, catalogHintsFromProviderConfig } from "./model-hints";
 import { mergeConfiguredModelsIntoLiveCatalog, shouldExposeProviderModel, warnDroppedConfiguredIdsOnce } from "./model-visibility";
-import { captureProviderGather, materializeCapturedHeaders } from "./gather-capture";
+import { captureModelsRequest, captureProviderGather, materializeCapturedHeaders } from "./gather-capture";
 
+
+/** Observed Kiro ids advertised in the public catalog: plain ids that need no router decoding. */
+const KIRO_PUBLISHABLE_MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+/** Upper bound on observed Kiro ids added to the catalog across the whole roster. */
+const KIRO_OBSERVED_CATALOG_MAX = 64;
 export interface ProviderModelsResult {
   readonly models: CatalogModel[];
   readonly outcome: CatalogGatherProviderModelOutcome;
@@ -150,7 +161,7 @@ export async function fetchProviderModelsWithAuth(
   contextCap: number | undefined,
   resolveAuth: ModelsAuthResolver,
 ): Promise<ProviderModelsResult> {
-  const { name, provider: prov, discovery, request, metadataModelIdCaseFold } = captured;
+  const { name, provider: prov, discovery, metadataModelIdCaseFold } = captured;
   const observed = (
     models: CatalogModel[],
     state: CatalogGatherProviderModelOutcome["state"],
@@ -213,14 +224,39 @@ export async function fetchProviderModelsWithAuth(
   // discovery failure left by an older live configuration even when the account is logged out.
   if (prov.liveModels === false) {
     clearProviderDiscoveryStatus(name);
+    if (name === "kiro") {
+      const ids = [...configuredIds];
+      // Observed ids are advertised only when they round-trip through catalog encoding (no "/"
+      // or other separators the router would have to decode), and the roster adds at most
+      // KIRO_OBSERVED_CATALOG_MAX of them. Every observed id still informs routing preference.
+      let observedAdded = 0;
+      for (const account of getAccountSet("kiro")?.accounts ?? []) {
+        if (account.needsReauth === true || account.paused === true) continue;
+        for (const row of readKiroAccountModels(account) ?? []) {
+          if (observedAdded >= KIRO_OBSERVED_CATALOG_MAX) break;
+          if (!KIRO_PUBLISHABLE_MODEL_ID.test(row.modelId) || ids.includes(row.modelId)) continue;
+          ids.push(row.modelId);
+          observedAdded += 1;
+        }
+      }
+      return observed(ids.map(id => {
+        const hints = catalogHintsFromProviderConfig(name, prov, id, contextCap,
+          metadataModelIdCaseFold, captured.effectiveAlias);
+        const observedWindow = kiroObservedContextWindow(id);
+        return { id, provider: name, ...hints,
+          ...(observedWindow !== undefined
+            ? { contextWindow: applyProviderContextCap(observedWindow, contextCap) } : {}) };
+      }), "authoritative");
+    }
     return observed(configured, "authoritative");
   }
   const auth: ModelsAuthResolution = captured.observedAuth ?? (resolveAuth.kind === "refreshing"
-    ? prov.authMode === "oauth" && effectiveGoogleMode(name, prov) === "cloud-code-assist"
+    ? prov.authMode === "oauth"
       ? await getValidAccessTokenSnapshot(name)
         .then(snapshot => ({
           apiKey: snapshot.accessToken,
           observed: false,
+          ...(snapshot.apiBaseUrl ? { oauthApiBaseUrl: snapshot.apiBaseUrl } : {}),
           ...(snapshot.projectId ? { oauthProjectId: snapshot.projectId } : {}),
         }))
         .catch(() => ({ apiKey: undefined, observed: false }))
@@ -243,6 +279,53 @@ export async function fetchProviderModelsWithAuth(
       ? [...models, vertexDefaultSeed]
       : models
   );
+  if (prov.adapter === "codebuddy") {
+    if (!apiKey) return observed(configured, "degraded");
+    const resolvedProfile = resolveProfileByBaseUrl(CODEBUDDY_PROFILES, prov.baseUrl);
+    if (!resolvedProfile) return observed(configured, "degraded");
+    const profile = resolvedProfile as CodeBuddyProfile;
+    // Cache reads/writes are provider/key-fingerprint-scoped: an irreversible fingerprint of
+    // the configured key means a key switch never reuses the roster cached for the previous
+    // key. The roster comes from the product configuration endpoint authenticated with that
+    // same key, so the fingerprint scope and the roster's authority are the same identity: the
+    // roster is the key's own account answer, never the CLI login's.
+    const authorityIdentity = createHash("sha256").update(apiKey).digest("hex");
+    const fresh = getFreshCached(name, ttlMs, Date.now(), authorityIdentity);
+    if (fresh) {
+      return observed(withConfiguredRetention(
+        applyConfigHintsToCachedModels(name, prov, fresh, contextCap, metadataModelIdCaseFold, captured.effectiveAlias),
+      ), "authoritative");
+    }
+    const scopedStale = getStaleCached(name, authorityIdentity);
+    if (isModelsFetchCoolingDown(name, undefined, undefined, authorityIdentity) && scopedStale) {
+      return observed(withConfiguredRetention(
+        applyConfigHintsToCachedModels(name, prov, scopedStale, contextCap, metadataModelIdCaseFold, captured.effectiveAlias),
+      ), "degraded");
+    }
+    const live = await fetchCodeBuddyModels(profile, apiKey);
+    if (live.ok) {
+      const discovered = live.models.map(id => ({
+        id,
+        provider: name,
+        ...catalogHintsFromProviderConfig(name, prov, id, contextCap, metadataModelIdCaseFold, captured.effectiveAlias),
+      }));
+      const forCache = withConfiguredRetention(discovered, { retainComboTargets: false });
+      if (!setCached(name, forCache, Date.now(), cacheGeneration, authorityIdentity)) {
+        return observed(withConfiguredRetention(configured), "degraded");
+      }
+      markProviderDiscoveryOk(name, live.models.length);
+      return observed(withConfiguredRetention(forCache, { warnDrops: true }), "authoritative");
+    }
+    if (isCurrentCacheGeneration()) {
+      markModelsFetchFailure(name, undefined, authorityIdentity);
+      markProviderDiscoveryFailed(name, { reason: "provider" });
+      console.warn(`[opencodex] CodeBuddy model discovery failed [${live.error}]${live.status === undefined ? "" : ` status=${live.status}`}; using stale/static catalog degradation.`);
+    }
+    const stale = getStaleCached(name, authorityIdentity);
+    return observed(withConfiguredRetention(
+      stale ? applyConfigHintsToCachedModels(name, prov, stale, contextCap, metadataModelIdCaseFold, captured.effectiveAlias) : configured,
+    ), "degraded");
+  }
   if (prov.adapter === "qoder") {
     if (!apiKey) return observed(configured, "degraded");
     const profile = resolveQoderProfile(prov.baseUrl);
@@ -289,10 +372,13 @@ export async function fetchProviderModelsWithAuth(
   }
   if (prov.adapter === "devin") {
     if (!apiKey) return observed(configured, "degraded");
-    // Devin's usable-model list is entitlement-specific. Bind cache reads/writes to an
-    // irreversible credential fingerprint so a credential switch cannot observe another
-    // account's roster or stale fallback (the Qoder precedent above).
-    const authorityIdentity = createHash("sha256").update(apiKey).digest("hex");
+    // Both the credential and its validated tenant destination own this roster.
+    // The registered Devin route ignores a saved baseUrl override; discovery must
+    // use that same fixed destination when the stored tenant URL is invalid.
+    const configuredBase = name === "devin" ? getProviderRegistryEntry(name)?.baseUrl ?? prov.baseUrl : prov.baseUrl;
+    const destination = resolveDevinApiBaseUrl(auth.oauthApiBaseUrl ?? configuredBase);
+    const authorityIdentity = createHash("sha256")
+      .update(JSON.stringify([apiKey, destination])).digest("hex");
     const cachedDevin = getFreshCached(name, ttlMs, Date.now(), authorityIdentity);
     if (cachedDevin) {
       return observed(
@@ -309,7 +395,12 @@ export async function fetchProviderModelsWithAuth(
         "degraded",
       );
     }
-    const liveResult = await fetchDevinUsableModels({ apiKey, baseUrl: prov.baseUrl });
+    // The OAuth snapshot owns both values: never combine one account's durable
+    // key with the registry's default host or another account's tenant host.
+    const liveResult = await fetchDevinUsableModels({
+      apiKey,
+      baseUrl: destination,
+    });
     if (liveResult.ok) {
       // Live catalog is the source of truth — use the discovered base models
       // directly, not a filtered subset of the static seed.
@@ -462,6 +553,11 @@ export async function fetchProviderModelsWithAuth(
       "degraded",
     );
   }
+  // The captured request predates any refresh, so a refreshing gather rebuilds it
+  // from the auth it resolved: the token and its origin, together.
+  const request = resolveAuth.kind === "refreshing"
+    ? captureModelsRequest(name, prov, auth.oauthApiBaseUrl)
+    : captured.request;
   const url = request.url;
   let headers = materializeCapturedHeaders(request, apiKey);
   // One Ollama authority contract: for canonical ollama-cloud/ollama-native rows, discovery
