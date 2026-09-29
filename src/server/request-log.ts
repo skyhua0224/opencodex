@@ -10,6 +10,7 @@ import {
   noteThreadRestrictionVerdict,
   noteThreadTurnDuration,
   noteThreadUpstreamCut,
+  shouldArmUpstreamCut,
 } from "./ws-thread-transport";
 import type { ResponsesTerminalStatus } from "../bridge";
 import {
@@ -1448,7 +1449,7 @@ export function addFinalRequestLog(
   // so the useful response is to stop routing this conversation the same way -- the same re-roll an
   // overload verdict arms, on the same ledger. effectiveStatus already folded a client cancel into
   // 499, which is not a verdict about the route, so the guard excludes it by construction.
-  if (effectiveStatus >= 500 && logCtx.firstOutputMs !== undefined) {
+  if (shouldArmUpstreamCut(effectiveStatus, logCtx.transportPhase, logCtx.firstOutputMs)) {
     noteThreadUpstreamCut(logCtx.conversationId, { status: effectiveStatus, midStream: true });
   }
   // Same seam, the other shape: this conversation is much slower than its OWN recent normal. Only

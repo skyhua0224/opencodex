@@ -13,7 +13,7 @@ import { join } from "node:path";
 // affinity state would otherwise decide the outcome of every check below.
 process.env.OPENCODEX_HOME = mkdtempSync(join(tmpdir(), "ocx-affinity-selftest-"));
 const PKG = new URL("../src", import.meta.url).pathname.replace(/\/$/, "");
-const { noteThreadOverloadVerdict, noteThreadRestrictionVerdict, noteThreadUpstreamCut, noteThreadSlowHeaders, noteThreadTurnDuration, sessionVerdictSummary, isRestrictionVerdictText, threadAffinityResetActive, threadTransportDemotedToHttp, clearThreadTransportLedgerForTests, clearThreadTurnSamplesForTests, clearManualAffinityArmCacheForTests } =
+const { noteThreadOverloadVerdict, noteThreadRestrictionVerdict, noteThreadUpstreamCut, noteThreadSlowHeaders, noteThreadTurnDuration, shouldArmUpstreamCut, sessionVerdictSummary, isRestrictionVerdictText, threadAffinityResetActive, threadTransportDemotedToHttp, clearThreadTransportLedgerForTests, clearThreadTurnSamplesForTests, clearManualAffinityArmCacheForTests } =
   await import(PKG + "/server/ws-thread-transport.ts");
 
 let failures = 0;
@@ -134,6 +134,14 @@ check("two turns against its own median arm the re-roll", threadAffinityResetAct
 check("the relative arm is not a transport demotion", threadTransportDemotedToHttp(relKey, relT0 + 41_000) === false);
 check("the relative arm expires with the short hold",
   threadAffinityResetActive(relKey, relT0 + 2 * 60 * 60_000 + 60_000) === false);
+
+// Which terminal failures arm the cut re-roll: output had been delivered, or the origin had
+// started and died with nothing. A pre-header failure is the ladder's business, not this signal's.
+check("a pre-header 502 is not a cut verdict", shouldArmUpstreamCut(502, undefined, undefined) === false);
+check("a cut after output counts", shouldArmUpstreamCut(502, undefined, 1_200) === true);
+check("a death after the origin started counts even with no output", shouldArmUpstreamCut(502, "terminal_sse", undefined) === true);
+check("a 4xx never counts", shouldArmUpstreamCut(429, "terminal_sse", 1_200) === false);
+check("a client cancel never counts", shouldArmUpstreamCut(499, "terminal_sse", 1_200) === false);
 
 console.log(failures === 0 ? "ALL THREAD AFFINITY CHECKS PASSED" : failures + " CHECK(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

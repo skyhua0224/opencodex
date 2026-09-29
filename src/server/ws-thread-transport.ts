@@ -391,6 +391,25 @@ export function noteThreadTurnDuration(
  * it the signal would also fire for ordinary pre-content refusals, which the retry ladders already
  * handle and which say nothing about how this conversation is routed.
  */
+/**
+ * Should this terminal failure arm the re-roll?
+ *
+ * Two shapes qualify, and the second one is what the first version of this rule missed: output had
+ * reached the client (a cut in the middle of an answer), OR the origin had answered with headers
+ * and then died before producing anything (measured 2026-09-29 on one conversation: four such
+ * turns between 20:32 and 21:10, each 43-54s of waiting for nothing, `terminal_sse` with no first
+ * output). A PRE-header failure does not qualify: the retry ladder owns those, and for the official
+ * row the capacity park owns them too.
+ */
+export function shouldArmUpstreamCut(
+  status: number,
+  transportPhase: string | undefined,
+  firstOutputMs: number | undefined,
+): boolean {
+  if (!Number.isFinite(status) || status < 500) return false;
+  return firstOutputMs !== undefined || transportPhase === "terminal_sse";
+}
+
 export function noteThreadUpstreamCut(
   threadId: string | undefined,
   options: { status?: number | undefined; midStream?: boolean | undefined } = {},
