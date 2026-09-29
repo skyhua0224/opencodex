@@ -357,14 +357,19 @@ tag is named here, because a named one goes stale the moment it is superseded.
 The mechanics, in order:
 
 ```bash
+tools/fork-release-pack.sh /tmp/ocx-pack     # builds gui/dist when missing, packs, verifies it
 git tag -a v<base>-skyhua.<n> -m "skyhua hardening fork, based on opencodex <base> -- <what changed>"
 git push origin v<base>-skyhua.<n>    # gitea-lan
 git push github v<base>-skyhua.<n>    # github
-PATH=... npm pack --pack-destination /tmp/ocx-pack
-mv /tmp/ocx-pack/bitkyc08-opencodex-<version>.tgz /tmp/ocx-pack/opencodex-<version>.tgz
 gh release create v<base>-skyhua.<n> -R skyhua0224/opencodex --latest \
   --title "..." --notes-file /tmp/notes.md /tmp/ocx-pack/opencodex-<version>.tgz
 ```
+
+Pack through `tools/fork-release-pack.sh`, not a bare `npm pack`: the dashboard lives in
+`gui/dist`, which the repository does not track, so a tarball packed before `bun run build` in
+`gui/` installs without a Web UI and answers `/healthz` with `dashboard.available: false` --
+which is what 2.69.0-skyhua.3 shipped. The script builds when the build is missing and refuses to
+hand out a tarball with no `gui/dist/index.html` inside it.
 
 The attached tarball is what `ocx update` installs and what the integrity pre-flight reads the
 digest from, so a release without it leaves every installed copy on its current version. Publish
