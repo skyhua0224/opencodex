@@ -60,6 +60,27 @@ interface ThreadTransportEntry {
    */
   restrictionVerdicts?: number[];
   /**
+   * Turns of this conversation that were CUT mid-stream by the origin inside the window.
+   *
+   * Not a verdict the origin stated -- it is the shape the user sees as "stream disconnected
+   * before completion" after the answer had already started. Nothing can be replayed at that
+   * point (the output is out), so the only thing worth doing is to stop riding this route: the
+   * same re-roll an overload verdict arms. Measured 2026-09-29: one conversation collected 13 of
+   * these in two hours (native gpt-6-sol, single official account, no combo to hop with) while
+   * its sibling collected 3, and no verdict path armed anything because the cut carries no
+   * capacity or restriction text.
+   */
+  cutVerdicts?: number[];
+  /**
+   * Headers that arrived slower than {@link SLOW_HEADERS_THRESHOLD_MS}, inside the window.
+   *
+   * Time from send to response headers is the backend's own queueing and prompt work, so unlike
+   * total turn time (a hard reasoning turn is legitimately minutes long) it is comparable across
+   * turns and across conversations. The measured asymmetry behind the affinity roll was exactly
+   * this number: 14-22s for the conversation the backend was serving badly, 8s for its sibling.
+   */
+  slowHeaderHits?: number[];
+  /**
    * While now < this, the thread's outbound `x-codex-window-id` is dropped.
    *
    * The shed conversation is not merely shedding: it is served 2-3x slower than its sibling at
@@ -250,6 +271,101 @@ export function noteThreadOverloadVerdict(
  * typically local and short-lived (the same reason an operator's "静置再蹬" works).
  */
 const RESTRICTION_RESET_HOLD_MS = 30 * 60_000;
+/**
+ * How long one cut or slow-header signal keeps this conversation's routing identity re-rolled.
+ *
+ * Shorter than the six-hour overload hold on purpose: a cut is one lost turn, not a pattern the
+ * origin stated, and the re-roll's cost (the backend places the conversation again) is small but
+ * not free. Two hours covers the shape that started this: 13 cuts spread over two hours, each one
+ * refreshing the window, so the hold lapses about two hours after the last bad turn.
+ */
+const EXPERIMENTAL_RESET_HOLD_MS = 2 * 60 * 60_000;
+/** Slow-header signals inside {@link VERDICT_WINDOW_MS} before the identity is re-rolled. */
+const SLOW_HEADERS_HITS = 2;
+/**
+ * A header wait this long is the "this conversation is being served badly" number, not the model
+ * thinking: measured p90 for healthy conversations on this deployment is ~15s (n=34, 2026-09-29),
+ * and the shed conversation sits at 14-22s against its sibling's 8s.
+ */
+const SLOW_HEADERS_THRESHOLD_MS = 20_000;
+
+/**
+ * The origin cut a started response. Arms the same re-roll an overload verdict arms.
+ *
+ * `midStream` is the caller's own knowledge that output had already reached the client; without
+ * it the signal would also fire for ordinary pre-content refusals, which the retry ladders already
+ * handle and which say nothing about how this conversation is routed.
+ */
+export function noteThreadUpstreamCut(
+  threadId: string | undefined,
+  options: { status?: number | undefined; midStream?: boolean | undefined } = {},
+  now = Date.now(),
+): void {
+  const key = trim(threadId);
+  if (!key || options.midStream !== true) return;
+  const status = options.status ?? 0;
+  if (status !== 0 && status < 500) return;
+  const previous = ledger.get(key);
+  const wasRolled = (previous?.affinityResetUntil ?? 0) > now;
+  const entry: ThreadTransportEntry = previous
+    ? { ...previous, cutVerdicts: [...(previous.cutVerdicts ?? []), now] }
+    : { verdicts: [], rung: 0, httpOnlyUntil: 0, affinityResetUntil: 0, lastAt: now, cutVerdicts: [now] };
+  entry.cutVerdicts = (entry.cutVerdicts ?? []).filter(at => now - at < VERDICT_WINDOW_MS);
+  entry.lastAt = now;
+  entry.affinityResetUntil = Math.max(entry.affinityResetUntil, now + EXPERIMENTAL_RESET_HOLD_MS);
+  ledger.delete(key);
+  ledger.set(key, entry);
+  persistAffinityState(now);
+  if (!wasRolled) {
+    console.warn(
+      "[opencodex] thread " + key.slice(0, 8) + ": the origin cut a response after it had started ("
+      + status + ") - re-rolling its routing identity for "
+      + Math.round(EXPERIMENTAL_RESET_HOLD_MS / 60_000) + "min so the next turn is placed afresh",
+    );
+  }
+}
+
+/**
+ * Headers for this conversation took longer than {@link SLOW_HEADERS_THRESHOLD_MS}.
+ *
+ * Arms on the second hit inside the window: one slow header wait is a busy moment, two in ten
+ * minutes is how a conversation that is being served badly looks before it also starts shedding.
+ */
+export function noteThreadSlowHeaders(
+  threadId: string | undefined,
+  headersMs: number,
+  now = Date.now(),
+): void {
+  const key = trim(threadId);
+  if (!key || !Number.isFinite(headersMs) || headersMs < SLOW_HEADERS_THRESHOLD_MS) return;
+  const previous = ledger.get(key);
+  const entry: ThreadTransportEntry = previous
+    ? { ...previous, slowHeaderHits: [...(previous.slowHeaderHits ?? []), now] }
+    : { verdicts: [], rung: 0, httpOnlyUntil: 0, affinityResetUntil: 0, lastAt: now, slowHeaderHits: [now] };
+  entry.slowHeaderHits = (entry.slowHeaderHits ?? []).filter(at => now - at < VERDICT_WINDOW_MS);
+  entry.lastAt = now;
+  const hits = entry.slowHeaderHits.length;
+  if (hits >= SLOW_HEADERS_HITS) {
+    const wasRolled = entry.affinityResetUntil > now;
+    entry.affinityResetUntil = Math.max(entry.affinityResetUntil, now + EXPERIMENTAL_RESET_HOLD_MS);
+    ledger.delete(key);
+    ledger.set(key, entry);
+    persistAffinityState(now);
+    if (!wasRolled) {
+      console.warn(
+        "[opencodex] thread " + key.slice(0, 8) + ": " + hits + " header waits over "
+        + Math.round(SLOW_HEADERS_THRESHOLD_MS / 1000) + "s in "
+        + Math.round(VERDICT_WINDOW_MS / 60_000) + "min (last " + Math.round(headersMs / 1000)
+        + "s) - re-rolling its routing identity for "
+        + Math.round(EXPERIMENTAL_RESET_HOLD_MS / 60_000) + "min",
+      );
+    }
+    return;
+  }
+  ledger.delete(key);
+  ledger.set(key, entry);
+}
+
 export function noteThreadRestrictionVerdict(
   threadId: string | undefined,
   message: string | undefined,

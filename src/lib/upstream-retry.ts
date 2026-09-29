@@ -550,6 +550,14 @@ export interface TransientRetryOptions extends ResetRetryOptions {
    */
   retryCapacityDeferralsMs?: readonly number[];
   /**
+   * Reports every capacity deferral this call imposed before a resend.
+   *
+   * The caller marked "the send started" before this function, and the absorb waits happen inside
+   * it, so a turn that absorbed twice would otherwise look like a backend that took 17s longer to
+   * answer its HEADERS. Callers subtract the reported total before measuring the origin.
+   */
+  onCapacityWait?: ((waitMs: number) => void) | undefined;
+  /**
    * Also retry a capacity decline that arrives INSIDE an already-200 SSE body.
    *
    * The transient ladder can only act on a status; the ChatGPT backend also declines *after* a 200,
@@ -851,6 +859,7 @@ export async function fetchWithTransientRetry(
       );
       cancelResponseBodyBestEffort(res);
       await sleepWithAbort(waitMs, opts.abortSignal);
+      opts.onCapacityWait?.(waitMs);
       attemptStart = Date.now();
       transientStatuses.push(res.status);
       try {

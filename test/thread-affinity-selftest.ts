@@ -13,7 +13,7 @@ import { join } from "node:path";
 // affinity state would otherwise decide the outcome of every check below.
 process.env.OPENCODEX_HOME = mkdtempSync(join(tmpdir(), "ocx-affinity-selftest-"));
 const PKG = new URL("../src", import.meta.url).pathname.replace(/\/$/, "");
-const { noteThreadOverloadVerdict, noteThreadRestrictionVerdict, sessionVerdictSummary, isRestrictionVerdictText, threadAffinityResetActive, threadTransportDemotedToHttp, clearThreadTransportLedgerForTests, clearManualAffinityArmCacheForTests } =
+const { noteThreadOverloadVerdict, noteThreadRestrictionVerdict, noteThreadUpstreamCut, noteThreadSlowHeaders, sessionVerdictSummary, isRestrictionVerdictText, threadAffinityResetActive, threadTransportDemotedToHttp, clearThreadTransportLedgerForTests, clearManualAffinityArmCacheForTests } =
   await import(PKG + "/server/ws-thread-transport.ts");
 
 let failures = 0;
@@ -74,6 +74,39 @@ check("the restriction hold is short, not the six-hour one",
   threadAffinityResetActive(key, t0 + 31 * 60_000) === false
   && threadAffinityResetActive(key, t0 + 5 * 60 * 60_000) === false);
 check("a transport demotion is still not triggered by a restriction", threadTransportDemotedToHttp(key, t0 + 3000) === false);
+
+// 2026-09-29: the two shapes the single-official-account deployment actually produces never armed
+// anything before this -- a response the origin CUT mid-stream (the user sees "stream disconnected
+// before completion") and a conversation whose HEADERS keep arriving slow. Both now arm the same
+// re-roll, with a shorter hold than the six-hour overload arm, and neither is a transport demotion.
+clearThreadTransportLedgerForTests();
+const cutKey = "9f2c1b7a4e6d8053";
+check("a pre-content failure is not a cut verdict", (() => {
+  noteThreadUpstreamCut(cutKey, { status: 502, midStream: false }, t0);
+  return threadAffinityResetActive(cutKey, t0 + 1000) === false;
+})());
+check("a 4xx mid-stream failure is not a routing verdict", (() => {
+  noteThreadUpstreamCut(cutKey, { status: 429, midStream: true }, t0 + 1000);
+  return threadAffinityResetActive(cutKey, t0 + 2000) === false;
+})());
+noteThreadUpstreamCut(cutKey, { status: 502, midStream: true }, t0 + 3000);
+check("one mid-stream cut arms the re-roll", threadAffinityResetActive(cutKey, t0 + 4000) === true);
+check("the cut hold is the short one, not six hours",
+  threadAffinityResetActive(cutKey, t0 + 2 * 60 * 60_000 + 60_000) === false);
+
+// Slow headers: one slow wait is a busy moment, two inside the window is how a conversation served
+// badly looks. The threshold is 20s and the sibling conversation must stay untouched.
+clearThreadTransportLedgerForTests();
+const slowKey = "5d81ff0c2ab34e77";
+noteThreadSlowHeaders(slowKey, 21_000, t0);
+check("one slow header wait is not enough", threadAffinityResetActive(slowKey, t0 + 1000) === false);
+noteThreadSlowHeaders(slowKey, 19_000, t0 + 2000);
+check("a header wait under the threshold does not count", threadAffinityResetActive(slowKey, t0 + 3000) === false);
+noteThreadSlowHeaders(slowKey, 24_000, t0 + 4000);
+check("two slow header waits arm the re-roll", threadAffinityResetActive(slowKey, t0 + 5000) === true);
+check("the slow-header arm is not a transport demotion", threadTransportDemotedToHttp(slowKey, t0 + 5000) === false);
+check("the slow-header hold is the short one",
+  threadAffinityResetActive(slowKey, t0 + 2 * 60 * 60_000 + 60_000) === false);
 
 console.log(failures === 0 ? "ALL THREAD AFFINITY CHECKS PASSED" : failures + " CHECK(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

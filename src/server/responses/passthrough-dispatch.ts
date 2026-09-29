@@ -169,7 +169,7 @@ import { isTransientConsoleGoUploadRejection } from "../../providers/opencode-ze
 import { planReasoningEffortDowngrade } from "../../providers/reasoning-metadata";
 import { withResponseAttestation } from "../../lib/response-attestation";
 import { guardNativeDegenerateOutput } from "./combo-degenerate-output";
-import { conversationKeyFromHeaders } from "../ws-thread-transport";
+import { conversationKeyFromHeaders, noteThreadSlowHeaders } from "../ws-thread-transport";
 
 /**
  * The paced capacity ladder for one provider, or nothing when it is not opted in.
@@ -204,9 +204,11 @@ function applyResponseGuards(
     configuredTier: string | undefined;
     comboAttempt: boolean;
     /** Marks for the latency ledger, and whether the client sent a Cookie header. */
-    timing?: { dispatchStartedAt: number; sendStartedAt: number } | undefined;
-    clientSentCookie?: boolean | undefined;
-    logCtx: { upstreamError?: string };
+      timing?: { dispatchStartedAt: number; sendStartedAt: number } | undefined;
+      clientSentCookie?: boolean | undefined;
+      logCtx: { upstreamError?: string };
+      /** Called once when the upstream headers arrive, for the per-conversation slow-lane verdict. */
+      onHeaders?: ((info: { headersMs: number; lane?: string | undefined }) => void) | undefined;
   },
 ): Response {
   if (!response.ok || !response.body) return response;
@@ -221,6 +223,7 @@ function applyResponseGuards(
   return withResponseAttestation(guarded, {
     transport: isCodexWsUpstreamResponse(guarded) ? "ws" : "http",
     timing: ctx.timing,
+    ...(ctx.onHeaders ? { onHeaders: ctx.onHeaders } : {}),
     clientSentCookie: ctx.clientSentCookie,
     requestedModel: ctx.model,
     configuredTier: ctx.configuredTier,
@@ -1000,6 +1003,12 @@ export async function preparePassthroughExchange(
       // Transient-5xx pre-stream retry (devlog/_plan/260716_claudecode_hardening/010):
       // the ChatGPT backend emits transient 502/520s that an immediate retry absorbs.
       // Body is a replayable string; nothing has streamed to the client yet.
+      /**
+       * Milliseconds this leg spent in its own absorb deferrals, so the attestation and the
+       * slow-lane verdict measure the ORIGIN's header wait rather than our pacing. Without it a
+       * turn that absorbed twice looks like a backend that took 17s longer to answer.
+       */
+      let absorbedWaitMs = 0;
       const sendStartedAt = Date.now();
       upstreamResponse = await fetchWithTransientRetry(
         recovery => {
@@ -1043,6 +1052,7 @@ export async function preparePassthroughExchange(
           // on 502/503/504.
           retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
           retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider), retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider),
+          onCapacityWait: waitMs => { absorbedWaitMs += waitMs; },
           // The OpenCode Go destination stalls-then-drops inference sends (ambiguous
           // pre-header resets surfacing as refused 429s); its subscription traffic is
           // inference-only, so a bounded reset replay here absorbs the blip instead of
@@ -1053,8 +1063,13 @@ export async function preparePassthroughExchange(
       );
       upstreamResponse = applyResponseGuards(upstreamResponse, {
         clientSentCookie: req.headers.has("cookie"),
-        timing: { dispatchStartedAt, sendStartedAt },
+        timing: { dispatchStartedAt, sendStartedAt: sendStartedAt + absorbedWaitMs },
         lane: conversationKeyFromHeaders(req.headers),
+        // A conversation the backend keeps answering slowly is the shape the affinity re-roll
+        // exists for; without this trigger it only fires on a verdict the origin states.
+        onHeaders: ({ headersMs, lane }) => {
+          if (lane) noteThreadSlowHeaders(lane, headersMs);
+        },
         provider: route.providerName,
         model: route.modelId,
         configuredTier: logCtx.configuredServiceTier,

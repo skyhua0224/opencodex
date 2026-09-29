@@ -54,6 +54,14 @@ export interface ResponseAttestationOptions {
   timing?: { dispatchStartedAt: number; sendStartedAt: number } | undefined;
   /** A turn at or above this many milliseconds also gets a latency line. Default 20s. */
   slowTurnMs?: number | undefined;
+  /**
+   * Called once, as soon as the upstream headers are in hand, with how long they took.
+   *
+   * The caller owns the policy: this module only measures. The number is time from the send the
+   * caller marked to the headers, so the callers that pace their own resends subtract that pacing
+   * before handing the mark in (see the canonical absorb ladder in passthrough-dispatch).
+   */
+  onHeaders?: ((info: { headersMs: number; lane?: string | undefined }) => void) | undefined;
 }
 
 const TIER_RANK: Readonly<Record<string, number>> = { flex: 0, auto: 1, default: 1, priority: 2, scale: 2, fast: 2 };
@@ -246,6 +254,11 @@ export function withResponseAttestation(response: Response, options: ResponseAtt
   const startedAt = options.timing?.sendStartedAt ?? Date.now();
   const queueMs = options.timing ? Math.max(0, options.timing.sendStartedAt - options.timing.dispatchStartedAt) : 0;
   const headersMs = Math.max(0, Date.now() - startedAt);
+  try {
+    options.onHeaders?.({ headersMs, lane: options.lane });
+  } catch {
+    /* observation only: a caller's bookkeeping never breaks the turn */
+  }
   observeCookieLink(response, {
     clientSentCookie: options.clientSentCookie,
     lane: options.lane,
