@@ -38,6 +38,22 @@ export const NATIVE_GPT6_SOL_MODEL = "gpt-6-sol";
 export const NATIVE_GPT6_LUNA_MODEL = "gpt-6-luna";
 
 /**
+ * GPT-6.1 Sol. Upstream serves the row, but only to clients it considers new enough.
+ *
+ * Measured 2026-09-30 with the operator's own account: the authenticated roster
+ * (`/backend-api/codex/models`) answers with **nine** models for `client_version=0.155.0` and
+ * **ten** for `0.160.0` — the extra row being `gpt-6.1-sol`. The installed Codex CLI here is
+ * 0.155.1, so the app's own roster ask, and therefore the app's picker, cannot see it at all;
+ * a live request to the model through the official forward row already answers 200.
+ *
+ * SELF-DESCRIBED, like Sol and Luna: the row is pinned verbatim in
+ * `src/codex/data/roster-pinned-models.json` (captured from that 0.160.0 ask) rather than gated on
+ * an entitlement this account's client version cannot even ask for. Listing it means the request
+ * dispatches and the real upstream status is what the user sees.
+ */
+export const NATIVE_GPT6_1_SOL_MODEL = "gpt-6.1-sol";
+
+/**
  * Unreleased GPT-6 Astra variant. No public row exists anywhere — neither the codex-rs bundle nor
  * the 2026-09-23 main-account roster probe carries it — so it is ACCOUNT-GATED: hidden and
  * request-refused until an authenticated `/models` roster lists it for that account. Absence is
@@ -123,6 +139,7 @@ export const SELF_DESCRIBED_NATIVE_OPENAI_MODELS: ReadonlySet<string> = new Set(
   // Rows come from roster-pinned-models.json via pinnedNativeModelRows(), not the codex-rs pin.
   NATIVE_GPT6_SOL_MODEL,
   NATIVE_GPT6_LUNA_MODEL,
+  NATIVE_GPT6_1_SOL_MODEL,
 ]);
 
 /**
@@ -223,6 +240,7 @@ const BUILT_IN_NATIVE_OPENAI_MODELS: readonly string[] = Object.freeze([
   NATIVE_DAYBREAK_BLUE_MODEL,
   NATIVE_GPT6_ASTRA_MODEL,
   NATIVE_GPT6_SOL_MODEL, NATIVE_GPT6_LUNA_MODEL,
+  NATIVE_GPT6_1_SOL_MODEL,
   NATIVE_GPT6_ASTRA_MINOR_MODEL,
 ]);
 
@@ -342,4 +360,5 @@ export const NATIVE_MAIN_DRAIN_SENTINEL_MODELS: ReadonlySet<string> = new Set([
   // Astra Minor arrives through the gated spread above; Sol and Luna are ungated flagships.
   NATIVE_GPT6_SOL_MODEL,
   NATIVE_GPT6_LUNA_MODEL,
+  NATIVE_GPT6_1_SOL_MODEL,
 ]);

@@ -45,6 +45,7 @@ import {
   NATIVE_DAYBREAK_BLUE_MODEL,
   NATIVE_GPT6_ASTRA_MINOR_MODEL,
   NATIVE_GPT6_ASTRA_MODEL,
+  NATIVE_GPT6_1_SOL_MODEL,
   NATIVE_GPT6_LUNA_MODEL,
   NATIVE_GPT6_SOL_MODEL,
   NATIVE_RESERVE_MODEL,
@@ -89,6 +90,9 @@ export const DOCUMENTED_NATIVE_OPENAI_ADDITIONS = [
   // client_version >= 0.155.0, so an installed catalog built by an older client lacks them.
   // Astra Minor is deliberately absent: it is gated, and nativeOpenAiSlugs() would drop it anyway.
   NATIVE_GPT6_SOL_MODEL, NATIVE_GPT6_LUNA_MODEL,
+  // Same backfill again for 6.1: the live roster serves it only to client_version >= 0.160.0
+  // (measured 2026-09-30), so an installed catalog built by 0.155.x lacks it entirely.
+  NATIVE_GPT6_1_SOL_MODEL,
 ];
 
 export function configuredNativeAliasSlugs(
@@ -196,6 +200,8 @@ export const NATIVE_OPENAI_CONTEXT_OVERRIDES: Record<string, { contextWindow?: n
   // the row's own ceiling rather than the GPT-5.6 family's measured 922,000.
   [NATIVE_GPT6_SOL_MODEL]: { ...NATIVE_GPT6_CONTEXT },
   [NATIVE_GPT6_LUNA_MODEL]: { ...NATIVE_GPT6_CONTEXT },
+  // 6.1 ships the same pair (roster row, client_version=0.160.0, 2026-09-30).
+  [NATIVE_GPT6_1_SOL_MODEL]: { ...NATIVE_GPT6_CONTEXT },
   // Astra Minor borrows Astra's row, so it inherits Astra's numbers. No account we hold can reach
   // it, so this is inheritance, not a measurement.
   [NATIVE_GPT6_ASTRA_MINOR_MODEL]: { ...NATIVE_GPT6_CONTEXT },

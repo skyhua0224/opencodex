@@ -26,6 +26,7 @@ import {
   ACCOUNT_GATED_NATIVE_OPENAI_MODELS,
   NATIVE_GPT6_ASTRA_MINOR_MODEL,
   NATIVE_GPT6_ASTRA_MODEL,
+  NATIVE_GPT6_1_SOL_MODEL,
   NATIVE_GPT6_LUNA_MODEL,
   NATIVE_GPT6_SOL_MODEL,
   NATIVE_MAIN_DRAIN_SENTINEL_MODELS,
@@ -75,6 +76,8 @@ function nativeTemplate(): Record<string, unknown> {
 
 const SOL_LADDER = ["low", "medium", "high", "xhigh", "max", "ultra"];
 const LUNA_LADDER = ["low", "medium", "high", "xhigh", "max"];
+// 6.1 ships Sol's ladder (roster row at client_version=0.160.0, 2026-09-30).
+const SOL_61_LADDER = ["low", "medium", "high", "xhigh", "max", "ultra"];
 
 describe("GPT-6 Sol and Luna are self-described flagship natives", () => {
   test("each projects its own roster row with its own label, windows and exact ladder", () => {
@@ -175,21 +178,30 @@ describe("gpt-6-astra-minor is an account-gated capability alias of gpt-6-astra"
 });
 
 describe("roster-pinned-models.json", () => {
-  test("holds only Sol and Luna, verbatim roster rows", () => {
+  // FORK DIVERGENCE: this fork pins a third row, gpt-6.1-sol. The origin serves it only to
+  // client_version >= 0.160.0 (measured 2026-09-30) and the installed client here is 0.155.1, so
+  // without the pin the app's picker cannot see a model the account can already call.
+  test("holds Sol, Luna and 6.1 Sol, verbatim roster rows", () => {
     const roster = readRows("src/codex/data/roster-pinned-models.json");
-    expect(roster.map(row => row.slug)).toEqual([NATIVE_GPT6_SOL_MODEL, NATIVE_GPT6_LUNA_MODEL]);
+    expect(roster.map(row => row.slug)).toEqual([
+      NATIVE_GPT6_SOL_MODEL, NATIVE_GPT6_LUNA_MODEL, NATIVE_GPT6_1_SOL_MODEL,
+    ]);
     expect(efforts(roster[0])).toEqual(SOL_LADDER);
     expect(efforts(roster[1])).toEqual(LUNA_LADDER);
+    expect(efforts(roster[2])).toEqual(SOL_61_LADDER);
   });
 
   test("never shadows a slug already in upstream-models.json", () => {
     const upstream = readRows("src/codex/data/upstream-models.json");
     const roster = readRows("src/codex/data/roster-pinned-models.json");
     const upstreamSlugs = new Set(upstream.map(row => row.slug));
-    // The files are disjoint today; a codex-rs re-pin that bundles Sol or Luna must win.
-    expect(roster.filter(row => upstreamSlugs.has(row.slug))).toEqual([]);
-
     const merged = pinnedNativeModelRows();
+    // FORK DIVERGENCE: this fork's codex-rs snapshot also carries Sol and Luna, so those roster
+    // copies are inert rather than absent. The rule that must hold is precedence: a slug the
+    // snapshot already has resolves to the SNAPSHOT row, and only the rest are appended.
+    expect(merged.slice(upstream.length).map(row => row.slug)).toEqual(
+      roster.map(row => row.slug).filter(slug => !upstreamSlugs.has(slug)),
+    );
     const slugs = merged.map(row => row.slug);
     expect(new Set(slugs).size).toBe(slugs.length);
     // Snapshot rows come first and are the snapshot's own objects, in order.
