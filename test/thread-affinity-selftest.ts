@@ -13,7 +13,7 @@ import { join } from "node:path";
 // affinity state would otherwise decide the outcome of every check below.
 process.env.OPENCODEX_HOME = mkdtempSync(join(tmpdir(), "ocx-affinity-selftest-"));
 const PKG = new URL("../src", import.meta.url).pathname.replace(/\/$/, "");
-const { noteThreadOverloadVerdict, noteThreadRestrictionVerdict, noteThreadUpstreamCut, noteThreadSlowHeaders, sessionVerdictSummary, isRestrictionVerdictText, threadAffinityResetActive, threadTransportDemotedToHttp, clearThreadTransportLedgerForTests, clearManualAffinityArmCacheForTests } =
+const { noteThreadOverloadVerdict, noteThreadRestrictionVerdict, noteThreadUpstreamCut, noteThreadSlowHeaders, noteThreadTurnDuration, sessionVerdictSummary, isRestrictionVerdictText, threadAffinityResetActive, threadTransportDemotedToHttp, clearThreadTransportLedgerForTests, clearThreadTurnSamplesForTests, clearManualAffinityArmCacheForTests } =
   await import(PKG + "/server/ws-thread-transport.ts");
 
 let failures = 0;
@@ -107,6 +107,33 @@ check("two slow header waits arm the re-roll", threadAffinityResetActive(slowKey
 check("the slow-header arm is not a transport demotion", threadTransportDemotedToHttp(slowKey, t0 + 5000) === false);
 check("the slow-header hold is the short one",
   threadAffinityResetActive(slowKey, t0 + 2 * 60 * 60_000 + 60_000) === false);
+
+// Relative slowness: judged against the conversation's OWN median, not an absolute number, because
+// a hard reasoning turn is legitimately long. Six samples establish the baseline, then two turns
+// at least twice that median arm the same short re-roll.
+clearThreadTransportLedgerForTests();
+clearThreadTurnSamplesForTests();
+const relKey = "3ab9c40d17e28f56";
+const relT0 = Date.now();
+for (let i = 0; i < 7; i++) noteThreadTurnDuration(relKey, 10_000, 3_000, relT0 + i * 1000);
+check("a conversation with no baseline yet is never armed", (() => {
+  noteThreadTurnDuration("fresh-thread", 60_000, 5_000, relT0);
+  return threadAffinityResetActive("fresh-thread", relT0 + 1000) === false;
+})());
+noteThreadTurnDuration(relKey, 22_000, 4_000, relT0 + 20_000);
+check("one turn at twice the median is not enough", threadAffinityResetActive(relKey, relT0 + 21_000) === false);
+check("a turn under the floor does not count", (() => {
+  // 10s median, so 16s is above 2x the floor... but 16s is under the 20s floor.
+  noteThreadTurnDuration("floor-thread", 1_000, 500, relT0);
+  for (let i = 0; i < 6; i++) noteThreadTurnDuration("floor-thread", 8_000, 2_000, relT0 + i * 1000);
+  noteThreadTurnDuration("floor-thread", 16_000, 3_000, relT0 + 20_000);
+  return threadAffinityResetActive("floor-thread", relT0 + 21_000) === false;
+})());
+noteThreadTurnDuration(relKey, 26_000, 5_000, relT0 + 40_000);
+check("two turns against its own median arm the re-roll", threadAffinityResetActive(relKey, relT0 + 41_000) === true);
+check("the relative arm is not a transport demotion", threadTransportDemotedToHttp(relKey, relT0 + 41_000) === false);
+check("the relative arm expires with the short hold",
+  threadAffinityResetActive(relKey, relT0 + 2 * 60 * 60_000 + 60_000) === false);
 
 console.log(failures === 0 ? "ALL THREAD AFFINITY CHECKS PASSED" : failures + " CHECK(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

@@ -5,7 +5,12 @@ import { KEY_ACCOUNT_LOG_LABEL_RE } from "../codex/account-label";
 import { attemptAccountChanged, sealRequestAttemptIdentity } from "./request-log-account-rotation";
 export { sealRequestAttemptIdentity };
 import { readBoundedResponseBody } from "../lib/bounded-body";
-import { noteThreadOverloadVerdict, noteThreadRestrictionVerdict, noteThreadUpstreamCut } from "./ws-thread-transport";
+import {
+  noteThreadOverloadVerdict,
+  noteThreadRestrictionVerdict,
+  noteThreadTurnDuration,
+  noteThreadUpstreamCut,
+} from "./ws-thread-transport";
 import type { ResponsesTerminalStatus } from "../bridge";
 import {
   classifyError,
@@ -1445,6 +1450,12 @@ export function addFinalRequestLog(
   // 499, which is not a verdict about the route, so the guard excludes it by construction.
   if (effectiveStatus >= 500 && logCtx.firstOutputMs !== undefined) {
     noteThreadUpstreamCut(logCtx.conversationId, { status: effectiveStatus, midStream: true });
+  }
+  // Same seam, the other shape: this conversation is much slower than its OWN recent normal. Only
+  // successful turns feed both the baseline and the verdict -- a cancelled turn is the user
+  // leaving, and it would drag the yardstick down until every turn looked slow.
+  if (effectiveStatus < 400) {
+    noteThreadTurnDuration(logCtx.conversationId, Date.now() - start, logCtx.firstOutputMs);
   }
   if (logCtx.activeAttempt) {
     finishRequestAttempt(

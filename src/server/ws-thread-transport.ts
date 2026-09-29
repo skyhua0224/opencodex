@@ -81,6 +81,17 @@ interface ThreadTransportEntry {
    */
   slowHeaderHits?: number[];
   /**
+   * Turns of this conversation that were much slower than the conversation's OWN recent normal.
+   *
+   * The other signals are absolute (a cut, a 20s header wait). This one is relative because the
+   * felt complaint is relative: "this Session is especially slow". Total turn time depends on the
+   * work being done, so it is only evidence when compared against the same conversation's own
+   * median -- a lane whose tasks got harder will drift its baseline with them. Measured
+   * 2026-09-29: one conversation held a 28.2s median against its sibling's 11.6s for hours with
+   * nothing wrong enough to state a verdict.
+   */
+  relativeSlowHits?: number[];
+  /**
    * While now < this, the thread's outbound `x-codex-window-id` is dropped.
    *
    * The shed conversation is not merely shedding: it is served 2-3x slower than its sibling at
@@ -288,6 +299,90 @@ const SLOW_HEADERS_HITS = 2;
  * and the shed conversation sits at 14-22s against its sibling's 8s.
  */
 const SLOW_HEADERS_THRESHOLD_MS = 20_000;
+/**
+ * Relative-slowness trigger: a turn this many times the conversation's own recent median.
+ *
+ * Two, with a floor: a conversation that normally takes 10s and takes 25s is the shape the
+ * operator notices, while a 40s turn on a conversation whose normal IS 35s is not a routing
+ * problem at all. The floor keeps tiny turns (a 2s ping answered in 5s) out of the count.
+ */
+const RELATIVE_SLOW_RATIO = 2;
+const RELATIVE_SLOW_FLOOR_MS = 20_000;
+/** Samples before a conversation's own median is trusted as a baseline. */
+const RELATIVE_SLOW_MIN_SAMPLES = 6;
+/** Relative-slowness hits inside the window before the identity is re-rolled. */
+const RELATIVE_SLOW_HITS = 2;
+/** Bounded history per conversation: enough to be stable, small enough for a long-lived process. */
+const TURN_SAMPLE_CAP = 24;
+/**
+ * Per-conversation turn durations, most recent last.
+ *
+ * Not part of the ledger entry: the ledger records verdicts (what happened), this is a baseline
+ * (what this conversation normally looks like). Keeping it separate means a re-roll or a demotion
+ * cannot silently rewrite the yardstick it is judged against.
+ */
+const turnSamples = new Map<string, number[]>();
+
+/** Test seam: forget every conversation's duration baseline. */
+export function clearThreadTurnSamplesForTests(): void {
+  turnSamples.clear();
+}
+
+function medianOf(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  return sorted.length % 2 === 0 ? (sorted[mid - 1]! + sorted[mid]!) / 2 : sorted[mid]!;
+}
+
+/**
+ * One completed turn of this conversation: baseline first, then the verdict.
+ *
+ * Called from the request's terminal seam, so it sees every transport and every route. Only
+ * successful turns are reported -- the caller filters -- because a cancelled turn is the user
+ * leaving, not the backend being slow, and would drag the baseline down.
+ */
+export function noteThreadTurnDuration(
+  threadId: string | undefined,
+  durationMs: number,
+  firstOutputMs: number | undefined,
+  now = Date.now(),
+): void {
+  const key = trim(threadId);
+  if (!key || !Number.isFinite(durationMs) || durationMs <= 0) return;
+  const history = turnSamples.get(key) ?? [];
+  const baseline = history.length >= RELATIVE_SLOW_MIN_SAMPLES ? medianOf(history) : 0;
+  history.push(durationMs);
+  while (history.length > TURN_SAMPLE_CAP) history.shift();
+  turnSamples.delete(key);
+  turnSamples.set(key, history);
+  if (baseline <= 0) return;
+  if (durationMs < RELATIVE_SLOW_FLOOR_MS || durationMs < baseline * RELATIVE_SLOW_RATIO) return;
+
+  const previous = ledger.get(key);
+  const entry: ThreadTransportEntry = previous
+    ? { ...previous, relativeSlowHits: [...(previous.relativeSlowHits ?? []), now] }
+    : { verdicts: [], rung: 0, httpOnlyUntil: 0, affinityResetUntil: 0, lastAt: now, relativeSlowHits: [now] };
+  entry.relativeSlowHits = (entry.relativeSlowHits ?? []).filter(at => now - at < VERDICT_WINDOW_MS);
+  entry.lastAt = now;
+  const hits = entry.relativeSlowHits.length;
+  const wasRolled = entry.affinityResetUntil > now;
+  if (hits >= RELATIVE_SLOW_HITS) {
+    entry.affinityResetUntil = Math.max(entry.affinityResetUntil, now + EXPERIMENTAL_RESET_HOLD_MS);
+  }
+  ledger.delete(key);
+  ledger.set(key, entry);
+  if (hits < RELATIVE_SLOW_HITS) return;
+  persistAffinityState(now);
+  if (!wasRolled) {
+    console.warn(
+      "[opencodex] thread " + key.slice(0, 8) + ": " + hits + " turns at "
+      + Math.round(durationMs / 1000) + "s against its own " + Math.round(baseline / 1000)
+      + "s median" + (firstOutputMs === undefined ? "" : " (first output " + Math.round(firstOutputMs / 1000) + "s)")
+      + " - re-rolling its routing identity for " + Math.round(EXPERIMENTAL_RESET_HOLD_MS / 60_000) + "min",
+    );
+  }
+}
 
 /**
  * The origin cut a started response. Arms the same re-roll an overload verdict arms.
