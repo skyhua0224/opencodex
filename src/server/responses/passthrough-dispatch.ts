@@ -154,8 +154,11 @@ import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS } from "../../codex/catalog/native-m
 import {
   attemptOpaqueBlobRecovery,
   isEncryptedFunctionOutputRejection,
+  noteOpaqueBlobRejectedThread,
   outboundResponsesBodyCarriesEncryptedFunctionOutput,
+  prepareOpaqueBlobRecovery,
   resetStreamedOpaqueBlobLogContext,
+  shouldPreStripOpaqueBlob,
   consoleGoUploadRejectionBody,
   CONSOLE_GO_UPLOAD_RETRY_DELAY_MS,
   reasoningEffortRejectionText,
@@ -401,6 +404,12 @@ export async function preparePassthroughExchange(
     // adapter has applied destination-specific injection and normalization. Client-executed tool
     // authority remains bounded to the caller-owned catalog above.
     const providerExecutedCallTypes = new Set<ProviderExecutedCallType>();
+    // A conversation the origin has already refused for opaque state sends the stripped body on
+    // its FIRST send from then on, instead of paying the refusal and the rebuild on every turn.
+    // The recovery below is what makes the strip correct; doing it a turn early only removes a
+    // send the origin was going to reject, which is also one fewer physical send for a shed
+    // verdict to land on.
+    if (shouldPreStripOpaqueBlob(logCtx.conversationId)) prepareOpaqueBlobRecovery(parsed);
     let request: Awaited<ReturnType<typeof transportState.adapter.buildRequest>>;
     try {
       request = await transportState.adapter.buildRequest(parsed, { headers: requestState.selectedForwardHeaders, translatorBudget });
@@ -1726,6 +1735,7 @@ export async function preparePassthroughExchange(
       }, rebuildAndRefetch);
       if (opaqueBlobRecovery.kind === "failed") return opaqueBlobRecovery.response;
       if (opaqueBlobRecovery.kind === "recovered") {
+        noteOpaqueBlobRejectedThread(logCtx.conversationId);
         upstreamResponse = opaqueBlobRecovery.response;
         continue passthroughRecovery;
       }
@@ -1770,6 +1780,7 @@ export async function preparePassthroughExchange(
           }, rebuildAndRefetch);
           if (streamedOpaqueRecovery.kind === "failed") return streamedOpaqueRecovery.response;
           if (streamedOpaqueRecovery.kind === "recovered") {
+            noteOpaqueBlobRejectedThread(logCtx.conversationId);
             resetStreamedOpaqueBlobLogContext(logCtx);
             upstreamResponse = streamedOpaqueRecovery.response;
             continue passthroughRecovery;

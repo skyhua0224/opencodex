@@ -454,6 +454,55 @@ export function prepareOpaqueBlobRecovery(parsed: OcxParsedRequest): void {
 }
 
 
+/**
+ * Threads the origin has already rejected for opaque state, and when that memory expires.
+ *
+ * The recovery above is corrective: the first send carries the blob, the origin refuses it, and the
+ * stripped rebuild is what actually runs. That costs one extra physical send on EVERY later turn of
+ * a conversation whose history keeps replaying the same rejected part -- measured 2026-09-30 on one
+ * thread: 37 of 41 turns carried `opaque-blob-rejection`, so half of that conversation's sends were
+ * the refused ones, and a shed verdict lands on a physical send. Since the strip is what the origin
+ * ends up accepting anyway, a thread that has been refused once starts stripped: the same request,
+ * one fewer send, half the exposure to the shed windows.
+ *
+ * Six hours, because the rejected part stays in the caller's transcript until it is compacted away,
+ * and refreshed by every later rejection. Nothing here changes what is sent for a thread that has
+ * never been refused, which is every other conversation on this deployment.
+ */
+const opaqueBlobPreStripThreads = new Map<string, number>();
+const OPAQUE_BLOB_PRE_STRIP_TTL_MS = 6 * 60 * 60_000;
+const OPAQUE_BLOB_PRE_STRIP_MAX_THREADS = 512;
+
+export function noteOpaqueBlobRejectedThread(threadId: string | undefined, now = Date.now()): void {
+  const key = threadId?.trim();
+  if (!key) return;
+  opaqueBlobPreStripThreads.delete(key);
+  opaqueBlobPreStripThreads.set(key, now + OPAQUE_BLOB_PRE_STRIP_TTL_MS);
+  while (opaqueBlobPreStripThreads.size > OPAQUE_BLOB_PRE_STRIP_MAX_THREADS) {
+    const oldest = opaqueBlobPreStripThreads.keys().next().value;
+    if (oldest === undefined) break;
+    opaqueBlobPreStripThreads.delete(oldest);
+  }
+}
+
+export function shouldPreStripOpaqueBlob(threadId: string | undefined, now = Date.now()): boolean {
+  const key = threadId?.trim();
+  if (!key) return false;
+  const until = opaqueBlobPreStripThreads.get(key);
+  if (until === undefined) return false;
+  if (until <= now) {
+    opaqueBlobPreStripThreads.delete(key);
+    return false;
+  }
+  return true;
+}
+
+/** Drop the pre-strip memory. Same contract as `clearReasoningReplayCacheForTests`. */
+export function clearOpaqueBlobPreStripForTests(): void {
+  opaqueBlobPreStripThreads.clear();
+}
+
+
 export function resetStreamedOpaqueBlobLogContext(logCtx: RequestLogContext): void {
   delete logCtx.upstreamError;
   delete logCtx.terminalHttpStatus;

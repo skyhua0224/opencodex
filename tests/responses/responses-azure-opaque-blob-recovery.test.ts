@@ -11,6 +11,7 @@ import { handleResponses } from "../../src/server/responses/core";
 import {
   adapterSpeaksResponsesWire,
   attemptOpaqueBlobRecovery,
+  clearOpaqueBlobPreStripForTests,
   shouldAttemptOpaqueBlobRecovery,
   type OpaqueBlobRecoveryGuard,
 } from "../../src/server/responses/core-opaque-recovery";
@@ -70,6 +71,9 @@ beforeEach(() => {
   releaseSpendHome = acquireOwnedSpendHome();
   clearReasoningReplayCacheForTests();
   resetThoughtSignatureReplayForTests();
+  // The pre-strip memo is keyed by conversation and survives a test on purpose; without this the
+  // next case's first send would already be stripped and never see its own rejection.
+  clearOpaqueBlobPreStripForTests();
 });
 
 afterEach(() => {
@@ -78,6 +82,7 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
   clearReasoningReplayCacheForTests();
   resetThoughtSignatureReplayForTests();
+  clearOpaqueBlobPreStripForTests();
   if (originalOpenCodexHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = originalOpenCodexHome;
   removeTreeWithRetry(testDir);
