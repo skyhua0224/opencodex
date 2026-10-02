@@ -55,14 +55,20 @@
 
 ## 安装
 
-装的就是本仓库自己发布的 release：`npm` 直接装 release 里附带的那个 tarball，tarball 自带 Bun 运行时，机器上除了 `npm`/Node 不需要别的东西。包名沿用上游的 scope（`@bitkyc08/opencodex`），所以命令里写的是文件地址，而不是包名。
+装的就是本仓库自己发布的 release，一条命令就够：
 
 ```bash
-# tag 从 Releases 页抄，或者用 gh 读
-tag=$(gh release view -R skyhua0224/opencodex --json tagName -q .tagName)
-npm install -g "https://github.com/skyhua0224/opencodex/releases/download/$tag/opencodex-${tag#v}.tgz"
+npm install -g https://github.com/skyhua0224/opencodex/releases/latest/download/opencodex-skyhua.tgz
 ocx setup
 ocx start
+```
+
+这个地址是「最新一个 release 的 tarball」：`releases/latest/download` 和 `ocx update` 走的是同一条通道（不取预发布版），每次发版都会在 `opencodex-<版本>.tgz` 之外，再用这个不带版本号的名字附一份。tarball 自带 Bun 运行时，机器上除了 `npm`/Node 不需要别的东西；包名沿用上游的 scope（`@bitkyc08/opencodex`），所以命令里写的是文件地址而不是包名。
+
+想钉死具体某一版，就从 Releases 页抄 tag，资产名是 `opencodex-<版本>.tgz`：
+
+```bash
+npm install -g https://github.com/skyhua0224/opencodex/releases/download/v<版本>/opencodex-<版本>.tgz
 ```
 
 已经装过的机器更新走同一批 release：`ocx update`（`--tag preview` 跟随预发布版）；以后要发到自己的 npm scope 或者换源，用环境变量 `OCX_UPDATE_SPEC` 覆盖即可，不用改代码。卸载：`ocx uninstall`，然后 `npm uninstall -g @bitkyc08/opencodex`。
@@ -117,10 +123,10 @@ git push github v<基线>-skyhua.<序号>         # github
 # 4. 发 release，并把 tarball 附上
 gh release create v<基线>-skyhua.<序号> -R skyhua0224/opencodex --latest \
   --title "v<基线>-skyhua.<序号>" --notes-file /tmp/notes.md \
-  /tmp/ocx-pack/opencodex-<版本>.tgz
+  /tmp/ocx-pack/opencodex-<版本>.tgz /tmp/ocx-pack/opencodex-skyhua.tgz
 ```
 
-三件事少一件都会安静地坏掉：release 必须带上 tarball（`ocx update` 读的就是它的摘要，没附件等于所有已安装的机器都停在原地）；必须是正式版而不是 pre-release（`--latest` 不看 pre-release，`ocx update` 就发现不了）；tarball 里必须有构建好的面板。按用户的方式验一遍：
+四件事少一件都会安静地坏掉：release 必须带上 tarball（`ocx update` 读的就是它的摘要，没附件等于所有已安装的机器都停在原地）；不带版本号的那份别名 `opencodex-skyhua.tgz` 也要一起传（上面那条一键安装走的就是 `releases/latest/download` 找它）；必须是正式版而不是 pre-release（`--latest` 不看 pre-release，`ocx update` 就发现不了）；tarball 里必须有构建好的面板。`tools/fork-release-pack.sh` 会把两份都打出来，并打印要附上的命令。按用户的方式验一遍：
 
 ```bash
 npm install -g "https://github.com/skyhua0224/opencodex/releases/download/v<版本>/opencodex-<版本>.tgz"

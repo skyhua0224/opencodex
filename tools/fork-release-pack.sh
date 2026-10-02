@@ -35,9 +35,23 @@ case "$listing" in
 esac
 echo "dashboard files in the tarball: $(printf '%s\n' "$listing" | grep -c 'package/gui/dist/')"
 
+# A second copy under a version-free name, so the README can hand readers ONE command:
+#   npm install -g https://github.com/skyhua0224/opencodex/releases/latest/download/opencodex-skyhua.tgz
+# `releases/latest/download/<name>` resolves the newest non-prerelease that carries that name, so
+# the alias has to be attached to every cut -- a release that ships only the versioned asset leaves
+# that command 404ing against the previous one. The versioned asset stays authoritative: it is what
+# `ocx update` reads, and its bytes are the ones this file just verified.
+cp -f "$out"/opencodex-"$version".tgz "$out"/opencodex-skyhua.tgz
+cmp -s "$out"/opencodex-skyhua.tgz "$out"/opencodex-"$version".tgz \
+  || { echo "the alias copy does not match the packed tarball; refusing to hand it out" >&2; exit 1; }
+
 echo
 echo "asset:   $out/opencodex-$version.tgz"
 echo "sha256:  $(shasum -a 256 "$out"/opencodex-"$version".tgz | cut -d' ' -f1)"
+echo "alias:   $out/opencodex-skyhua.tgz (same bytes; the version-free install URL)"
 echo "attach:  gh release create v$version -R skyhua0224/opencodex --latest \\"
 echo "           --title \"v$version - ...\" --notes-file /tmp/notes.md \\"
-echo "           $out/opencodex-$version.tgz"
+echo "           $out/opencodex-$version.tgz $out/opencodex-skyhua.tgz"
+echo
+echo "README install line:"
+echo "  npm install -g https://github.com/skyhua0224/opencodex/releases/latest/download/opencodex-skyhua.tgz"

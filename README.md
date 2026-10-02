@@ -16,17 +16,25 @@ each threshold, and how to rebase it onto a newer upstream release live in
 
 ## Install
 
-Installs come from this fork's own releases: `npm` installs the tarball attached to a release, and
-that tarball bundles its own Bun runtime, so the machine needs nothing beyond `npm`/Node. The
-package keeps the upstream scope name (`@bitkyc08/opencodex`), which is why the command names the
-file instead of a registry package.
+Installs come from this fork's own releases, and one command is enough:
 
 ```bash
-# take the tag from the Releases page, or read it with gh
-tag=$(gh release view -R skyhua0224/opencodex --json tagName -q .tagName)
-npm install -g "https://github.com/skyhua0224/opencodex/releases/download/$tag/opencodex-${tag#v}.tgz"
+npm install -g https://github.com/skyhua0224/opencodex/releases/latest/download/opencodex-skyhua.tgz
 ocx setup
 ocx start
+```
+
+That URL is the newest release's tarball: `releases/latest/download` follows the same
+non-prerelease channel `ocx update` uses, and every cut attaches the package under that version-free
+name next to its `opencodex-<version>.tgz`. The tarball bundles its own Bun runtime, so the machine
+needs nothing beyond `npm`/Node; the package keeps the upstream scope name
+(`@bitkyc08/opencodex`), which is why the command names a file instead of a registry package.
+
+To pin an exact cut instead, copy the tag from the Releases page -- the asset is
+`opencodex-<version>.tgz`:
+
+```bash
+npm install -g https://github.com/skyhua0224/opencodex/releases/download/v<version>/opencodex-<version>.tgz
 ```
 
 An installed copy updates itself from the same releases with `ocx update` (`--tag preview` follows
@@ -628,14 +636,16 @@ git push github v<base>-skyhua.<n>         # github
 # 4. publish, with the tarball attached
 gh release create v<base>-skyhua.<n> -R skyhua0224/opencodex --latest \
   --title "v<base>-skyhua.<n>" --notes-file /tmp/notes.md \
-  /tmp/ocx-pack/opencodex-<version>.tgz
+  /tmp/ocx-pack/opencodex-<version>.tgz /tmp/ocx-pack/opencodex-skyhua.tgz
 ```
 
-Three properties of the cut are load-bearing, and each fails quietly: the release must carry the
+Four properties of the cut are load-bearing, and each fails quietly: the release must carry the
 tarball (`ocx update` reads its digest, and a release without it leaves every installed copy where
-it is), it must be a normal release rather than a prerelease (`--latest` skips prereleases, so
-`ocx update` would not see it), and the tarball must contain the built dashboard. Verify the cut
-the way a user would:
+it is), the version-free alias `opencodex-skyhua.tgz` must ride along (it is what the one-command
+install above resolves through `releases/latest/download`), it must be a normal release rather than
+a prerelease (`--latest` skips prereleases, so `ocx update` would not see it), and the tarball must
+contain the built dashboard. `tools/fork-release-pack.sh` writes both assets and prints the command
+to attach them. Verify the cut the way a user would:
 
 ```bash
 npm install -g "https://github.com/skyhua0224/opencodex/releases/download/v<version>/opencodex-<version>.tgz"

@@ -92,11 +92,13 @@ would generate a second answer for the same turn.
 ## Install
 
 ```bash
-git clone <this repo> opencodex
-cd opencodex
-npm install -g .        # or: bun install -g .
+npm install -g https://github.com/skyhua0224/opencodex/releases/latest/download/opencodex-skyhua.tgz
 ocx setup               # then: ocx start
 ```
+
+That is the newest release's tarball, and it carries its own Bun runtime. To work on the fork
+instead, clone it and `npm install -g .` from the checkout; to pin one cut, install
+`/releases/download/v<version>/opencodex-<version>.tgz`. See README for the full text.
 
 ## Relationship to upstream, and how to rebase
 
@@ -362,8 +364,15 @@ git tag -a v<base>-skyhua.<n> -m "skyhua hardening fork, based on opencodex <bas
 git push origin v<base>-skyhua.<n>    # gitea-lan
 git push github v<base>-skyhua.<n>    # github
 gh release create v<base>-skyhua.<n> -R skyhua0224/opencodex --latest \
-  --title "..." --notes-file /tmp/notes.md /tmp/ocx-pack/opencodex-<version>.tgz
+  --title "..." --notes-file /tmp/notes.md \
+  /tmp/ocx-pack/opencodex-<version>.tgz /tmp/ocx-pack/opencodex-skyhua.tgz
 ```
+
+The script writes two assets from the same bytes: the versioned `opencodex-<version>.tgz` that
+`ocx update` resolves, and the version-free `opencodex-skyhua.tgz` that the README's one-command
+install reads through `releases/latest/download/`. `cmp` refuses a mismatched pair, so the alias
+cannot drift from the verified tarball; what the script cannot do is attach them, and a release
+that ships only the versioned asset leaves that one-liner resolving to the PREVIOUS cut.
 
 Pack through `tools/fork-release-pack.sh`, not a bare `npm pack`: the dashboard lives in
 `gui/dist`, which the repository does not track, so a tarball packed before `bun run build` in
