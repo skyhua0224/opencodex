@@ -1178,6 +1178,7 @@
   "omo-client.test.ts": "clients",
   "omp-path-contract.test.ts": "clients",
   "omp-yaml-source-inline-comments.test.ts": "clients",
+  "opaque-blob-pre-strip.test.ts": "responses",
   "opaque-blob-wrapped-rejection.test.ts": "responses",
   "openai-api-virtual-models.test.ts": "adapters/openai",
   "openai-chat-bounded-tool-names.test.ts": "adapters/openai",
