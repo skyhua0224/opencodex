@@ -16,6 +16,27 @@ each threshold, and how to rebase it onto a newer upstream release live in
 
 ## Install
 
+Installs come from this fork's own releases: `npm` installs the tarball attached to a release, and
+that tarball bundles its own Bun runtime, so the machine needs nothing beyond `npm`/Node. The
+package keeps the upstream scope name (`@bitkyc08/opencodex`), which is why the command names the
+file instead of a registry package.
+
+```bash
+# take the tag from the Releases page, or read it with gh
+tag=$(gh release view -R skyhua0224/opencodex --json tagName -q .tagName)
+npm install -g "https://github.com/skyhua0224/opencodex/releases/download/$tag/opencodex-${tag#v}.tgz"
+ocx setup
+ocx start
+```
+
+An installed copy updates itself from the same releases with `ocx update` (`--tag preview` follows
+prereleases), and `OCX_UPDATE_SPEC` is the hook for publishing under another npm scope or registry
+later without touching code. Remove an install with `ocx uninstall`, then
+`npm uninstall -g @bitkyc08/opencodex`.
+
+Working on the fork itself instead — clone, then install from the checkout, and pull the same way
+afterwards:
+
 ```bash
 git clone https://github.com/skyhua0224/opencodex.git
 cd opencodex
@@ -580,6 +601,51 @@ See **[Contributing](./CONTRIBUTING.md)**.
 Contributor work that landed through a maintainer carry or reimplementation,
 where the commit does not name its original author, is recorded in
 **[CREDITS.md](./CREDITS.md)**.
+
+## Cutting a release
+
+Versions are `<upstream base>-skyhua.<n>` and the asset is named after the version, so
+`v2.69.0-skyhua.7` publishes `opencodex-2.69.0-skyhua.7.tgz`. Pack through
+`tools/fork-release-pack.sh` rather than a bare `npm pack`: the dashboard lives in `gui/dist`,
+which the repository does not track, and the script builds it when missing, refuses to hand out a
+tarball without it, and prints the digest. [FORK-NOTES.md](./FORK-NOTES.md) §12 carries the rest of
+the reasoning.
+
+```bash
+# 1. version and commit
+$EDITOR package.json                       # "version": "<base>-skyhua.<n>"
+git commit -am "release: <base>-skyhua.<n>"
+git push origin main && git push github main
+
+# 2. pack (builds gui/dist when missing; refuses a tarball without it)
+tools/fork-release-pack.sh /tmp/ocx-pack
+
+# 3. tag both mirrors
+git tag -a v<base>-skyhua.<n> -m "<what changed>"
+git push origin v<base>-skyhua.<n>         # gitea-lan
+git push github v<base>-skyhua.<n>         # github
+
+# 4. publish, with the tarball attached
+gh release create v<base>-skyhua.<n> -R skyhua0224/opencodex --latest \
+  --title "v<base>-skyhua.<n>" --notes-file /tmp/notes.md \
+  /tmp/ocx-pack/opencodex-<version>.tgz
+```
+
+Three properties of the cut are load-bearing, and each fails quietly: the release must carry the
+tarball (`ocx update` reads its digest, and a release without it leaves every installed copy where
+it is), it must be a normal release rather than a prerelease (`--latest` skips prereleases, so
+`ocx update` would not see it), and the tarball must contain the built dashboard. Verify the cut
+the way a user would:
+
+```bash
+npm install -g "https://github.com/skyhua0224/opencodex/releases/download/v<version>/opencodex-<version>.tgz"
+ocx --version                                # prints <version>
+curl -s http://127.0.0.1:10100/ | head -c 15 # "<!doctype html>" means the dashboard shipped
+```
+
+The tag alone reaches Gitea over SSH; its release object answers API calls with "Only signed in
+user is allowed to call APIs" unless an admin token is passed, so a Gitea release needs that token
+or a couple of clicks on the tag page.
 
 ## Disclaimer
 

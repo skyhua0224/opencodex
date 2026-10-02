@@ -55,6 +55,20 @@
 
 ## 安装
 
+装的就是本仓库自己发布的 release：`npm` 直接装 release 里附带的那个 tarball，tarball 自带 Bun 运行时，机器上除了 `npm`/Node 不需要别的东西。包名沿用上游的 scope（`@bitkyc08/opencodex`），所以命令里写的是文件地址，而不是包名。
+
+```bash
+# tag 从 Releases 页抄，或者用 gh 读
+tag=$(gh release view -R skyhua0224/opencodex --json tagName -q .tagName)
+npm install -g "https://github.com/skyhua0224/opencodex/releases/download/$tag/opencodex-${tag#v}.tgz"
+ocx setup
+ocx start
+```
+
+已经装过的机器更新走同一批 release：`ocx update`（`--tag preview` 跟随预发布版）；以后要发到自己的 npm scope 或者换源，用环境变量 `OCX_UPDATE_SPEC` 覆盖即可，不用改代码。卸载：`ocx uninstall`，然后 `npm uninstall -g @bitkyc08/opencodex`。
+
+要在本仓库上改代码，就 clone 下来装，之后 `git pull` 完重跑一次 `npm install -g .`：
+
 ```bash
 git clone https://github.com/skyhua0224/opencodex.git
 cd opencodex
@@ -81,6 +95,40 @@ bun test/thread-affinity-selftest.ts
 ocx-tiers --hours 6        # 等级、模型、复读三项汇总
 ocx-tiers --findings       # 只列逐条记录
 ```
+
+## 发布
+
+版本号是 `<上游基线>-skyhua.<序号>`，产物名跟着版本走：`v2.69.0-skyhua.7` 对应 `opencodex-2.69.0-skyhua.7.tgz`。打包必须走 `tools/fork-release-pack.sh`，不要用裸 `npm pack`：面板在 `gui/dist`，仓库不跟踪它，脚本会在缺的时候先构建、打完再确认 tarball 里有它，并打印 sha256。其余理由在 [FORK-NOTES.md](FORK-NOTES.md) 第 12 节。
+
+```bash
+# 1. 改版本号、提交
+$EDITOR package.json                       # "version": "<基线>-skyhua.<序号>"
+git commit -am "release: <基线>-skyhua.<序号>"
+git push origin main && git push github main
+
+# 2. 打包（缺 gui/dist 会先构建；没有面板的 tarball 会被拒绝）
+tools/fork-release-pack.sh /tmp/ocx-pack
+
+# 3. 两边打 tag
+git tag -a v<基线>-skyhua.<序号> -m "<这次改了什么>"
+git push origin v<基线>-skyhua.<序号>         # gitea-lan
+git push github v<基线>-skyhua.<序号>         # github
+
+# 4. 发 release，并把 tarball 附上
+gh release create v<基线>-skyhua.<序号> -R skyhua0224/opencodex --latest \
+  --title "v<基线>-skyhua.<序号>" --notes-file /tmp/notes.md \
+  /tmp/ocx-pack/opencodex-<版本>.tgz
+```
+
+三件事少一件都会安静地坏掉：release 必须带上 tarball（`ocx update` 读的就是它的摘要，没附件等于所有已安装的机器都停在原地）；必须是正式版而不是 pre-release（`--latest` 不看 pre-release，`ocx update` 就发现不了）；tarball 里必须有构建好的面板。按用户的方式验一遍：
+
+```bash
+npm install -g "https://github.com/skyhua0224/opencodex/releases/download/v<版本>/opencodex-<版本>.tgz"
+ocx --version                                 # 打印 <版本>
+curl -s http://127.0.0.1:10100/ | head -c 15  # 输出 "<!doctype html>" 就说明面板带上了
+```
+
+tag 通过 SSH 推到 Gitea 就够了；Gitea 的 release 对象不带 admin token 会回 "Only signed in user is allowed to call APIs"，要么带上 token，要么在 tag 页面点两下。
 
 ## 几件要注意的
 
