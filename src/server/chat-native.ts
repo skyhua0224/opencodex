@@ -523,7 +523,7 @@ export async function runNativeChatAttempt(
       for await (const _ of prepareSameTarget429Wait({
         body: response.body,
         signal: upstream.signal,
-        delayMs: rateLimitRetryDelayMs(retryPolicy, response.headers.get("retry-after"), Date.now()),
+        delayMs: rateLimitRetryDelayMs(retryPolicy, response.headers.get("retry-after"), Date.now(), retries - 1),
       })) { /* pre-stream wait */ }
       if (upstream.signal.aborted) throw upstream.signal.reason;
       response = await send(activeRequest, "rate-limit-429");

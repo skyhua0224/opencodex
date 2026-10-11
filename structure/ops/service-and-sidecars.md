@@ -196,6 +196,19 @@ over a desktop claim. `detachedStartEnvironment` strips `OCX_SERVICE` and both
 supervisor markers before spawning ensure/tray children, because a marker inherited from the
 service child's own environment would otherwise answer the gate as a managed job.
 
+Both service verbs that promise a running proxy — `ocx service repair` and `ocx service
+restart` — take the runtime back themselves on the Windows scheduler backend
+(`reclaimProxyForServiceRestart` and `waitForReplacementProxy` in
+`src/service/orchestration.ts`). `schtasks /end` ends the task instance and the launcher kill
+removes the `:loop` batch that would respawn the child, so the child itself is reclaimed with the
+identity-checked direct kill every forced stop already uses — never with the management-API stop,
+which a child under a respawnable wrapper answers `409 respawnable_service` by design. That
+swallowed refusal was the defect: the old process kept the port while the command printed success.
+An unreadable Task Scheduler state refuses before anything is stopped, and health cannot prove a
+replacement — the old child and its successor both answer `/healthz` — so the command waits for a
+serving pid that is not the one it reclaimed and reports the failed replacement instead of a
+checkmark when none appears (`tests/service/service-restart-replacement.test.ts`).
+
 ## Sidecars
 
 Web search and vision sidecars run only when the main request needs that capability and a usable

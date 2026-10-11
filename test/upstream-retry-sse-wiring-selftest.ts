@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 /**
  * Wiring test: the SSE decline retry must be reachable from the real retry helper.
  *
@@ -11,7 +12,7 @@
  *
  * Run: bun test/upstream-retry-sse-wiring-selftest.ts
  */
-const PKG = new URL("../src", import.meta.url).pathname.replace(/\/$/, "");
+const PKG = fileURLToPath(new URL("../src/", import.meta.url)).replace(/[\\/]+$/, "").replace(/\\/g, "/");
 const { fetchWithTransientRetry } = await import(PKG + "/lib/upstream-retry.ts");
 
 let failures = 0;

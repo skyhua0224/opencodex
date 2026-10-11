@@ -110,6 +110,26 @@ function runtimeRoleMeta(runtimeRole: string): string {
 function managementAuthRequiredMeta(required: boolean): string {
   return `<meta name="opencodex-management-auth-required" content="${required ? "1" : "0"}">`;
 }
+
+/**
+ * The version of the runtime that SERVED this document, stamped on every response.
+ *
+ * The dashboard reads `/healthz` for the live version and falls back to the constant Vite baked
+ * in at build time. That fallback is the only version a local operator ever saw, because the
+ * loopback companion deliberately serves no health/readiness route — see "health/readiness remain
+ * data-plane-only" in `tests/server/loopback-listener-integration.test.ts`. `gui/dist` is
+ * gitignored and therefore survives a pull that moves the runtime forward, so that baked constant
+ * went on describing a version nobody was running (a 2.69.0 badge on a 2.80.0 runtime).
+ *
+ * Stamping the served document answers the question where it is asked, on every plane, without a
+ * second request and without depending on the build being current. It is the same fact
+ * `rootFallbackPayload` already publishes when no dashboard build exists, so it reveals nothing
+ * `/healthz` would not.
+ */
+function runtimeVersionMeta(version: string): string {
+  return `<meta name="opencodex-version" content="${escapeHtmlAttribute(version)}">`;
+}
+
 function htmlDocumentResponse(html: string): Response {
   return new Response(html, {
     headers: {
@@ -129,6 +149,7 @@ function htmlResponse(
 ): Response {
   let html = readFileSync(path, "utf8");
   const bootstrap = [
+    runtimeVersionMeta(VERSION),
     runtimeRole ? runtimeRoleMeta(runtimeRole) : "",
     managementAuthRequired === undefined ? "" : managementAuthRequiredMeta(managementAuthRequired),
     session ? sessionBootstrapMeta(session) : "",

@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 /**
  * Self-test for lib/sse-prelude-retry.ts (2026-09-24).
  *
@@ -7,7 +8,7 @@
  *
  * Run: bun ~/.opencodex/tools/sse-prelude-retry-selftest.ts
  */
-const PKG = new URL("../src", import.meta.url).pathname.replace(/\/$/, "");
+const PKG = fileURLToPath(new URL("../src/", import.meta.url)).replace(/[\\/]+$/, "").replace(/\\/g, "/");
 const { withSsePreludeDeclineRetry } = await import(PKG + "/lib/sse-prelude-retry.ts");
 
 let failures = 0;

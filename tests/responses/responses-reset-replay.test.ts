@@ -162,4 +162,22 @@ describe("ambiguousResendAllowanceFor", () => {
     expect(grant.claim()).toBe(true);
     expect(seen).toEqual([2]);
   });
+
+  test("stateful replay opt-in is limited to the canonical ChatGPT forward endpoint", () => {
+    const canonical = ambiguousResendAllowanceFor({
+      adapter: "openai-responses",
+      authMode: "forward",
+      baseUrl: "https://chatgpt.com/backend-api/codex",
+      retryOnReset: { allowStateful: true, replacements: 2 },
+    }, () => false, () => true)!;
+    expect(canonical.selfContained).toBe(true);
+
+    const relay = ambiguousResendAllowanceFor({
+      adapter: "openai-responses",
+      authMode: "forward",
+      baseUrl: "https://relay.example.test/v1",
+      retryOnReset: { allowStateful: true, replacements: 2 },
+    }, () => false, () => true)!;
+    expect(relay.selfContained).toBe(false);
+  });
 });

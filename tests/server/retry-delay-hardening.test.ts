@@ -24,8 +24,16 @@ describe("stated reset duration boundaries", () => {
     ["Retry-After: 0.1", 1],
     ["Your limit RESETS IN 21 MINUTES", 1260],
     ["try again in 2s. Your limit will reset in 21 minutes.", 1260],
-  ] as const)("%s -> %i seconds", (message, expected) => {
-    expect(parseRetryAfterFromMessage(message)).toBe(expected);
+ ] as const)("%s -> %i seconds", (message, expected) => {
+   expect(parseRetryAfterFromMessage(message)).toBe(expected);
+ });
+
+  test("converts an absolute quota reset timestamp into a client delay", () => {
+    const now = Date.parse("2026-09-29T13:39:00Z");
+    expect(parseRetryAfterFromMessage(
+      "Usage limit reached for 5 hour. Your limit will reset at 2026-09-29 13:54:00",
+      now,
+    )).toBe(900);
   });
 
   test.each([

@@ -17,6 +17,7 @@
  */
 import type { OcxProviderConfig } from "../../types";
 import { resetReplayPolicyFor } from "../../providers/key-failover";
+import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers-destination";
 import type { AmbiguousResendAllowance } from "../../lib/request-resend-gate";
 
 /** Input items a client owns end to end: replaying them re-runs nothing but the model. */
@@ -127,14 +128,16 @@ export function selfContainedChatBody(body: unknown): boolean {
  * across every leg of the request.
  */
 export function ambiguousResendAllowanceFor(
-  provider: Pick<OcxProviderConfig, "retryOnReset">,
+  provider: Pick<OcxProviderConfig, "retryOnReset"> &
+    Partial<Pick<OcxProviderConfig, "adapter" | "authMode" | "baseUrl">>,
   requestIsSelfContained: () => boolean,
   claim: (limit: number) => boolean,
 ): AmbiguousResendAllowance | undefined {
   const policy = resetReplayPolicyFor(provider);
   if (policy === null) return undefined;
+  const allowStateful = policy.allowStateful && isCanonicalOpenAiForwardProvider(provider);
   return {
-    get selfContained(): boolean { return requestIsSelfContained(); },
+    get selfContained(): boolean { return requestIsSelfContained() || allowStateful; },
     claim: () => claim(policy.replacements),
   };
 }

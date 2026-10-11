@@ -4,6 +4,7 @@ import { getMainAccountExternalUsageWarning } from "../../codex/main-account-ext
 import { getObservedMainQuotaIdentityKey } from "../../codex/main-account-cache";
 import { compactionRoutingSchema, memoryModelsSchema } from "../../config/schema/leaf-validators";
 import { compactionRecoverySchema } from "../../config/schema/compaction-recovery";
+import { capacityRetryConfigSchema, resetStormConfigSchema } from "../../config/schema/config-schema";
 import { captureConfigTopLevelRollback } from "../../config/rebase-provenance";
 import type { IntegrationClientId } from "../../integrations/registry";
 import { randomUUID } from "node:crypto";
@@ -41,6 +42,8 @@ import {
 import { removeCredential } from "../../oauth/store";
 import { providerDestinationResolvedError } from "../../lib/destination-policy";
 import { isStreamMode } from "../../lib/bun-stream-caps";
+import { configureCapacityLadder } from "../../lib/capacity-ladder";
+import { configureResetStorm, resolveResetStormConfig } from "../../lib/reset-storm";
 import { shadowSourceModels } from "../../lib/shadow-call";
 import {
   configureAppOwnedMemoryBudget,
@@ -382,6 +385,8 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       compactionRecovery: config.compactionRecovery ?? null,
       // Absent means both phases keep their existing routes; the GUI renders that as "Off".
       memoryModels: config.memoryModels ?? null,
+      resetStorm: config.resetStorm ?? null,
+      capacityRetry: config.capacityRetry ?? null,
       startupHealth: await readStartupHealthSnapshot(config),
       codexRuntime: {
         path: displayCodexRuntimePath(resolved.runtime.command),
@@ -478,6 +483,8 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       compactionRouting?: unknown;
       compactionRecovery?: unknown;
       memoryModels?: unknown;
+      resetStorm?: unknown;
+      capacityRetry?: unknown;
     };
     if (body.codexAutoStart === undefined
       && body.streamMode === undefined
@@ -494,8 +501,10 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       && body.codexClientCompaction === undefined
       && body.compactionRouting === undefined
       && body.compactionRecovery === undefined
-      && body.memoryModels === undefined) {
-      return jsonResponse({ error: "provide codexAutoStart, streamMode, appOwnedMemoryBudgetMb, codexAccountPickerEnabled, codexQuotaAutoRefresh, oauthOpenBrowser, showCodexCredits, ultraFastTier, fastRows, codexMainAccountHardLock, codexMainAccountHardLockThresholds, codexDesktopAuthless, codexClientCompaction, compactionRouting, compactionRecovery, or memoryModels" }, 400);
+      && body.memoryModels === undefined
+      && body.resetStorm === undefined
+      && body.capacityRetry === undefined) {
+      return jsonResponse({ error: "provide codexAutoStart, streamMode, appOwnedMemoryBudgetMb, codexAccountPickerEnabled, codexQuotaAutoRefresh, oauthOpenBrowser, showCodexCredits, ultraFastTier, fastRows, codexMainAccountHardLock, codexMainAccountHardLockThresholds, codexDesktopAuthless, codexClientCompaction, compactionRouting, compactionRecovery, memoryModels, resetStorm, or capacityRetry" }, 400);
     }
     if (body.codexAutoStart !== undefined && typeof body.codexAutoStart !== "boolean") {
       return jsonResponse({ error: "codexAutoStart boolean is required" }, 400);
@@ -560,6 +569,20 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
     if (memoryModels != null && !memoryModels.success) {
       return jsonResponse({ error: "memoryModels requires a nonblank model and an optional declared reasoningEffort per configured phase, and no other fields" }, 400);
     }
+    // Live writes reject malformed blocks instead of silently disabling the feature the
+    // way a malformed hand edit does: the caller believes the write happened.
+    const resetStorm = body.resetStorm == null
+      ? body.resetStorm
+      : resetStormConfigSchema.safeParse(body.resetStorm);
+    if (resetStorm != null && !resetStorm.success) {
+      return jsonResponse({ error: "resetStorm requires enabled plus optional bounded pacing fields and no other keys" }, 400);
+    }
+    const capacityRetry = body.capacityRetry == null
+      ? body.capacityRetry
+      : capacityRetryConfigSchema.safeParse(body.capacityRetry);
+    if (capacityRetry != null && !capacityRetry.success) {
+      return jsonResponse({ error: "capacityRetry requires enabled and 1-8 delaysMs entries of 1000-600000ms and no other keys" }, 400);
+    }
     let quotaAutoRefreshChange: { id: string; window: "fiveHour" | "weekly"; enabled: boolean } | undefined;
     if (body.codexQuotaAutoRefresh !== undefined) {
       if (!isPlainRecord(body.codexQuotaAutoRefresh)) {
@@ -589,7 +612,7 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
     )) {
       return jsonResponse({ error: `appOwnedMemoryBudgetMb must be an integer from ${MIN_APP_OWNED_MEMORY_BUDGET_MB} to ${MAX_APP_OWNED_MEMORY_BUDGET_MB}` }, 400);
     }
-    const restoreCompactionRouting = captureConfigTopLevelRollback(config, ["compactionRouting", "compactionRecovery", "memoryModels"]);
+    const restoreCompactionRouting = captureConfigTopLevelRollback(config, ["compactionRouting", "compactionRecovery", "memoryModels", "resetStorm", "capacityRetry"]);
     const previousSettings = {
       codexAutoStart: config.codexAutoStart,
       hasCodexAutoStart: Object.hasOwn(config, "codexAutoStart"),
@@ -671,6 +694,10 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       // Null clears both phases; the GUI sends that when neither row names a model.
       if (memoryModels === null) deleteConfigTopLevelKey(config, "memoryModels");
       else if (memoryModels?.success) config.memoryModels = memoryModels.data;
+      if (resetStorm === null) deleteConfigTopLevelKey(config, "resetStorm");
+      else if (resetStorm?.success) config.resetStorm = resolveResetStormConfig(resetStorm.data);
+      if (capacityRetry === null) deleteConfigTopLevelKey(config, "capacityRetry");
+      else if (capacityRetry?.success) config.capacityRetry = capacityRetry.data;
       if (quotaAutoRefreshChange) {
         const { id, window, enabled } = quotaAutoRefreshChange;
         const setting = { ...(config.codexQuotaAutoRefresh?.[id] ?? {}) };
@@ -731,6 +758,10 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       configureAppOwnedMemoryBudget(resolveAppOwnedMemoryBudgetBytes(body.appOwnedMemoryBudgetMb));
       enforceAppOwnedMemoryBudget();
     }
+    // Same wiring loadConfig() performs on every read, so the saved change reaches the
+    // running process without a restart.
+    if (body.resetStorm !== undefined) configureResetStorm(config.resetStorm);
+    if (body.capacityRetry !== undefined) configureCapacityLadder(config.capacityRetry);
     const authlessIsEnabled = config.codexDesktopAuthless === true;
     const clientCompactionIsEnabled = config.codexClientCompaction === true;
     const fastRowsIsEnabled = config.fastRows !== false;
@@ -782,6 +813,8 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       // The panel re-reads its own save response, so a missing block would render both
       // phases as "Off" while the server kept them.
       memoryModels: config.memoryModels ?? null,
+      resetStorm: config.resetStorm ?? null,
+      capacityRetry: config.capacityRetry ?? null,
       codexMainAccountHardLock: isMainAccountHardLockEnabled(config),
       mainAccountHardLock: { ...getMainAccountHardLockStatus(config),
         externalUsage: getMainAccountExternalUsageWarning(getObservedMainQuotaIdentityKey()) },

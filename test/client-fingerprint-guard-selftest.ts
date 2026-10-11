@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 /**
  * Self-test for the client fingerprint guard (2026-09-25).
  *
@@ -17,7 +18,7 @@ import { join } from "node:path";
 process.env.OPENCODEX_HOME = mkdtempSync(join(tmpdir(), "ocx-fingerprint-"));
 const home = process.env.OPENCODEX_HOME;
 
-const PKG = new URL("../src", import.meta.url).pathname.replace(/\/$/, "");
+const PKG = fileURLToPath(new URL("../src/", import.meta.url)).replace(/[\\/]+$/, "").replace(/\\/g, "/");
 const { observeClientFingerprint, fingerprintGuardSnapshot,
   clearClientFingerprintGuardForTests } = await import(PKG + "/codex/client-fingerprint-guard.ts");
 

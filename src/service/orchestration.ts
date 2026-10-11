@@ -3,7 +3,7 @@ import { existsSync, unlinkSync } from "node:fs";
 import { getConfigDir } from "../config";
 import { readPid, removePid, removeRuntimePort, verifyPidIdentity } from "../config/process-state";
 import { isWslRuntime } from "../codex/home";
-import { isProcessAlive, stopProxy } from "../lib/process-control";
+import { isProcessAlive, killProxy, stopProxy } from "../lib/process-control";
 import { randomUUID } from "node:crypto";
 import { startWinswService, stopWinswService, statusWinswRaw, uninstallWinswService, winswStatusSummary, type WinswStatus } from "../lib/winsw";
 import { diagnoseService } from "./diagnostics";
@@ -226,6 +226,121 @@ export async function stopTrackedProxyForServiceCommand(): Promise<TrackedProxyC
   } catch (err) {
     console.error(`⚠️  Failed to stop proxy: ${err instanceof Error ? err.message : String(err)}`);
     return "none";
+  }
+}
+
+/** What a restart reclaim found before and after it took the runtime back. */
+export interface ServiceRestartReclaim {
+  /** Pid of the proxy serving before the restart; null when no probe named one. */
+  previousPid: number | null;
+  /** Pid reclaimed with a direct kill; null when nothing live was found. */
+  reclaimedPid: number | null;
+}
+
+export interface ServiceRestartReclaimDeps {
+  readTrackedPid?: () => number | null;
+  verifyTracked?: (pid: number | null | undefined) => number | null;
+  isAlive?: (pid: number) => boolean;
+  kill?: (pid: number) => void;
+  clearPid?: (pid: number) => void;
+  clearPort?: (pid: number) => void;
+  findLive?: () => Promise<{ pid: number | null } | null>;
+}
+
+/** Identity-checked discovery of the proxy serving this home, capped like the stop path. */
+function findRestartTarget(): Promise<{ pid: number | null } | null> {
+  return findLiveProxy({
+    ...SERVICE_STOP_LIVENESS,
+    deadlineAt: Date.now() + 7000,
+    acceptPackageTreeFenced: true,
+  });
+}
+
+/**
+ * Take the runtime back for `ocx service repair` / `restart` on the Windows scheduler backend.
+ *
+ * The cleanup this replaces asked the proxy to stop through the management API, and a proxy
+ * under a respawnable Task Scheduler wrapper refuses exactly that request
+ * (`respawnable_service`) by design: an API client cannot end the task. The refusal was logged
+ * and swallowed, the repair went on to stop and restart the task, and the child the wrapper
+ * left behind kept the port — so `ocx service restart` reported a restart that replaced
+ * nothing, and `/healthz` was answered by the process still running the old code. The caller
+ * has already ended the task and its launchers, so the child is the only piece left: kill it
+ * directly, after the same identity verification the stop path uses for every pid it kills.
+ *
+ * The pid serving BEFORE the kill is returned alongside the one that was reclaimed, because
+ * after the kill the probe has nothing left to name — and that pid is the only evidence that
+ * can tell a genuine replacement from a survivor when the command reports success.
+ */
+export async function reclaimProxyForServiceRestart(
+  deps: ServiceRestartReclaimDeps = {},
+): Promise<ServiceRestartReclaim> {
+  const verify = deps.verifyTracked ?? verifiedKillTarget;
+  const isAlive = deps.isAlive ?? isProcessAlive;
+  const kill = deps.kill ?? killProxy;
+  const clearPid = deps.clearPid ?? removePid;
+  const clearPort = deps.clearPort ?? removeRuntimePort;
+
+  const live = await (deps.findLive ?? findRestartTarget)();
+  const rawTracked = (deps.readTrackedPid ?? readPid)();
+  const trackedPid = verify(rawTracked);
+  // The probe answers with a pid the identity check already agreed on; the pid file covers the
+  // case where the port has already been released but a live proxy still writes that record.
+  const target = live?.pid ?? trackedPid;
+  if (target === null) {
+    // Nothing verifiable is running. Drop a stale record so the next command does not inherit
+    // a pid it has to disbelieve; both removers are value-guarded, so a rewritten record wins.
+    if (typeof rawTracked === "number" && Number.isSafeInteger(rawTracked) && rawTracked > 0) {
+      clearPid(rawTracked);
+      clearPort(rawTracked);
+    }
+    return { previousPid: null, reclaimedPid: null };
+  }
+  // A record can outlive its process: clearing it is still the right cleanup, and there is
+  // nothing to kill. Anything alive is reclaimed with the direct kill, never the API stop.
+  const wasAlive = isAlive(target);
+  if (wasAlive) kill(target);
+  clearPid(target);
+  clearPort(target);
+  return { previousPid: target, reclaimedPid: wasAlive ? target : null };
+}
+
+/**
+ * Wait, bounded, for a proxy that is NOT the pid a restart just reclaimed.
+ *
+ * Health cannot answer whether a restart replaced anything: the child the wrapper left behind
+ * and its replacement are both this home's proxy on the same port, so both satisfy
+ * `confirmServiceServing`. The pid is the only thing that separates them, so a wait that expires
+ * with the same pid still answering is the restart failing to replace the runtime — and that is
+ * exactly the answer the caller must not turn into a success line.
+ * Returns the replacement pid, or null when the budget expires with nothing new serving.
+ */
+export async function waitForReplacementProxy(
+  previousPid: number | null,
+  deps: {
+    findProxy?: () => Promise<{ pid: number | null } | null>;
+    sleep?: (ms: number) => Promise<void>;
+    now?: () => number;
+    timeoutMs?: number;
+  } = {},
+): Promise<number | null> {
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
+  const now = deps.now ?? Date.now;
+  const findProxy = deps.findProxy
+    ?? (() => findLiveProxy({ ...SERVICE_STOP_LIVENESS, deadlineAt: now() + 5000, nowFn: now }));
+  const deadline = now() + (deps.timeoutMs ?? 20_000);
+  for (;;) {
+    let live: { pid: number | null } | null;
+    try {
+      live = await findProxy();
+    } catch {
+      live = null;
+    }
+    // A pidless legacy body cannot be told from the reclaimed one; it must not be accepted as
+    // a replacement, and it must not stop the wait either — the real child may still be coming.
+    if (live?.pid != null && live.pid !== previousPid) return live.pid;
+    if (now() >= deadline) return null;
+    await sleep(500);
   }
 }
 

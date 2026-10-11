@@ -32,6 +32,8 @@ import { getConfigDir } from "../config/paths";
  * enough to catch a lane that is genuinely unusable, not merely busy. */
 const VERDICT_THRESHOLD = 6;
 const VERDICT_WINDOW_MS = 10 * 60_000;
+/** Two cuts in one window are enough evidence that this thread's WS lane is unhealthy. */
+const CUT_HTTP_DEMOTION_THRESHOLD = 2;
 /** Escalating holds; the last value repeats. */
 const DEMOTION_HOLD_MS = [30 * 60_000, 60 * 60_000, 120 * 60_000];
 /** A thread with no verdicts for this long starts over at the first hold. */
@@ -116,11 +118,8 @@ const ledger = new Map<string, ThreadTransportEntry>();
 /**
  * The armed conversations, persisted so a restart cannot silently un-fix a working conversation.
  *
- * The ledger itself is deliberately in-memory: a demotion is a fresh judgement about recent
- * verdicts. The AFFINITY hold is different -- it is the one piece of state whose loss costs the
- * operator a slow, shedding conversation again (observed: the shed came back ten seconds after a
- * disarm, and every restart in this session cleared the holds). Only the key and its expiry are
- * written; verdict history is not.
+ * Recent verdict history stays in memory, but active affinity and HTTP/SSE holds are persisted so
+ * a proxy restart cannot immediately put a known-bad conversation back on the WS lane.
  */
 const AFFINITY_STATE_FILE = "thread-affinity.json";
 const AFFINITY_STATE_VERSION = 1;
@@ -131,13 +130,40 @@ function affinityStatePath(): string {
 
 function loadAffinityState(): void {
   try {
-    const raw = JSON.parse(readFileSync(affinityStatePath(), "utf8")) as { version?: unknown; armed?: unknown };
+    const raw = JSON.parse(readFileSync(affinityStatePath(), "utf8")) as {
+      version?: unknown;
+      armed?: unknown;
+      httpOnly?: unknown;
+    };
     if (raw.version !== AFFINITY_STATE_VERSION || typeof raw.armed !== "object" || raw.armed === null) return;
     const now = Date.now();
     for (const [key, until] of Object.entries(raw.armed as Record<string, unknown>)) {
       if (typeof until !== "number" || !Number.isFinite(until) || until <= now) continue;
       const entry: ThreadTransportEntry = { verdicts: [], rung: 0, httpOnlyUntil: 0, affinityResetUntil: until, lastAt: now };
       ledger.set(key, entry);
+    }
+    if (!raw.httpOnly || typeof raw.httpOnly !== "object" || Array.isArray(raw.httpOnly)) return;
+    for (const [key, rawEntry] of Object.entries(raw.httpOnly as Record<string, unknown>)) {
+      const entry = rawEntry && typeof rawEntry === "object" && !Array.isArray(rawEntry)
+        ? rawEntry as { until?: unknown; rung?: unknown }
+        : undefined;
+      const until = entry?.until;
+      if (typeof until !== "number" || !Number.isFinite(until) || until <= now) continue;
+      const rung = typeof entry?.rung === "number" && Number.isInteger(entry.rung) && entry.rung >= 0
+        ? Math.min(entry.rung, DEMOTION_HOLD_MS.length - 1)
+        : 0;
+      const prior = ledger.get(key);
+      ledger.set(key, {
+        verdicts: prior?.verdicts ?? [],
+        restrictionVerdicts: prior?.restrictionVerdicts,
+        cutVerdicts: prior?.cutVerdicts,
+        slowHeaderHits: prior?.slowHeaderHits,
+        relativeSlowHits: prior?.relativeSlowHits,
+        rung,
+        httpOnlyUntil: until,
+        affinityResetUntil: prior?.affinityResetUntil ?? 0,
+        lastAt: now,
+      });
     }
   } catch {
     /* absent or malformed state means "nothing armed" */
@@ -146,15 +172,17 @@ function loadAffinityState(): void {
 
 function persistAffinityState(now: number): void {
   const armed: Record<string, number> = {};
+  const httpOnly: Record<string, { until: number; rung: number }> = {};
   for (const [key, entry] of ledger) {
     if (entry.affinityResetUntil > now) armed[key] = entry.affinityResetUntil;
+    if (entry.httpOnlyUntil > now) httpOnly[key] = { until: entry.httpOnlyUntil, rung: entry.rung };
   }
   try {
     // atomicWriteFile, not writeFileSync: it is upstream's platform-aware replace -- a private
     // temp plus a rename that retries EBUSY/EPERM/EACCES on Windows, where a plain overwrite of a
     // file another process has open fails or truncates. The hold is small state, but it is exactly
     // the state an operator notices losing.
-    atomicWriteFile(affinityStatePath(), JSON.stringify({ version: AFFINITY_STATE_VERSION, armed }, null, 2) + "\n");
+    atomicWriteFile(affinityStatePath(), JSON.stringify({ version: AFFINITY_STATE_VERSION, armed, httpOnly }, null, 2) + "\n");
   } catch {
     /* persistence is best-effort: the in-memory hold still applies for this process */
   }
@@ -407,7 +435,12 @@ export function shouldArmUpstreamCut(
   firstOutputMs: number | undefined,
 ): boolean {
   if (!Number.isFinite(status) || status < 500) return false;
-  return firstOutputMs !== undefined || transportPhase === "terminal_sse";
+  // A Responses WS may have delivered only response.created/in_progress before the socket
+  // dies. That is still a started stream from the client's point of view, and the repeated
+  // 1006/protocol-prelude shape must be allowed to demote this thread to HTTP/SSE.
+  return firstOutputMs !== undefined
+    || transportPhase === "terminal_sse"
+    || transportPhase === "mid_stream";
 }
 
 export function noteThreadUpstreamCut(
@@ -427,6 +460,16 @@ export function noteThreadUpstreamCut(
   entry.cutVerdicts = (entry.cutVerdicts ?? []).filter(at => now - at < VERDICT_WINDOW_MS);
   entry.lastAt = now;
   entry.affinityResetUntil = Math.max(entry.affinityResetUntil, now + EXPERIMENTAL_RESET_HOLD_MS);
+  if (entry.cutVerdicts.length >= CUT_HTTP_DEMOTION_THRESHOLD && entry.httpOnlyUntil <= now) {
+    const hold = DEMOTION_HOLD_MS[Math.min(entry.rung, DEMOTION_HOLD_MS.length - 1)]!;
+    entry.httpOnlyUntil = now + hold;
+    entry.rung = Math.min(entry.rung + 1, DEMOTION_HOLD_MS.length - 1);
+    entry.cutVerdicts = [];
+    console.warn(
+      "[opencodex] thread " + key.slice(0, 8) + ": repeated upstream cuts - demoted to HTTP/SSE for "
+      + Math.round(hold / 60_000) + "min",
+    );
+  }
   ledger.delete(key);
   ledger.set(key, entry);
   persistAffinityState(now);

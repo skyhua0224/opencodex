@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { saveCodexAccountCredential } from "../../src/codex/account-store";
 import { clearAccountQuota, updateAccountQuota } from "../../src/codex/auth-api";
 import { clearCodexUpstreamHealth } from "../../src/codex/routing";
 import { clearUpstreamHostHealth } from "../../src/codex/upstream-host-health";
+import { clearConversationSelectionsForTests, rememberConversationSelection } from "../../src/server/responses/conversation-selection";
+import { clearThreadModelSettingsForTests, threadModelSettingForRequest } from "../../src/server/responses/thread-model-settings";
 import { handleResponsesCompact } from "../../src/server/responses";
 import type { OcxConfig } from "../../src/types";
 import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
@@ -15,6 +17,8 @@ const originalFetch = globalThis.fetch;
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  clearConversationSelectionsForTests();
+  clearThreadModelSettingsForTests();
 });
 
 /**
@@ -191,12 +195,16 @@ describe("compact handoff route admission namespacing", () => {
         }
       }
 
-      // The owner's own quota-blocked retry still finds the route and hands off.
+      // The owner has since made an ordinary request with another model. That fresh
+      // selection outranks the older compact-only route: the retry stays on the model
+      // the conversation is now using instead of returning to DeepSeek.
+      rememberConversationSelection(new Headers(headers), owner, "openai-apikey/gpt-5.6-sol");
       calls.length = 0;
       const handoff = await compact("openai-apikey/gpt-5.6-sol", owner);
       try {
-        expect(handoff.status).toBe(200);
-        expect(calls.at(-1)).toEqual({ model: "deepseek-v4-flash", nativeCompact: false });
+        expect(handoff.status).toBe(502);
+        expect(calls.length).toBeGreaterThan(0);
+        expect(calls.every(call => call.model === "gpt-5.6-sol" && call.nativeCompact)).toBe(true);
       } finally {
         await handoff.body?.cancel();
       }
@@ -204,4 +212,36 @@ describe("compact handoff route admission namespacing", () => {
     // Five request sequences ride the transient-502 retry ladder; the default
     // 5s budget is not enough on a contended host.
   }, 20000);
+
+  test("loopback reads the latest Codex thread setting from rollout history", () => {
+    const testDir = mkdtempSync(join(tmpdir(), "ocx-thread-model-settings-"));
+    const previousCodexHome = process.env.CODEX_HOME;
+    const previousOpencodexHome = process.env.OPENCODEX_HOME;
+    const threadId = "01a00000-0000-4000-8000-000000000001";
+    try {
+      process.env.CODEX_HOME = testDir;
+      process.env.OPENCODEX_HOME = testDir;
+      const rolloutDir = join(testDir, "sessions", "2026", "10", "01");
+      mkdirSync(rolloutDir, { recursive: true });
+      writeFileSync(join(rolloutDir, "rollout-thread.jsonl"), `${JSON.stringify({
+        timestamp: "2026-10-01T10:00:00.000Z",
+        type: "event_msg",
+        payload: {
+          type: "thread_settings_applied",
+          thread_settings: { thread_id: threadId, model: "gpt-5.6-sol" },
+        },
+      })}\n`);
+      const setting = threadModelSettingForRequest(
+        new Headers({ "thread-id": threadId }),
+        { kind: "loopback", source: "loopback" },
+      );
+      expect(setting?.model).toBe("gpt-5.6-sol");
+    } finally {
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previousOpencodexHome;
+      removeTreeWithRetry(testDir);
+    }
+  });
 });

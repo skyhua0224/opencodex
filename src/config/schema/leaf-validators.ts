@@ -112,7 +112,8 @@ export const transientRetryOn5xxPolicySchema = z.object({
  */
 export const retryOnResetPolicySchema = z.object({
   enabled: z.boolean().optional(),
-  replacements: z.number().int().min(1).max(2).optional(),
+  replacements: z.number().int().min(1).max(4).optional(),
+  allowStateful: z.boolean().optional(),
 }).strict();
 
 const requestPacingRuleSchema = z.object({

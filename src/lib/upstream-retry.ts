@@ -18,7 +18,9 @@
 import { withSsePreludeDeclineRetry } from "./sse-prelude-retry";
 
 import { clearableDeadline } from "./abort";
+import { BOUNDED_BODY_MAX_BYTES, BOUNDED_BODY_TIMEOUT_MS, readBoundedResponseBytes } from "./bounded-body";
 import { redactSecretString } from "./redact";
+import { resetStorm } from "./reset-storm";
 
 /**
  * Responses the origin may already be executing. RFC 9110 §9.2.2 forbids an intermediary
@@ -153,6 +155,9 @@ export function carryReplayRefusal<T extends Response>(source: Response, rewrapp
 const RESET_RETRY_MAX_ATTEMPTS = 3;
 const RESET_RETRY_BASE_DELAY_MS = 150;
 const RESET_RETRY_MAX_DELAY_MS = 1_000;
+// Storm-lane identity for legs the caller did not name: one id per helper call, so the
+// retries inside one call count as ONE lane while concurrent calls count as their own.
+let resetStormLegCounter = 0;
 
 // Transient-5xx status retry layer (pre-stream only; devlog/_plan/260716_claudecode_hardening/010).
 /** Total sends one transient-retry helper call may make: 1 initial + 2 retries. */
@@ -222,7 +227,10 @@ const TRANSIENT_RETRY_SLOW_ATTEMPT_MS = 15_000;
  * Upstream statuses treated as transient: gateway errors and Cloudflare 52x.
  * 500 is included per the OpenAI SDK default (auto-retries >=500; Tier-2 proven in
  * devlog/260716_ocx_claude_sol_502_midstream/02). 507 was observed in the 48h ledger
- * but is deliberately excluded (storage-class, not gateway-transient).
+ * but is deliberately excluded here (storage-class, not gateway-transient). The one
+ * 507 shape the capacity lane below may still absorb is the origin's own
+ * retry-buffer overflow verdict, confirmed by body marker -- see
+ * peekOriginRetryBufferOverflow.
  */
 export function isTransientUpstreamStatus(status: number): boolean {
   return status === 500 || status === 502 || status === 503 || status === 504
@@ -501,6 +509,17 @@ export interface ResetRetryOptions {
   /** Total upstream sends allowed, including the first one. Not a per-layer retry count. */
   attempts?: number;
   /**
+   * Paced waits for an upstream 429, as the waits before each resend.
+   *
+   * Paces the outer transient lane 429 lane AND the one place the reset layer itself
+   * re-sends: an operator replacement that is answered 429 (measured 2026-10-11 15:35-18:29:
+   * reset -> operator replacement -> 429 settled as the replay refusal, five turns dead). A 429
+   * proves the replacement never ran, so before the refusal settles it is absorbed here, each
+   * resend drawing the operator replacement grant. Absent or empty keeps 429 exactly as it
+   * was -- settled as the refusal.
+   */
+  retryRateLimitDeferralsMs?: readonly number[];
+  /**
    * Reports how many upstream sends this call actually consumed, so a caller that spans
    * several legs of one request (initial send, then a 429/account-recovery refetch) can
    * keep them on ONE budget instead of handing each leg a fresh one.
@@ -525,6 +544,13 @@ export interface ResetRetryOptions {
    * `attempts`, exactly like every other send this leg makes.
    */
   claimAmbiguousResend?: () => boolean;
+  /**
+   * Stable identity for reset-storm coordination. Every retry inside one call shares it,
+   * so the storm counts this leg as ONE lane; concurrent legs of the same logical request
+   * pass different ids (a request id is ideal). Absent falls back to a per-call unique id,
+   * which is still correct for the gate and only coarser for detection.
+   */
+  stormLaneId?: string;
 }
 
 export interface TransientRetryOptions extends ResetRetryOptions {
@@ -558,6 +584,9 @@ export interface TransientRetryOptions extends ResetRetryOptions {
    * means the origin is busy, a 429 means this requester is over a limit. Both arrive before
    * anything has run, both are spent as ADDITIONAL sends, and neither widens `attempts`. An empty
    * list keeps 429 exactly as it was -- a non-transient status the caller owns.
+    *
+    * Declared on {@link ResetRetryOptions}: the same list also paces the reset layer own
+    * replacement-429 absorption.
    */
   retryRateLimitDeferralsMs?: readonly number[];
   /**
@@ -684,18 +713,64 @@ export async function fetchWithResetRetry(
   // settles as the refusal or an unambiguous answer: a second send of a possibly-executed turn
   // is already out, and handing the client anything it would retry compounds it.
   let spentOperatorReplacement = false;
+  /** Paced 429 absorbs spent on the operator replacement own answer, across the whole call. */
+  let replacement429Absorbs = 0;
+  // One stable identity per leg (see ResetRetryOptions.stormLaneId), and the same origin
+  // label the retry warn log prints as the coordination scope.
+  const stormLane = opts.stormLaneId ?? "leg-" + String(resetStormLegCounter++);
+  const stormScope = opts.label ?? "";
   for (let attempt = 0; attempt < attempts; attempt++) {
     if (opts.abortSignal?.aborted) throw abortError(opts.abortSignal);
+    // The storm gate delays REPLACEMENT sends only. The first send of a leg is never
+    // gated: one request's latency must not depend on its neighbors' connection health.
+    // A "defer" settles this leg without the send -- the budget never counted it, so no
+    // phantom spend is reported -- with exactly the verdict an exhausted budget has.
+    const stormGate = attempt === 0
+      ? null
+      : await resetStorm().acquireReplacementSlot(stormScope, opts.abortSignal);
+    if (stormGate === "defer") {
+      if (opts.abortSignal?.aborted) throw abortError(opts.abortSignal);
+      if (opts.replaySafe === true) throw lastError ?? new Error("upstream fetch failed");
+      return replayRefusalResponse();
+    }
     // Reported before the await, one physical send at a time: a send that rejects has still
     // been made, and this helper leaves through four exits (return, reset give-up, non-reset
     // rethrow, abort), so a per-send report is the only shape that is correct on all of them.
     opts.onSendsConsumed?.(1);
     try {
       const response = await doFetch(attempt === 0 ? firstRecovery : "connection-reset");
-      return spentOperatorReplacement ? settleOperatorReplacement(response) : response;
+      // Headers arrived over a live connection: proof the reclaim window has passed. Any
+      // send under an active storm counts as the probe that lifts it for every queued lane.
+      resetStorm().noteSendSuccess(stormScope);
+      stormGate?.release();
+      if (!spentOperatorReplacement) return response;
+      const replacementDelays = opts.retryRateLimitDeferralsMs ?? [];
+      let res = response;
+      while (res.status === 429 && replacement429Absorbs < replacementDelays.length) {
+        if (opts.abortSignal?.aborted || opts.claimAmbiguousResend?.() !== true) break;
+        const instructed = retryAfterDelayMs(res.headers);
+        if (instructed !== undefined && instructed > RETRY_AFTER_CEILING_MS) break;
+        const waitMs = instructed ?? replacementDelays[replacement429Absorbs]!;
+        replacement429Absorbs += 1;
+        console.warn(
+          "[upstream-retry] operator replacement answered 429 -- absorbing: waiting " + waitMs + "ms before resend (" + replacement429Absorbs + "/" + replacementDelays.length + ")",
+        );
+        cancelResponseBodyBestEffort(res);
+        await sleepWithAbort(waitMs, opts.abortSignal);
+        const absorbGate = await resetStorm().acquireReplacementSlot(stormScope, opts.abortSignal);
+        if (absorbGate === "defer") return settleOperatorReplacement(res);
+        opts.onSendsConsumed?.(1);
+        res = await doFetch();
+        resetStorm().noteSendSuccess(stormScope);
+        absorbGate?.release();
+      }
+      return settleOperatorReplacement(res);
     } catch (err) {
+      stormGate?.release();
       if (opts.abortSignal?.aborted) throw err;
-      if (!isConnectionResetError(err)) {
+      const connectionReset = isConnectionResetError(err);
+      if (connectionReset) resetStorm().recordReset(stormScope, stormLane);
+      if (!connectionReset) {
         // Whatever ended the leg, an operator replacement already went out, so the first send
         // may have run the turn. Settle it as the refusal instead of throwing into a caller
         // whose transport-failure path answers with a client-retryable 502.
@@ -728,10 +803,17 @@ export async function fetchWithResetRetry(
           spentOperatorReplacement ? "replacing" : "retrying"
         } (${attempt + 2}/${attempts})`,
       );
-      await sleepWithAbort(retryBackoffDelayMs(attempt, {
+      // A storm adds a lane-stable offset on top of the paced ladder, so a herd of
+      // simultaneous resets re-sends across a spread instead of in one clump. Zero unless
+      // a storm is active for this scope.
+      const pacedWaitMs = retryBackoffDelayMs(attempt, {
         baseDelayMs: RESET_RETRY_BASE_DELAY_MS,
         maxDelayMs: RESET_RETRY_MAX_DELAY_MS,
-      }), opts.abortSignal);
+      });
+      await sleepWithAbort(
+        pacedWaitMs + resetStorm().replacementStaggerMs(stormScope, stormLane),
+        opts.abortSignal,
+      );
     }
   }
   throw lastError ?? new Error("upstream fetch failed");
@@ -794,13 +876,52 @@ export const SLOW_SHED_ATTEMPT_MS = 25_000;
  * does not apply to this class, exactly as it does not for capacity.
  *
  * Paced rather than immediate: the limiter counts requests in a window, so resending on the same
- * second spends another request against the same window. Three rungs keep a turn alive for half a
- * minute without turning one rejection into a burst.
+ * second spends another request against the same window. Four rungs keep a turn alive for about
+ * ninety seconds without turning one rejection into a burst.
  */
-export const RATE_LIMIT_RETRY_DELAYS_MS: readonly number[] = [2_000, 8_000, 20_000];
+export const RATE_LIMIT_RETRY_DELAYS_MS: readonly number[] = [2_000, 8_000, 20_000, 45_000];
 
 /** Longest `Retry-After` honoured on a 429 before the answer is handed back untouched. */
 export const RATE_LIMIT_RETRY_AFTER_CEILING_MS = 60_000;
+
+/** The origin's own answer when its edge could not buffer the request to retry it upstream. */
+const ORIGIN_RETRY_BUFFER_LIMIT_MARKER = "exceeded request buffer limit";
+
+/**
+ * Peek a 507 body for the origin retry-buffer overflow verdict.
+ *
+ * Measured 2026-10-11 13:24 (+08): a 490k-token gpt-6.1-sol turn was answered 507 with this
+ * body in 10.3s, and the client's immediate resend of the same turn succeeded -- the overflow
+ * is a "not now" about the request's transient edge buffering, not about storage durability,
+ * which is why it may ride the capacity lane while every other 507 keeps its exclusion.
+ * The read is bounded to an error-body budget; a body that says anything else (or one that
+ * cannot be read) is handed back with its status and, when the bytes were retained, its body.
+ */
+async function peekOriginRetryBufferOverflow(
+  res: Response,
+  signal?: AbortSignal,
+): Promise<{ overflow: boolean; response: Response }> {
+  try {
+    const bounded = await readBoundedResponseBytes(res, {
+      signal,
+      maxBytes: BOUNDED_BODY_MAX_BYTES,
+      inactivityTimeoutMs: BOUNDED_BODY_TIMEOUT_MS,
+    });
+    const overflow = !bounded.oversized
+      && new TextDecoder("utf-8", { fatal: false }).decode(bounded.bytes).includes(ORIGIN_RETRY_BUFFER_LIMIT_MARKER);
+    if (overflow) return { overflow: true, response: res };
+    const headers = new Headers(res.headers);
+    headers.delete("content-length");
+    headers.delete("content-encoding");
+    return {
+      overflow: false,
+      response: new Response(bounded.bytes, { status: res.status, statusText: res.statusText, headers }),
+    };
+  } catch {
+    // An unreadable body must not change the verdict: keep the status, lose the bytes.
+    return { overflow: false, response: res };
+  }
+}
 
 export async function fetchWithTransientRetry(
   doFetch: ReplayableFetch,
@@ -893,8 +1014,15 @@ export async function fetchWithTransientRetry(
     // A 429 only enters this loop when the caller opted into a rate-limit ladder; without one it
     // keeps its old meaning (a non-transient status the caller owns) and returns here.
     const rateLimited = res.status === 429 && rateLimitDelays.length > 0;
-    if (res.ok || (!isTransientUpstreamStatus(res.status) && !rateLimited) || isNonReplayableResponse(res)) {
-      return wrapSseDeclineRetry(res);
+    let originRetryBufferOverflow = false;
+    let settled = res;
+    if (res.status === 507 && !isNonReplayableResponse(res) && capacityDelays.length > 0) {
+      const peek = await peekOriginRetryBufferOverflow(res, opts.abortSignal);
+      originRetryBufferOverflow = peek.overflow;
+      settled = peek.response;
+    }
+    if (res.ok || (!isTransientUpstreamStatus(res.status) && !rateLimited && !originRetryBufferOverflow) || isNonReplayableResponse(res)) {
+      return wrapSseDeclineRetry(settled);
     }
     // Checked before cancelResponseBodyBestEffort so an already-aborted caller never receives
     // a response whose body we just cancelled.
@@ -902,7 +1030,7 @@ export async function fetchWithTransientRetry(
     // Capacity lane, checked BEFORE the slow gate: the canonical backend's shed answers arrive in
     // anywhere from 1s to 36s (measured 2026-09-23), so gating on elapsed time missed the fast
     // half of them entirely.
-    if ((res.status === 502 || res.status === 503 || res.status === 504)
+    if ((res.status === 502 || res.status === 503 || res.status === 504 || originRetryBufferOverflow)
       && capacityRetriesUsed < capacityDelays.length) {
       const attemptMs = Date.now() - attemptStart;
       const slowShedMs = opts.slowShedAttemptMs ?? SLOW_SHED_ATTEMPT_MS;
@@ -910,7 +1038,7 @@ export async function fetchWithTransientRetry(
         console.warn(
           `[upstream-retry] capacity ${res.status}${opts.label ? ` (${opts.label})` : ""} after ${(attemptMs / 1000).toFixed(1)}s of queueing — slow weight-shaped shed; skipping the remaining ${capacityDelays.length - capacityRetriesUsed} rung(s) and handing the answer back`,
         );
-        return res;
+        return settled;
       }
       const waitMs = capacityDelays[capacityRetriesUsed]!;
       capacityRetriesUsed += 1;
@@ -970,6 +1098,8 @@ export async function fetchWithTransientRetry(
     // capacity rungs below have not been spent: the extra sends exist for "the origin said not now"
     // and must never widen the general transient ladder (a forward pool that retries its own 429s
     // and 500s is the amplification the send budget was built to stop).
+    // The overflow rungs are spent: hand the retained answer back, body intact.
+    if (originRetryBufferOverflow) return settled;
     if (sent >= budget) return res;
     if (Date.now() - attemptStart > slowAttemptMs) {
       // The ChatGPT backend's capacity verdicts arrive SLOWLY: on 2026-09-23 one conversation was

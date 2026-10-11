@@ -126,7 +126,13 @@ function frameType(text: string): string | undefined {
 
 function isCapacityDecline(text: string): boolean {
   const lower = text.toLowerCase();
-  return lower.includes("overloaded") || lower.includes("capacity") || lower.includes("server_is_overloaded");
+  return lower.includes("overloaded") || lower.includes("capacity") || lower.includes("server_is_overloaded")
+    // The screening gate has its own "not now": a 200 SSE that holds the prelude ~29s and then
+    // errors with this verdict ran nothing (measured 2026-10-11 15:40-15:43: four turns,
+    // protocol-prelude, sendCount 1 each, terminal synthesized). Same decline shape, same ladder.
+    // The phrase is narrow, and an answer merely quoting it still has to pass the explicit
+    // framing checks in isDeclineFrame (or arrive after real content, which is never retried).
+    || lower.includes("response protection is unavailable");
 }
 
 /**
@@ -185,7 +191,7 @@ function isDeclineFrame(frameText: string, type: string | undefined): boolean {
   // allowed to contain these words (this investigation's own replies do). Without a frame type the
   // verdict must therefore be explicit, not merely mentioned.
   if (type === undefined) {
-    return /"server_is_overloaded"|"type"\s*:\s*"error"|"status"\s*:\s*"failed"|"code"\s*:\s*"(?:server_is_overloaded|capacity)"/.test(frameText);
+    return /"server_is_overloaded"|"response protection is unavailable"|"type"\s*:\s*"error"|"status"\s*:\s*"failed"|"code"\s*:\s*"(?:server_is_overloaded|capacity)"/.test(frameText);
   }
   if (type === "error" || type === "response.failed") return true;
   if (type !== "response.completed") return false;

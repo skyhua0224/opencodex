@@ -12,8 +12,8 @@ import { withWindowsServiceMutationLock } from "../lib/windows-service-mutation-
 import { maybeShowStarPrompt } from "../cli/star-prompt";
 import { serviceStatusReport } from "./diagnostics";
 import { assertServiceEnvironmentMatchesInstall, assertServiceAuthEnvironment } from "./guards";
-import { resolveServiceListenPort, reportServiceServing } from "./health";
-import { platformOps, proxyStillLiveAfterStop, stopTrackedProxyForServiceCommand, installServiceSafely, installFreshWindowsSchedulerSafely, removeServiceInstallState, isServiceInstalled } from "./orchestration";
+import { resolveServiceListenPort, reportServiceServing, serviceInstallHealthMs } from "./health";
+import { platformOps, proxyStillLiveAfterStop, reclaimProxyForServiceRestart, stopTrackedProxyForServiceCommand, waitForReplacementProxy, installServiceSafely, installFreshWindowsSchedulerSafely, removeServiceInstallState, isServiceInstalled } from "./orchestration";
 import { repairService } from "./repair";
 import type { ServiceRepairVerb } from "./repair";
 import { TASK, plistPath, readServiceBackend, releaseServiceOwner, resolveServiceOwnership, serviceStatePaths } from "./state";
@@ -23,6 +23,7 @@ import type { ServiceBackend } from "./state";
 import { unitPath } from "./systemd";
 import { inspectWindowsSchedulerServiceStatus, schtasksErrorDetail, probeWindowsSchedulerTask } from "./windows-scheduler";
 import type { WindowsSchedulerTaskProbe } from "./windows-scheduler";
+import { killWindowsServiceWrapperProcesses, stopWindows } from "./windows-ops";
 import { win32 } from "node:path";
 import { serviceDiagnosticsSummary } from "./diagnostics";
 import { runServiceClaim } from "./claim";
@@ -249,7 +250,40 @@ export async function serviceCommand(...args: (string | undefined)[]): Promise<v
     // existing registration had been restarted, not repaired (#4914).
     let repairError: unknown;
     try {
+      const repairBackend = parsed.backend ?? (process.platform === "win32" ? readServiceBackend() : "scheduler");
+      const windowsScheduler = process.platform === "win32" && repairBackend === "scheduler";
+      // Task Scheduler's /end stops the task instance but its cmd/wscript wrapper can survive
+      // and leave the old Bun child listening. End the task and its launchers, then reclaim that
+      // child with the direct kill: the management-API stop this path used to call is refused
+      // for exactly this supervisor (`respawnable_service`), so it never reclaimed anything.
+      let previousPid: number | null = null;
+      if (windowsScheduler) {
+        const scheduler = probeWindowsSchedulerTask(TASK);
+        // An unreadable registration cannot be stopped or restarted on purpose: `/end` on a
+        // name whose state is unknown either misses the task or ends someone else's.
+        if (scheduler.status === "unknown") {
+          throw new Error(`Task Scheduler state could not be verified before ${verb}: ${scheduler.detail}`);
+        }
+        if (scheduler.status === "present") {
+          try { stopWindows(); } catch { /* repairService re-verifies the registration */ }
+          try { killWindowsServiceWrapperProcesses(); } catch { /* the reclaim below still runs */ }
+        }
+        previousPid = (await reclaimProxyForServiceRestart()).previousPid;
+      }
       await repairService({ verb });
+      // Registration is not service, and health is not replacement: the reclaimed child and
+      // its replacement both answer /healthz on this home's port, so probing the endpoint alone
+      // is what let a restart that replaced nothing print a checkmark. A different pid is the
+      // only proof the runtime was actually taken back.
+      if (windowsScheduler && previousPid !== null) {
+        const replacement = await waitForReplacementProxy(previousPid, { timeoutMs: serviceInstallHealthMs() });
+        if (replacement === null) {
+          throw new Error(
+            `the proxy serving before the ${verb} (pid ${previousPid}) is still the one answering `
+            + `on port ${resolveServiceListenPort()}, so the running process was not replaced`,
+          );
+        }
+      }
     } catch (error) {
       repairError = error;
       process.exitCode = 1;

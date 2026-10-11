@@ -274,14 +274,10 @@ ocx sync          # the hub now writes its own Codex/Grok blocks
 ocx claude        # Claude Code wired to the hub's own loopback address
 ```
 
-The listener carries inference wires only: `POST /v1/responses` and its WebSocket upgrade,
-`POST /v1/responses/compact`, `POST /v1/messages`, `POST /v1/chat/completions`,
-`POST /v1/alpha/search`, `GET /v1/models`, and the realtime voice surface.
-`POST /v1/messages/count_tokens` is deliberately **not** admitted, so Claude Code falls back to
-local token estimation — a cosmetic loss, not a broken launch. `/api/*`, `/healthz`, `/readyz` and
-the dashboard all return `404` there: local management reads such as `ocx claude`'s discovery call go
-to the authenticated management surface with a management credential, never to an unauthenticated
-socket. That is why the management ingress and this listener remain two different things.
+The listener carries the local `/v1` data routes, `GET /v1/models`, the realtime voice surface,
+the packaged dashboard, session bootstrap, and `/api/*` for the operator's browser workflow.
+`/healthz` and `/readyz` return `404` there. Headless management reads such as `ocx claude`'s
+discovery call still use the authenticated public management surface with their own credential.
 
 With the listener **off**, a hub deliberately does not rewrite its own client configs, and every
 skip names the gate that stopped it:

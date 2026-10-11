@@ -12,6 +12,8 @@ description: 监听、远程访问、准入密钥、超时、存储、侧车、�
 | --- | --- | --- | --- |
 | `port` | `number` | `10100` | 代理监听端口。 |
 | `hostname?` | `string` | `"127.0.0.1"` | 绑定地址。非回环绑定需要 `OPENCODEX_API_AUTH_TOKEN`。 |
+| `unauthenticatedLoopbackListener?` | object | off | 在 `127.0.0.1` 上额外绑定一个本机监听。省略 `port` 时与代理共用端口；该监听提供本机 `/v1`、GUI 和 `/api/*`，但不提供 `/healthz` / `/readyz`。 |
+| `unauthenticatedRemoteListener?` | object | off | 在一个明确的非回环 IPv4 地址和独立端口上绑定无认证数据平面。只提供 `/v1/*`；公共监听仍保持原有认证。 |
 | `proxy?` | `string` | — | 出站 HTTP(S) 或 SOCKS5 代理 URL（`socks5://host:port`），或 `${ENV_VAR}`。HTTP URL 仅在未设置时写入 `HTTP_PROXY` / `HTTPS_PROXY`。SOCKS5 URL 使用内置的真实 SOCKS5 隧道，也会写入 `ALL_PROXY`（`ocx start --socks5`）；并清除本进程继承的 `HTTP(S)_PROXY`。回环地址始终保留在 `NO_PROXY` 中。 |
 | `emptyCompletionRetry?` | `boolean` | `false` | 显式启用：当 Responses turn 既无文本也无工具调用时，使用相同请求重试一次，包括流在终止事件之前结束的情况。重试可能产生费用。`OCX_EMPTY_COMPLETION_RETRY=0` 可在不修改配置的情况下禁用；combo 与 routed-compaction turn 不参与。 |
 | `dropCodexSafetyBuffering?` | `boolean` | `false` | 从 Codex Responses 透传响应中移除 Codex safety-buffering 提示：`x-codex-safety-buffering-enabled` / `x-codex-safety-buffering-faster-model` 响应头、类型为 `safety_buffering` 的 `response.metadata` SSE 事件，以及其他 SSE 事件中的 `safety_buffering` 字段。Codex TUI 会将这些提示显示为“使用更快模型重试”的提示框，其默认操作会把会话切换到较弱的模型。其他 `x-codex-*` 响应头和其他所有 SSE 事件内容均保持不变，但会移除该字段。默认关闭。 |
@@ -75,6 +77,35 @@ Messages 和 `count_tokens` 为兼容路由客户端仍接受三种准入形式�
 :::caution[LAN 暴露]
 绑定到 `0.0.0.0` 会将代理及其配置的提供方访问暴露给局域网。仅应在受信任
 的网络中配合强令牌使用。
+:::
+
+### 本机与可信远程数据监听
+
+下面是一个通用拓扑：公共 `hostname:port` 继续要求凭据，本机使用同一个端口的
+`127.0.0.1`，另一台可信机器使用专用的无认证数据端口：
+
+```json
+{
+  "hostname": "203.0.113.10",
+  "port": 10100,
+  "unauthenticatedLoopbackListener": { "enabled": true },
+  "unauthenticatedRemoteListener": {
+    "enabled": true,
+    "host": "203.0.113.10",
+    "port": 10102
+  }
+}
+```
+
+`127.0.0.1:10100` 提供本机 `/v1`、GUI 和 `/api/*`。`203.0.113.10:10102` 只提供
+`/v1/*`；`/api/*`、GUI、`/healthz` 和 `/readyz` 都会在分发前返回 `404`。远程监听的
+`host` 必须是明确的非回环 IPv4 地址，端口也不能与公共监听或本机监听相同。修改后需要
+重启，因为所有 socket 都在启动时绑定。
+
+:::danger[远程数据监听没有认证]
+能访问该地址和端口的进程都可以消耗已保存的提供方凭据与账户额度。OpenCodex 不会为这个
+监听额外添加凭据；只应在你自己拥有的网络中使用。若要用主机防火墙限制它，请确保限制
+范围与预期客户端一致，而不是改变这个“无认证数据平面”的语义。
 :::
 
 ### SSH 端口转发

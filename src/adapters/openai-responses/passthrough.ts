@@ -242,6 +242,12 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
           throw new Error("Codex pool account auth is required but unavailable");
         }
         if (mayForwardCallerCredentials) {
+          // Bun transparently decodes compressed fetch bodies. A long-lived SSE response that is
+          // cut mid-flight can then surface as `error decoding response body` before the relay
+          // gets a chance to classify the transport reset. Keep the canonical Codex stream plain
+          // so a truncated response is observed as the actual socket failure and can follow the
+          // existing stage-aware recovery rules.
+          headers["accept-encoding"] = "identity";
           for (const h of FORWARD_HEADERS) {
             const v = incoming?.headers.get(h);
             if (v) {

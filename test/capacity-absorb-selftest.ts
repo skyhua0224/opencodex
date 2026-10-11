@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 /**
  * Self-test for the capacity absorb ladder in lib/upstream-retry.ts (2026-09-23).
  *
@@ -8,7 +9,7 @@
  *
  * Run: bun ~/.opencodex/tools/capacity-absorb-selftest.ts
  */
-const PKG = new URL("../src", import.meta.url).pathname.replace(/\/$/, "");
+const PKG = fileURLToPath(new URL("../src/", import.meta.url)).replace(/[\\/]+$/, "").replace(/\\/g, "/");
 const { fetchWithTransientRetry } = await import(PKG + "/lib/upstream-retry.ts");
 
 let failures = 0;

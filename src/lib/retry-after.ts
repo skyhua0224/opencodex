@@ -42,7 +42,7 @@ export function resolveClientRetryAfter(opts: {
   if (fromHeader) return fromHeader;
 
   const message = opts.message ?? "";
-  const fromMessage = parseRetryAfterFromMessage(message);
+  const fromMessage = parseRetryAfterFromMessage(message, now);
   if (fromMessage !== undefined) return String(fromMessage);
 
   if (opts.includeDefault === false) return undefined;

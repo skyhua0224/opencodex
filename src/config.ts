@@ -15,6 +15,8 @@ import {
   projectConfigRebaseProvenance,
 } from "./config/rebase-provenance";
 import { getConfigDir, getConfigPath, hardenConfigDir } from "./config/paths";
+import { configureResetStorm } from "./lib/reset-storm";
+import { configureCapacityLadder } from "./lib/capacity-ladder";
 export { DEFAULT_SUBAGENT_MODELS } from "./config/subagent-models";
 export {
   AtomicWriteResidualTempError,
@@ -209,7 +211,7 @@ import {
  * until a valid config or a genuinely missing file is observed. A partially-
  * invalid config is merged with defaults so providers and pool accounts survive.
  */
-export function loadConfig(): OcxConfig {
+function loadConfigFromDisk(): OcxConfig {
   const dir = getConfigDir();
   const configPath = getConfigPath();
   hardenConfigDir();
@@ -326,6 +328,16 @@ export function loadConfig(): OcxConfig {
     warnAndBackupInvalidConfig(configPath, error);
     return getDefaultConfig();
   }
+}
+
+export function loadConfig(): OcxConfig {
+  const config = loadConfigFromDisk();
+  // One wiring point for lib-level consumers keyed off config.json (reset-storm): cheap,
+  // idempotent, and called on every read so a live config save takes effect without a
+  // restart -- including the reset-to-default paths, which must disarm a configured storm.
+  configureResetStorm(config.resetStorm);
+  configureCapacityLadder(config.capacityRetry);
+  return config;
 }
 
 export type PersistedConfigInitializationOutcome = "created" | "exists" | "invalid";

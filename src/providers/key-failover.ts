@@ -13,6 +13,7 @@ import type { ProviderApiKeySelection } from "../types/provider";
 import { routedProviderConfig } from "../router";
 import { getProviderRegistryEntry } from "./registry";
 import { isCanonicalCommandCodeBaseUrl, normalizedBaseUrl } from "./quota/vendor-probes-key";
+import { isCanonicalOpenAiForwardProvider } from "./openai-tiers-destination";
 import type { OcxConfig, OcxProviderConfig, RateLimitRetryPolicy, ResetReplayPolicy, TransientRetryPolicy } from "../types";
 import { OPENCODE_GO_SESSION_HEADER } from "./opencode-go-transport";
 import { resolveProviderTransport, type OcxProviderTransport } from "./xai-transport";
@@ -334,6 +335,7 @@ const DEFAULT_TRANSIENT_RETRY = {
 const DEFAULT_RESET_REPLAY = {
   enabled: true,
   replacements: 1,
+  allowStateful: false,
 } as const satisfies Required<ResetReplayPolicy>;
 
 /** Map<`${providerName}\0${keyId}`, KeyCooldown> */
@@ -568,7 +570,9 @@ export function selectProactiveApiKeyTransport(
  * burst 429 waits and replays instead of surfacing to the client and aborting a long
  * session; key-auth Command Code at its canonical endpoints gets the same fallback (#5180), and
  * every other provider without the knob keeps today's fail-fast behavior.
- * OAuth/forward/local credentials are never replayed on the same token. The returned
+ * OAuth, noncanonical forward, and local credentials are never replayed on the same token. The
+ * canonical ChatGPT Codex forward endpoint may opt in explicitly because its pre-stream 429
+ * response is a provider rate-limit result, not an unknown transport outcome. The returned
  * policy is fully defaulted so callers never re-check fields.
  */
 export function rateLimitRetryPolicyFor(
@@ -578,11 +582,11 @@ export function rateLimitRetryPolicyFor(
   const policy = provider.retryOn429;
   if (policy) {
     if (policy.enabled === false) return null;
-    // Fail closed: only explicit key auth or the documented omitted-default (undefined == key for
-    // custom API-key providers) may use same-key replays. OAuth/forward are never replayed on the
-    // same token, local runtimes have no remote key to preserve, and unknown/custom values are
-    // rejected rather than guessed at.
-    if (provider.authMode !== undefined && provider.authMode !== "key") return null;
+    // Fail closed: explicit key auth and the canonical ChatGPT Codex forward endpoint may opt in.
+    // OAuth, noncanonical forward, local runtimes, and unknown/custom values are rejected rather
+    // than guessed at.
+    const canonicalForward = isCanonicalOpenAiForwardProvider(provider);
+    if (provider.authMode !== undefined && provider.authMode !== "key" && !canonicalForward) return null;
     return {
       enabled: policy.enabled ?? DEFAULT_RATE_LIMIT_RETRY.enabled,
       attempts: policy.attempts ?? DEFAULT_RATE_LIMIT_RETRY.attempts,
@@ -651,6 +655,7 @@ export function resetReplayPolicyFor(
   return {
     enabled: policy.enabled ?? DEFAULT_RESET_REPLAY.enabled,
     replacements: policy.replacements ?? DEFAULT_RESET_REPLAY.replacements,
+    allowStateful: policy.allowStateful ?? false,
   };
 }
 
@@ -664,13 +669,24 @@ export function rateLimitRetryDelayMs(
   policy: Required<RateLimitRetryPolicy>,
   retryAfterHeader: string | null | undefined,
   now = Date.now(),
+  retryNumber?: number,
+  random = Math.random,
 ): number {
   const raw = retryAfterHeader?.trim();
   if (policy.respectRetryAfter && raw) {
     const parsed = parseRetryAfterMs(raw, now);
     if (parsed !== undefined) return Math.min(parsed, policy.maxIntervalMs);
   }
-  return Math.min(policy.intervalMs, policy.maxIntervalMs);
+  // Keep the historical fixed delay for callers that do not track an attempt number. The
+  // request paths pass a zero-based retry number so concurrent lanes do not wake together after
+  // every 429: exponential backoff plus a small jitter spreads the next wave while still obeying
+  // the operator's ceiling. An explicit Retry-After remains authoritative above.
+  if (retryNumber === undefined) return Math.min(policy.intervalMs, policy.maxIntervalMs);
+  const exponent = Math.min(Math.max(0, retryNumber), 30);
+  const base = Math.min(policy.intervalMs * (2 ** exponent), policy.maxIntervalMs);
+  const drawn = random();
+  const sample = Number.isFinite(drawn) ? Math.min(1, Math.max(0, drawn)) : 0.5;
+  return Math.max(1, Math.min(policy.maxIntervalMs, Math.floor(base * (0.8 + sample * 0.4))));
 }
 
 /**

@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 /**
  * Self-test for cross-turn WebSocket reuse (2026-09-25).
  *
@@ -18,7 +19,7 @@ import { join } from "node:path";
 // Evidence rows must not land in the operator's real ledger.
 process.env.OPENCODEX_HOME = mkdtempSync(join(tmpdir(), "ocx-cross-turn-"));
 
-const PKG = new URL("../src", import.meta.url).pathname.replace(/\/$/, "");
+const PKG = fileURLToPath(new URL("../src/", import.meta.url)).replace(/[\\/]+$/, "").replace(/\\/g, "/");
 const { CodexWsPool, codexWsReuseIdentity, codexWsCrossTurnReuseEnabled, codexWsCrossTurnStats,
   noteCodexWsCrossTurnResult, resetCodexWsCrossTurnState } =
   await import(PKG + "/server/responses/codex-ws-pool.ts");

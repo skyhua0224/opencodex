@@ -19,6 +19,25 @@ export function isStandaloneRuntime(): boolean {
 }
 
 /**
+ * Version of the runtime that served this document, when it stamped one.
+ *
+ * The live source is `/healthz`, but that route is deliberately unavailable on the loopback
+ * companion and on a remote data-plane listener — which is how a local operator browses the
+ * dashboard. Without this the version fell back to the constant Vite baked into the bundle at
+ * build time: a fact about whichever build produced `gui/dist`, not about what is running. The
+ * server stamps every served document, so the badge describes the runtime that answered.
+ *
+ * `null` means an older server, a separately hosted GUI, or the Vite dev server; callers fall
+ * back exactly as they did before.
+ */
+export function runtimeVersionFromDocument(): string | null {
+  if (typeof document === "undefined") return null;
+  const meta = document.querySelector('meta[name="opencodex-version"]');
+  const version = meta?.getAttribute("content")?.trim();
+  return version && version.length > 0 ? version : null;
+}
+
+/**
  * Did the server say this proxy is running as a connected client?
  *
  * Anything else — standalone, hub, an older server that sends no tag, a separately hosted

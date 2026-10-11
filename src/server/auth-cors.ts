@@ -100,7 +100,9 @@ export function isSameOriginAsRequest(req: Request, origin: string): boolean {
 export function isAllowedRequestOrigin(req: Request, config: RequestPolicyView): boolean {
   const origin = req.headers.get("Origin");
   if (!isApiAuthRequired(config)) {
-    if (!isLoopbackRequestHost(req.headers.get("Host"))) return false;
+    if (config.unauthenticatedHost
+      ? parseHttpHost(req.headers.get("Host"))?.hostname !== config.unauthenticatedHost
+      : !isLoopbackRequestHost(req.headers.get("Host"))) return false;
     return !origin || isLoopbackOriginValue(origin) || isExtraAllowedOrigin(origin, config);
   }
   return !origin || isLoopbackOriginValue(origin) || isSameOriginAsRequest(req, origin) || isExtraAllowedOrigin(origin, config);
@@ -295,8 +297,8 @@ export function isLoopbackHostname(hostname: string | undefined): boolean {
   return normalized === "" || normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1" || normalized === "[::1]";
 }
 
-export function isApiAuthRequired(config: Pick<OcxConfig, "hostname">): boolean {
-  return !isLoopbackHostname(config.hostname);
+export function isApiAuthRequired(config: Pick<OcxConfig, "hostname"> & { unauthenticatedHost?: string }): boolean {
+  return !isLoopbackHostname(config.hostname) && !config.unauthenticatedHost;
 }
 
 /**
@@ -321,6 +323,8 @@ export interface LinkIngressPolicy {
 
 export type RequestPolicyView = Pick<OcxConfig, "hostname" | "corsAllowOrigins" | "apiKeys"> & {
   linkIngress?: LinkIngressPolicy;
+  /** Exact Host header hostname accepted by a dedicated unauthenticated listener. */
+  unauthenticatedHost?: string;
 };
 
 export type DataPlaneAdmissionOptions = {
@@ -332,12 +336,14 @@ export function requestPolicyView(
   config: OcxConfig,
   bindHostname: string,
   linkIngress?: LinkIngressPolicy,
+  unauthenticatedHost?: string,
 ): RequestPolicyView {
   return {
     hostname: bindHostname,
     ...(config.corsAllowOrigins ? { corsAllowOrigins: config.corsAllowOrigins } : {}),
     ...(config.apiKeys ? { apiKeys: config.apiKeys } : {}),
     ...(linkIngress ? { linkIngress } : {}),
+    ...(unauthenticatedHost ? { unauthenticatedHost } : {}),
   };
 }
 

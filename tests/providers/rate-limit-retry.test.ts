@@ -15,15 +15,23 @@ describe("rateLimitRetryPolicyFor", () => {
     expect(rateLimitRetryPolicyFor({ retryOn429: { enabled: false } } as OcxProviderConfig)).toBeNull();
   });
 
-  test("null for OAuth, forward, local, and unknown auth modes (fail closed)", () => {
+  test("null for OAuth, noncanonical forward, local, and unknown auth modes (fail closed)", () => {
     expect(rateLimitRetryPolicyFor({
       authMode: "oauth",
       retryOn429: {},
     } as OcxProviderConfig)).toBeNull();
     expect(rateLimitRetryPolicyFor({
       authMode: "forward",
+      baseUrl: "https://relay.example.test/v1",
+      adapter: "openai-responses",
       retryOn429: {},
     } as OcxProviderConfig)).toBeNull();
+    expect(rateLimitRetryPolicyFor({
+      authMode: "forward",
+      baseUrl: "https://chatgpt.com/backend-api/codex",
+      adapter: "openai-responses",
+      retryOn429: { attempts: 5 },
+    } as OcxProviderConfig)).toMatchObject({ enabled: true, attempts: 5 });
     expect(rateLimitRetryPolicyFor({
       authMode: "local",
       retryOn429: {},
@@ -150,6 +158,13 @@ describe("rateLimitRetryDelayMs", () => {
   test("fixed interval when no header is present", () => {
     expect(rateLimitRetryDelayMs(policy, null, 1_000_000)).toBe(5_000);
     expect(rateLimitRetryDelayMs(policy, undefined, 1_000_000)).toBe(5_000);
+  });
+
+  test("uses exponential jitter when the retry number is supplied", () => {
+    expect(rateLimitRetryDelayMs(policy, null, 1_000_000, 0, () => 0)).toBe(4_000);
+    expect(rateLimitRetryDelayMs(policy, null, 1_000_000, 1, () => 0.5)).toBe(10_000);
+    expect(rateLimitRetryDelayMs(policy, null, 1_000_000, 2, () => 1)).toBe(24_000);
+    expect(rateLimitRetryDelayMs(policy, "2", 1_000_000, 3, () => 0)).toBe(2_000);
   });
 
   test("honors Retry-After seconds and caps it at maxIntervalMs", () => {

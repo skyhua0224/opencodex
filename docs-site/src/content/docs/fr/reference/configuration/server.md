@@ -109,9 +109,9 @@ et omet l'en-tête d'authentification ; un serveur d'applications lancé direct
 Le port est obligatoire et doit différer du port proxy. Il n'est jamais attribué par le système d'exploitation : un port éphémère
 changerait au fil des redémarrages tandis que les serveurs d'applications déjà en cours d'exécution conservaient le `base_url` précédent.
 
-L'écouteur ne sert que `POST /v1/responses`, sa mise à niveau WebSocket, `POST /v1/responses/compact`,
-`POST /v1/alpha/search` (le relais de recherche web natif de Codex), `GET /v1/models` et les mises à
-niveau WebSocket vocales autonomes. Tout le reste, y compris `/api/*` et le tableau de bord, renvoie `404`.
+L'écouteur sert les routes de données locales `/v1`, la surface vocale en temps réel,
+`GET /v1/models`, l'interface empaquetée, l'amorçage de session et `/api/*`. Le flux de gestion
+du navigateur reste sur la liaison loopback du noyau ; `/healthz` et `/readyz` renvoient `404`.
 
 :::danger[Surface non authentifiée]
 Chaque processus de la machine peut utiliser cet écouteur. Il consomme le quota du compte et utilise les identifiants de

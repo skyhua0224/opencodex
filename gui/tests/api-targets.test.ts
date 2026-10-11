@@ -4,6 +4,7 @@ import {
   apiBaseForPlane,
   discoverApiTargets,
   relayUrlForPath,
+  runtimeVersionFromDocument,
   standaloneApiTargets,
   targetsFromMachineStatus,
   type MachineStatusV1,
@@ -119,5 +120,19 @@ describe("two-plane API targets", () => {
     globalThis.fetch = (async () => { calls += 1; return new Response(null, { status: 404 }); }) as typeof fetch;
     await discoverApiTargets("");
     expect(calls).toBe(1);
+  });
+
+  test("the served document names the running version, on planes without /healthz", () => {
+    // The loopback companion serves no health route, so this tag is the only thing that keeps the
+    // dashboard from reporting the version Vite baked in when gui/dist was built.
+    const meta = win.document.createElement("meta");
+    meta.setAttribute("name", "opencodex-version");
+    meta.setAttribute("content", " 2.80.0-skyhua.9 ");
+    win.document.head.append(meta);
+    expect(runtimeVersionFromDocument()).toBe("2.80.0-skyhua.9");
+
+    meta.remove();
+    // An older server, a separately hosted GUI, or the Vite dev server: readers fall back.
+    expect(runtimeVersionFromDocument()).toBeNull();
   });
 });

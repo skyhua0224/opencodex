@@ -55,6 +55,7 @@ export interface GuiSessionState {
 
 export interface GuiSessionRequestContext {
   trustedTailscaleIngress: boolean;
+  unauthenticatedLoopback?: boolean;
   now?: number;
 }
 
@@ -179,7 +180,7 @@ export function issueGuiSession(
   if (!host) return null;
   const now = context.now ?? Date.now();
 
-  if (!isApiAuthRequired(config)) {
+  if (!isApiAuthRequired(config) || context.unauthenticatedLoopback === true) {
     if (!isLoopbackHostname(host.hostname) || !isAllowedManagementOrigin(req, config)) return null;
     const origin = managementRequestOrigin(req, config);
     return origin ? mintSession(origin, origin, "loopback", state, now) : null;

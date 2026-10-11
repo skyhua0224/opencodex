@@ -261,9 +261,9 @@ describe("localManagementOrigin", () => {
     )).toBe("http://127.0.0.1:10102");
   });
 
-  test("the loopback listener never answers management, so it is never used here", () => {
-    // `/api/*` is deliberately absent from that listener's allowlist. Resolving management to
-    // it would 404 every discovery call while looking like a reachable local port.
+  test("management discovery still uses the authenticated public surface", () => {
+    // The browser GUI may ride the loopback listener, but headless CLI discovery continues to
+    // resolve the public management surface so it transports its own management credential.
     const origin = localManagementOrigin(
       hub({
         hub: { managementIngress: { enabled: true, port: 10_102 } },

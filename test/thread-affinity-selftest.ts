@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 /**
  * Self-test for the per-thread affinity reset (2026-09-23).
  *
@@ -12,7 +13,7 @@ import { join } from "node:path";
 // Isolate the config home BEFORE the module loads: the operator's real arm file and persisted
 // affinity state would otherwise decide the outcome of every check below.
 process.env.OPENCODEX_HOME = mkdtempSync(join(tmpdir(), "ocx-affinity-selftest-"));
-const PKG = new URL("../src", import.meta.url).pathname.replace(/\/$/, "");
+const PKG = fileURLToPath(new URL("../src/", import.meta.url)).replace(/[\\/]+$/, "").replace(/\\/g, "/");
 const { noteThreadOverloadVerdict, noteThreadRestrictionVerdict, noteThreadUpstreamCut, noteThreadSlowHeaders, noteThreadTurnDuration, shouldArmUpstreamCut, sessionVerdictSummary, isRestrictionVerdictText, threadAffinityResetActive, threadTransportDemotedToHttp, clearThreadTransportLedgerForTests, clearThreadTurnSamplesForTests, clearManualAffinityArmCacheForTests } =
   await import(PKG + "/server/ws-thread-transport.ts");
 

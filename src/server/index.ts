@@ -337,6 +337,18 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
     if (companionError) throw new Error(companionError);
   }
   const loopbackListenerPort = effectiveLoopbackListenerPort(config, listenPort);
+  const remoteListener = config.unauthenticatedRemoteListener;
+  const remoteListenerPort = remoteListener?.enabled === true ? remoteListener.port : null;
+  if (remoteListener?.enabled === true) {
+    if (remoteListener.port === listenPort || remoteListener.port === loopbackListenerPort) {
+      throw new Error("unauthenticatedRemoteListener.port must differ from the public and loopback listener ports");
+    }
+    const parts = remoteListener.host.split(".").map(Number);
+    if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)
+      || parts[0] === 0 || parts[0] === 127 || parts[0] >= 224) {
+      throw new Error("unauthenticatedRemoteListener.host must be a specific non-loopback IPv4 address");
+    }
+  }
   // Hub management ingress is a third, management-only listener. Its address is intentionally
   // fixed: the kernel loopback bind is the trust boundary that permits Tailscale identity headers.
   const managementIngress = config.runtimeRole === "hub" ? config.hub?.managementIngress : undefined;
@@ -356,10 +368,17 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
    */
   const publicPolicy = (): RequestPolicyView => config;
   const loopbackPolicy = (): RequestPolicyView => requestPolicyView(config, "127.0.0.1");
+  const remotePolicy = (): RequestPolicyView => requestPolicyView(
+    config,
+    "0.0.0.0",
+    undefined,
+    remoteListener?.enabled === true ? remoteListener.host : undefined,
+  );
   void publicPolicy;
 
   /**
-   * Routes the unauthenticated loopback listener will serve. Everything else 404s.
+   * Routes the unauthenticated loopback listener will serve. Its data and management surfaces
+   * are allowlisted independently; health/readiness and every other route still 404.
    *
    * This is an allowlist rather than a filter applied to the public handler, because a filter
    * inverts the failure mode: a route added later would be reachable here by default. The
@@ -382,16 +401,16 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
    * leaving them off this list left every non-Codex local client pointed at a closed port.
    * Both handlers resolve their own admission from the RECEIVING listener's policy view — the
    * same resolver and the same loopback short-circuit `/v1/responses` already uses — so this
-   * adds a wire, not a trust level. `/api/*` is deliberately still absent: local management
-   * discovery goes to the authenticated management surface, never to this listener.
+   * adds a wire, not a trust level. The browser management surface also rides this kernel-loopback
+   * bind; headless management discovery still resolves the authenticated public surface itself.
    *
    * `POST /v1/messages/count_tokens` completes that Anthropic wire. It is admitted on a
    * narrower argument than the other two rather than on symmetry: it spends no provider quota,
    * reaches no stored credential, and returns a token count computed from the request body the
    * caller already holds. Withholding it bought no confinement — the same caller may POST the
    * whole conversation to `/v1/messages` on this socket — and cost Claude Code its server-side
-   * count, which it then silently replaces with a local estimate. `/api/*`, `/healthz`,
-   * `/readyz` and the GUI remain 404 here, which is the boundary that actually matters.
+   * count, which it then silently replaces with a local estimate. `/healthz` and `/readyz` remain
+   * 404 here, which keeps liveness discovery off the unauthenticated socket.
    *
    * `GET /v1/models` is on the list for a reason that is easy to miss. When catalog
    * materialization fails or finds no source, `syncCodex` warns and injects with
@@ -401,6 +420,13 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
    */
   function loopbackRouteAllowed(url: URL, req: Request): boolean {
     const path = url.pathname;
+    if (path.startsWith("/api/")) return true;
+    if (path === "/opencodex-session") return req.method === "GET" || req.method === "POST";
+    if (req.method === "GET" || req.method === "HEAD") {
+      // The GUI's SPA fallback must not turn an unknown data or health path into index.html.
+      if ((path === "/" || serveGuiFile(path) !== null)
+        && path !== "/healthz" && path !== "/readyz" && !path.startsWith("/v1/")) return true;
+    }
     if (path === "/v1/responses") {
       return req.method === "POST" || req.headers.get("upgrade")?.toLowerCase() === "websocket";
     }
@@ -620,6 +646,7 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
     };
   let server: Server<WsData>;
   let loopbackServer: Server<WsData> | null = null;
+  let remoteServer: Server<WsData> | null = null;
   let managementIngressServer: Server<WsData> | null = null;
   const optionalListeners = createOptionalListenerSet<WsData>();
   const inboundBodyLimitBytes = resolveInboundBodyLimitWithWarning(config);
@@ -628,6 +655,7 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
     const optionalIngress = optionalListeners.ingressOf(requestServer);
     if (optionalIngress !== undefined) return optionalIngress;
     if (requestServer === loopbackServer) return "unauthenticated-loopback";
+    if (requestServer === remoteServer) return "unauthenticated-remote";
     if (requestServer === managementIngressServer) return "hub-management";
     return "public";
   }
@@ -675,6 +703,7 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
       loadRemoteWorkspaceRuntime,
       localAttestationSecret,
       loopbackPolicy,
+      remotePolicy,
       managementApiDeps,
       managementAuth,
       managementSessionControl,
@@ -713,6 +742,21 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
         throw new AuxiliaryListenerBindError("unauthenticatedLoopbackListener", loopbackListenerPort, "127.0.0.1", error);
       }
     }
+    if (remoteListenerPort !== null && remoteListener?.enabled === true) {
+      try {
+        remoteServer = spendLedgerLifecycle.track(Bun.serve<WsData>({
+          ...serveOptions,
+          port: remoteListenerPort,
+          hostname: remoteListener.host,
+        }));
+      } catch (error) {
+        for (const bound of [loopbackServer, server]) {
+          if (!bound) continue;
+          try { void bound.stop(true); } catch { /* report the original bind error */ }
+        }
+        throw new AuxiliaryListenerBindError("unauthenticatedRemoteListener", remoteListenerPort, remoteListener.host, error);
+      }
+    }
     if (managementIngressPort !== null) {
       try {
         managementIngressServer = spendLedgerLifecycle.track(Bun.serve<WsData>({
@@ -723,7 +767,7 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
       } catch (error) {
         // Preserve the management bind failure while synchronously initiating rollback of every
         // listener already opened in this startup transaction. startServer must not become async.
-        for (const bound of [loopbackServer, server]) {
+        for (const bound of [remoteServer, loopbackServer, server]) {
           if (!bound) continue;
           try { void bound.stop(true); } catch { /* report the original bind error */ }
         }
@@ -743,6 +787,7 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
   bindNativeMainStartupLifecycle(server, nativeMainLifecycle);
   const nativeStop = server.stop.bind(server);
   const loopbackListenerRef = loopbackServer;
+  const remoteListenerRef = remoteServer;
   const managementIngressRef = managementIngressServer;
   let packageRefreshStopped = false;
   Object.defineProperty(server, "stop", {
@@ -763,6 +808,9 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
           () => nativeStop(closeActiveConnections),
           ...(loopbackListenerRef
             ? [() => loopbackListenerRef.stop(closeActiveConnections)]
+            : []),
+          ...(remoteListenerRef
+            ? [() => remoteListenerRef.stop(closeActiveConnections)]
             : []),
           ...(managementIngressRef
             ? [() => managementIngressRef.stop(closeActiveConnections)]
@@ -814,13 +862,21 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
       // The companion form is the intended one-port hub topology, not a surprise surface: the
       // public listener is already on a non-loopback address, so this line states where local
       // processes go rather than warning about a second port nobody asked for.
-      console.log(`🔁 Loopback companion active on http://127.0.0.1:${loopbackPort} — same port as the public listener; local processes need no credential`);
+      console.log(`🔁 Loopback companion active on http://127.0.0.1:${loopbackPort} — same port as the public listener`);
+      console.log("   Local /v1 calls, the GUI, and /api/* need no credential; health/readiness stay unavailable here");
     } else {
       console.warn(`⚠️  Unauthenticated loopback listener active on http://127.0.0.1:${loopbackPort}`);
       console.warn(`   Any local process can use it without a credential — it spends account`);
       console.warn(`   quota and paid provider credentials, and can starve authenticated`);
-      console.warn(`   remote clients. Not for shared or multi-tenant hosts.`);
+      console.warn(`   remote clients. It also exposes the local GUI and /api/* to every local`);
+      console.warn(`   process. Not for shared or multi-tenant hosts.`);
     }
+  }
+
+  if (remoteServer && remoteListener?.enabled === true) {
+    console.warn(`⚠️  Unauthenticated remote data listener active on http://${remoteListener.host}:${remoteServer.port ?? remoteListener.port}`);
+    console.warn("   This listener serves only the /v1 data plane; /api/* and the GUI remain unavailable.");
+    console.warn("   Restrict this exact socket with the host firewall to trusted clients.");
   }
 
   if (managementIngressServer) {

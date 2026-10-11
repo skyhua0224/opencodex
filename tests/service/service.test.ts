@@ -2489,7 +2489,7 @@ describe("service lifecycle cleanup ordering", () => {
 
     expect(service).toContain('verifyPidIdentity');
     expect(service).toContain("removeRuntimePort(pid);");
-    expect(service).toContain('import { isProcessAlive, stopProxy } from "../lib/process-control";');
+    expect(service).toContain('import { isProcessAlive, killProxy, stopProxy } from "../lib/process-control";');
     expect(service).toContain('import { findLiveProxy, SERVICE_STOP_LIVENESS } from "../server/proxy-liveness";');
     expect(service).toContain('type TrackedProxyCleanupResult = "none" | "stale" | "stopped";');
     const health = await readText("src/service/health.ts");

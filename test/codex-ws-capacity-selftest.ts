@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 /**
  * Self-test for the WS prelude hold + layered capacity recovery (2026-09-24).
  *
@@ -27,7 +28,7 @@ import { join } from "node:path";
 process.env.OPENCODEX_HOME = mkdtempSync(join(tmpdir(), "ocx-ws-capacity-"));
 process.env.OCX_WS_CROSS_TURN_FIRST_FRAME_MS = "600";
 
-const PKG = new URL("../src", import.meta.url).pathname.replace(/\/$/, "");
+const PKG = fileURLToPath(new URL("../src/", import.meta.url)).replace(/[\\/]+$/, "").replace(/\\/g, "/");
 const { codexWsExchange } = await import(PKG + "/server/responses/codex-ws-exchange.ts");
 const { CODEX_RESPONSES_HTTP_URL } = await import(PKG + "/server/responses/codex-ws-request.ts");
 const { isNonReplayableResponse } = await import(PKG + "/lib/upstream-retry.ts");

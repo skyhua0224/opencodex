@@ -112,7 +112,7 @@ companion 형태는 `hostname`이 루프백도 와일드카드도 아닌 구체 
 
 **어느 형태든 이 필드를 바꾸면 프록시를 재시작하세요.** 소켓은 시작할 때 한 번 바인드되고 내보내는 클라이언트 값도 그때 결정된 포트로 기록되므로, 실행 중인 프록시는 예전 답을 유지합니다.
 
-이 리스너는 `POST /v1/responses`와 그 WebSocket 업그레이드, `POST /v1/responses/compact`, `POST /v1/messages`, `POST /v1/chat/completions`, `POST /v1/alpha/search`, `GET /v1/models`, 실시간 음성 표면만 제공합니다. `POST /v1/messages/count_tokens`를 포함해 `/api/*`, `/healthz`, `/readyz`, 대시보드는 모두 `404`입니다. `ocx claude`의 탐색 호출 같은 로컬 관리 읽기는 관리 자격 증명을 들고 인증된 관리 표면으로 갑니다.
+이 리스너는 로컬 `/v1` 데이터 경로, 실시간 음성 표면, `GET /v1/models`, 번들 GUI, session bootstrap, `/api/*`를 제공합니다. 브라우저 관리 워크플로는 kernel-loopback 바인드에 남고 `/healthz`와 `/readyz`는 계속 `404`입니다. 헤드리스 관리 탐색은 관리 자격 증명을 들고 인증된 공개 표면으로 갑니다.
 
 :::danger[인증 없는 표면입니다]
 컴퓨터의 모든 프로세스가 이 리스너를 사용할 수 있습니다. 계정 쿼터와 유료 provider 비용을 소모합니다.

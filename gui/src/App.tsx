@@ -22,7 +22,7 @@ import { SectionSwitcher } from "./components/SectionSwitcher";
 import { useI18n, useT, LOCALES, localeDisplayName, type Locale, type TKey } from "./i18n/shared";
 import { Notice, Select, ToastNotice, type NoticeTone } from "./ui";
 import { configureApiTargets, hasApiSession, installApiAuthFetch, installApiSessionFromHtml, logoutApiSession, SESSION_UNAVAILABLE_EVENT } from "./api";
-import { adminTokenPromptAllowed, apiBaseForPlane, discoverApiTargets, isConnectedRuntime, runtimeRoleFromDocument, standaloneApiTargets, type ApiTargets } from "./api-targets";
+import { adminTokenPromptAllowed, apiBaseForPlane, discoverApiTargets, isConnectedRuntime, runtimeRoleFromDocument, runtimeVersionFromDocument, standaloneApiTargets, type ApiTargets } from "./api-targets";
 import { ConnectPairingForm } from "./connect-pairing";
 import { type Page } from "./app-routing";
 import { readModelsTab, type ModelsTab } from "./pages/models-tab";
@@ -284,7 +284,10 @@ export default function App() {
   );
 
   const themeSwitch = <ThemeSwitch theme={theme} onChange={setTheme} />;
-  const displayedVersion: string = healthPoll.data ?? __APP_VERSION__;
+  // The live version first, then the version the SERVING runtime stamped into this document.
+  // Only a server that stamped nothing (or a separately hosted GUI) falls back to the constant
+  // baked in at build time, which describes the build rather than what is running.
+  const displayedVersion: string = healthPoll.data ?? runtimeVersionFromDocument() ?? __APP_VERSION__;
 
   const [stopping, setStopping] = useState(false);
 

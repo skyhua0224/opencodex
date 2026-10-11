@@ -3,7 +3,7 @@ import { createServer } from "node:net";
 /** An auxiliary bind cannot be repaired by selecting a different public port. */
 export class AuxiliaryListenerBindError extends Error {
   constructor(
-    readonly listener: "unauthenticatedLoopbackListener" | "hub.managementIngress",
+    readonly listener: "unauthenticatedLoopbackListener" | "unauthenticatedRemoteListener" | "hub.managementIngress",
     readonly port: number,
     readonly hostname: string,
     cause: unknown,

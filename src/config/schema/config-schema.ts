@@ -86,6 +86,30 @@ export const protocolConfigSchema = z.object({
   }).strict().optional(),
 }).strict();
 
+// Cross-lane connection-reset storm coordination (src/lib/reset-storm.ts). Coordination
+// only ever delays or skips a replacement send the reset ladder already authorized, so
+// the bounds here cap pacing, never verdicts. The bare schema backs the live settings
+// write, which must reject a malformed block instead of silently disabling the feature
+// the way a malformed hand edit does.
+export const resetStormConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  minLanes: z.number().int().min(2).max(64).optional(),
+  detectionWindowMs: z.number().int().min(1000).max(60000).optional(),
+  stormWindowMs: z.number().int().min(5000).max(300000).optional(),
+  maxStormWindowMs: z.number().int().min(30000).max(900000).optional(),
+  staggerSpreadMs: z.number().int().min(0).max(60000).optional(),
+  maxConcurrentReplacements: z.number().int().min(1).max(16).optional(),
+  queueDeadlineMs: z.number().int().min(250).max(120000).optional(),
+}).strict();
+
+// Operator-extensible capacity-absorption ladder (src/lib/capacity-ladder.ts): extra
+// paced resends of the SAME turn so a session rides out a longer shed window instead
+// of stopping. The bare schema backs the live settings write for the same reason.
+export const capacityRetryConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  delaysMs: z.array(z.number().int().min(1000).max(600000)).min(1).max(8).optional(),
+}).strict();
+
 export const configSchema = z.object({
   chatgptDesktop: chatgptDesktopSchema.optional().catch(undefined),
   codexNativeSteering: z.boolean().optional().catch(false),
@@ -104,6 +128,12 @@ export const configSchema = z.object({
   skills: skillsConfigSchema.optional().catch(undefined),
   // Malformed hand edits disable this opt-in exporter. Live writes reject them in diagnostics.ts.
   metricsExport: z.object({ enabled: z.boolean().optional() }).strict().optional().catch(undefined),
+  // Cross-lane connection-reset storm coordination (src/lib/reset-storm.ts). Coordination
+  // only ever delays or skips a replacement send the reset ladder already authorized, so
+  // the bounds here cap pacing, never verdicts. Malformed hand edits disable coordination
+  // and the per-lane ladder behaves exactly as before.
+  resetStorm: resetStormConfigSchema.optional().catch(undefined),
+  capacityRetry: capacityRetryConfigSchema.optional().catch(undefined),
   // Kept raw on purpose: `.catch(undefined)` would turn a mistyped `enabled` into "inherit",
   // which can reopen a surface the operator meant to close. src/protocols/settings.ts parses it
   // and fails closed instead.
@@ -182,6 +212,10 @@ export const configSchema = z.object({
   unauthenticatedLoopbackListener: z.union([
     z.object({ enabled: z.literal(false) }),
     z.object({ enabled: z.literal(true), port: z.number().int().min(1).max(65535).optional() }),
+  ]).optional().catch(undefined),
+  unauthenticatedRemoteListener: z.union([
+    z.object({ enabled: z.literal(false) }),
+    z.object({ enabled: z.literal(true), host: z.string().trim().min(1), port: z.number().int().min(1).max(65535) }),
   ]).optional().catch(undefined),
   providers: z.record(z.string(), providerConfigSchema),
   modelPinnedEfforts: modelPinnedEffortsSchema.optional(),

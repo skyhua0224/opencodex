@@ -552,7 +552,7 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
           yield* prepareSameTarget429Wait({
             body: prepared.response.body,
             signal,
-            delayMs: rateLimitRetryDelayMs(rateLimitRetryPolicy, retryAfterHeader, Date.now()),
+            delayMs: rateLimitRetryDelayMs(rateLimitRetryPolicy, retryAfterHeader, Date.now(), rateLimitRetries - 1),
             heartbeatIntervalMs: Math.min(10_000, Math.max(250, stallTimeoutMs / 2)),
           });
         } catch {

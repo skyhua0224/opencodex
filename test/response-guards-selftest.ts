@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 /**
  * Self-test for the native response guards (2026-09-25):
  *
@@ -13,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 // Isolate the config home BEFORE the modules load: the attestation ledger path is resolved from it.
 process.env.OPENCODEX_HOME = mkdtempSync(join(tmpdir(), "ocx-guards-selftest-"));
-const PKG = new URL("../src", import.meta.url).pathname.replace(/\/$/, "");
+const PKG = fileURLToPath(new URL("../src/", import.meta.url)).replace(/[\\/]+$/, "").replace(/\\/g, "/");
 const { guardNativeDegenerateOutput } = await import(PKG + "/server/responses/combo-degenerate-output.ts");
 const { withResponseAttestation, attestationLedgerPath, cookieLinkLedgerPath, latencyLedgerPathForTests } = await import(PKG + "/lib/response-attestation.ts");
 

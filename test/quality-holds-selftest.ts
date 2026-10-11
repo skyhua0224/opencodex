@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 /**
  * Self-test for the quality hold: the one router input that saw the CONTENT.
  *
@@ -16,7 +17,7 @@ import { join } from "node:path";
 process.env.OPENCODEX_HOME = mkdtempSync(join(tmpdir(), "ocx-quality-"));
 const home = process.env.OPENCODEX_HOME;
 
-const PKG = new URL("../src", import.meta.url).pathname.replace(/\/$/, "");
+const PKG = fileURLToPath(new URL("../src/", import.meta.url)).replace(/[\\/]+$/, "").replace(/\\/g, "/");
 const { providerQualityHeld, providerQualityHold, clearQualityHoldCacheForTests } =
   await import(PKG + "/providers/quality-holds.ts");
 const { pickComboTarget, clearComboSelectionStateForTests } = await import(PKG + "/combos/resolve.ts");

@@ -23,6 +23,7 @@ import {
   memoryModelTargetUnavailableResponse,
 } from "./memory-models";
 import { recallComboForLane } from "./combo-session-recall";
+import { rememberConversationSelection } from "./conversation-selection";
 import {
   sessionLaneIdFromRequest,
   conversationIdFromResponsesRequest,
@@ -143,6 +144,7 @@ import {
 } from "./core-codex-account";
 import { acquireUpstreamHostAdmission } from "../../codex/upstream-host-health";
 import { applyCompactionRoutingOverride, compactionRoutingKeepsProviderIdentity } from "./compaction-routing";
+import { threadModelSettingForRequest } from "./thread-model-settings";
 import { codexAuthContextLogLabel } from "../../codex/account-label";
 import {
   conversationStateBindingFromAuth,
@@ -380,14 +382,6 @@ export async function prepareResponsesRequest(
   let toolBridgeMaps: ReturnType<typeof buildToolBridgeMaps>;
   try {
     parsed = parseRequest(body);
-    if (!options.comboAttempt) {
-      observeTurnStateRequestBody(body, req.headers, {
-        provider: logCtx.provider,
-        model: parsed.modelId,
-        direction: "request",
-        transport: options.inboundTransport ?? "http",
-      });
-    }
     parsed._promptCacheKeyIsSharedCohort = options.promptCacheKeyIsSharedCohort;
     // The body may have been rebuilt since the inbound observation (previous-response
     // expansion); alias the parsed raw body to the same draft so the outbound
@@ -414,6 +408,31 @@ export async function prepareResponsesRequest(
           : {}),
         effort: effortRow.effort,
       };
+    }
+    // The desktop can enqueue a turn while a model-change event is still being flushed. In that
+    // window the request body may carry the previous provider/model even though the thread has
+    // already switched. Local loopback threads have an authoritative settings event, so align
+    // both ordinary and automatic-compaction requests before route selection. Child/combo and
+    // explicit compaction overrides intentionally keep their own synthetic target.
+    if (inboundWire === "responses"
+      && !options.comboAttempt
+      && !options.compactionRoutingOverride
+      && !threadSpawn
+      && !memoryModelApplies) {
+      const threadSetting = threadModelSettingForRequest(req.headers, options.admission);
+      if (threadSetting && threadSetting.model !== parsed.modelId) {
+        parsed.modelId = threadSetting.model;
+        const raw = parsed._rawBody as Record<string, unknown>;
+        raw.model = threadSetting.model;
+      }
+    }
+    if (!options.comboAttempt) {
+      observeTurnStateRequestBody(body, req.headers, {
+        provider: logCtx.provider,
+        model: parsed.modelId,
+        direction: "request",
+        transport: options.inboundTransport ?? "http",
+      });
     }
     if (options.comboReplaySnapshot?.recoveredPlaintext) {
       markBodyNonPersistable(parsed._rawBody);
@@ -531,6 +550,14 @@ export async function prepareResponsesRequest(
   // or a subagent fallback rewrites it, so a refusal names the client's own
   // request rather than a destination it never asked for.
   const inboundSelector = parsed.modelId;
+  if (inboundWire === "responses"
+    && options.comboAttempt !== true
+    && options.compactionRoutingOverride === undefined
+    && options.shadowCallIntercepted !== true
+    && options.memoryModelPhase === undefined
+    && parsed._compactionRequest !== true) {
+    rememberConversationSelection(req.headers, options.admission, inboundSelector);
+  }
   const admissionScope = resolveAdmissionModelScope(config, options.admission);
   const captureInboundRoutePolicy = (candidate: RouteResult, captureRequestPolicy = true): RouteResult => {
     // Every route this request path produces passes through here: the direct

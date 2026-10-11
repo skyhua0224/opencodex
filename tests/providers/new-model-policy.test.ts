@@ -2,13 +2,44 @@ import { describe, expect, test } from "bun:test";
 import {
   applyNewModelPolicy,
   effectiveNewModelPolicy,
+  gateRoutedModelsToVisibleRows,
   MODEL_REMOVAL_GRACE_FETCHES,
   reconcileSuccessfulModelDiscoveries,
 } from "../../src/providers/new-model-policy";
 
 const now = "2026-08-24T02:11:00Z";
 
+const row = (provider: string, id: string) => ({ provider, id });
+const gateConfig = (over: Record<string, unknown> = {}) => ({
+  disabledModels: [], modelDiscovery: {}, providers: {}, ...over,
+} as Parameters<typeof gateRoutedModelsToVisibleRows>[0]);
+
 describe("new-model policy", () => {
+  test("the live gate answers with the dashboard's own row universe", () => {
+    const config = gateConfig({
+      disabledModels: ["deepseek/deepseek-v4-flash"],
+      modelDiscovery: { newModelPolicy: "off", knownModels: { deepseek: { ids: ["deepseek-flash", "deepseek-v4-flash"], removed: [], updatedAt: now } } },
+      providers: { deepseek: {} },
+    });
+    const gated = gateRoutedModelsToVisibleRows(config, [
+      row("deepseek", "deepseek-flash"),
+      row("deepseek", "deepseek-v4-flash"),
+      row("deepseek", "deepseek-chat"),
+      { provider: "deepseek", id: "pinned", custom: true },
+    ]);
+    expect(gated.map(r => r.id)).toEqual(["deepseek-flash", "pinned"]);
+  });
+
+  test("a non-empty selectedModels allowlist is authoritative under an on policy", () => {
+    const config = gateConfig({
+      modelDiscovery: { newModelPolicy: "on" },
+      providers: { zai: { selectedModels: ["glm-5.3", "glm-5.3-flash"] } },
+    });
+    const gated = gateRoutedModelsToVisibleRows(config, [
+      row("zai", "glm-5.3"), row("zai", "glm-5.3-flash"), row("zai", "glm-5.2"),
+    ]);
+    expect(gated.map(r => r.id)).toEqual(["glm-5.3", "glm-5.3-flash"]);
+  });
   test("bootstraps without hiding the existing catalog", () => {
     const r = applyNewModelPolicy({ provider: "openrouter", discoveredIds: ["a", "b"], policy: "off", now });
     expect(r.newIds).toEqual([]); expect(r.slugsToDisable).toEqual([]); expect(r.nextBaseline.ids).toEqual(["a", "b"]);

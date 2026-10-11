@@ -298,7 +298,6 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
       if (responseCommitted) return;
       responseCommitted = true;
       clearTimeout(silenceTimer);
-      clearTimeout(pingTimer);
       clearTimeout(preludeHoldTimer);
       const responseHeaders = metadata?.snapshot() ?? new Headers();
       responseHeaders.set("content-type", "text/event-stream; charset=utf-8");
@@ -459,12 +458,12 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
         CODEX_WS_RESPONSE_PRELUDE_TIMEOUT_MS,
       );
     };
-    /** Ping on a fixed interval until the response starts; a socket without ping() is never pinged. */
+    /** Ping on a fixed interval until the terminal event; long Responses turns need post-header liveness too. */
     const schedulePing = () => {
       const ping = (ws as WebSocket & { ping?: (data?: string) => void }).ping;
-      if (typeof ping !== "function" || responseCommitted || terminal) return;
+      if (typeof ping !== "function" || terminal) return;
       pingTimer = setTimeout(() => {
-        if (responseCommitted || terminal) return;
+        if (terminal) return;
         try { ping.call(ws); } catch { return; }
         pings += 1;
         // ping() may close the socket synchronously and settle the exchange; re-check.

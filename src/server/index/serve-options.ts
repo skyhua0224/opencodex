@@ -40,6 +40,7 @@ import {
 import { websocketsEnabled } from "../../config";
 import { metricsExportEnabled } from "../../config/feature-flags";
 import { grokDefaultReasoningEffort } from "../../grok/effort";
+import { gateRoutedModelsToVisibleRows } from "../../providers/new-model-policy";
 import { OPENAI_CODEX_PROVIDER_ID } from "../../providers/openai-tiers";
 import { providerCodexAccountMode } from "../../providers/registry";
 import {
@@ -204,7 +205,7 @@ import { createWebsocketHandler } from "./websocket-handler";
 import { withGrokSessionIdentity } from "../../grok/session-identity";
 import { withCallerSessionIdentity } from "../caller-session-identity";
 
-export type ServerIngress = "public" | "unauthenticated-loopback" | "hub-management" | "claude-intercept" | "hub-link";
+export type ServerIngress = "public" | "unauthenticated-loopback" | "unauthenticated-remote" | "hub-management" | "claude-intercept" | "hub-link";
 
 export function trustedLoopbackForIngress(ingress: ServerIngress, hostname: string): boolean {
   return ingress === "unauthenticated-loopback"
@@ -258,6 +259,7 @@ export interface ServeOptionsContext {
   >;
   localAttestationSecret: string;
   loopbackPolicy: () => RequestPolicyView;
+  remotePolicy: () => RequestPolicyView;
   managementApiDeps: ManagementApiDeps;
   managementAuth: ManagementAuthState;
   managementSessionControl: ManagementSessionControl;
@@ -286,6 +288,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
     loadRemoteWorkspaceRuntime,
     localAttestationSecret,
     loopbackPolicy,
+    remotePolicy,
     managementApiDeps,
     managementAuth,
     managementSessionControl,
@@ -316,11 +319,17 @@ export function createServeOptions(ctx: ServeOptionsContext) {
       // The unauthenticated loopback listener (#1102) serves a fixed allowlist and nothing
       // else. Rejecting here, before any handler runs, is what keeps the surface from growing
       // silently when a route is added below.
-      if (ingress === "unauthenticated-loopback" && !loopbackRouteAllowed(codexCompatibleUrl(req.url), req)) {
+      const unauthenticatedRoute = codexCompatibleUrl(req.url);
+      const remoteDataOnlyDenied = ingress === "unauthenticated-remote"
+        && (unauthenticatedRoute.pathname.startsWith("/api/")
+          || unauthenticatedRoute.pathname === "/"
+          || !unauthenticatedRoute.pathname.startsWith("/v1/"));
+      if ((ingress === "unauthenticated-loopback" || ingress === "unauthenticated-remote")
+        && (remoteDataOnlyDenied || !loopbackRouteAllowed(unauthenticatedRoute, req))) {
         return withCors(
           formatErrorResponse(404, "not_found", `Unknown endpoint: ${req.method} ${new URL(req.url).pathname}`),
           req,
-          loopbackPolicy(),
+          ingress === "unauthenticated-remote" ? remotePolicy() : loopbackPolicy(),
         );
       }
       if (ingress === "hub-link" && !linkRouteAllowed(requestUrl, req)) {
@@ -356,7 +365,9 @@ export function createServeOptions(ctx: ServeOptionsContext) {
       // Anthropic credentials, not opencodex admission tokens — so it takes the loopback view too.
       const policy: RequestPolicyView = ingress === "hub-link"
         ? linkPolicyView!
-        : ingress === "unauthenticated-loopback" || ingress === "claude-intercept"
+        : ingress === "unauthenticated-remote"
+          ? remotePolicy()
+          : ingress === "unauthenticated-loopback" || ingress === "claude-intercept"
           ? loopbackPolicy()
           : config;
       if (ingress === "hub-link") {
@@ -669,12 +680,17 @@ export function createServeOptions(ctx: ServeOptionsContext) {
           pid: process.pid,
           port: ctx.boundPort ?? requestServer.port ?? listenPort,
         };
-        const apiAuthError = requireManagementAuth(req, managementAuth, config, localManagementAuth);
+        const localUnauthenticatedManagement = ingress === "unauthenticated-loopback";
+        const apiAuthError = localUnauthenticatedManagement
+          ? null
+          : requireManagementAuth(req, managementAuth, config, localManagementAuth);
         if (apiAuthError) return withManagementCors(apiAuthError, req, config);
         // Which credential passed the gate, resolved from the same session table the
         // gate used. Consent-bearing routes need this: request headers are forgeable
         // by anything holding the admin token, the credential is not.
-        const principal = managementPrincipal(req, managementAuth, config, localManagementAuth) ?? undefined;
+        const principal = localUnauthenticatedManagement
+          ? "gui-session" as const
+          : managementPrincipal(req, managementAuth, config, localManagementAuth) ?? undefined;
         if (url.pathname === GUI_PAIR_PATH) {
           if (req.method !== "POST" || principal !== "gui-pair-capability" || !managementAuth.available) {
             return withManagementCors(Response.json({ error: "GUI pairing capability required" }, { status: 403 }), req, config);
@@ -922,7 +938,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
           }
           throw error;
         }
-        const { accountBoundNativeOpenAiSlugsBySelector, applyNativeVisibility, buildCatalogEntries, configuredNativeAliasSlugs, desktopAllowlistSuppressedNativeSlugs, disabledNativeSlugs, exactComboCatalogSlugs, loadCatalogTemplate, NATIVE_OPENAI_MODELS, nativeContextLimits, nativeInputModalities, nativeOpenAiContextWindow, nativeOpenAiMaxOutputTokens, nativeOpenAiContextTier, nativeOpenAiSlugs, nativeReasoningEfforts, nativeDefaultReasoningEffort, shouldIncludeAccountBoundNativeOpenAi, shouldIncludeNativeOpenAi, uniqueCatalogModelsForRawPublicList, visibleCodexAccountSelectors, visibleNativeSlugs, desktopVisibleNativeSlugs } = await import("../../codex/catalog");
+        const { accountBoundNativeOpenAiSlugsBySelector, applyNativeVisibility, buildCatalogEntries, configuredNativeAliasSlugs, desktopAllowlistSuppressedNativeSlugs, disabledNativeSlugs, exactComboCatalogSlugs, loadCatalogTemplate, NATIVE_OPENAI_MODELS, nativeContextLimits, nativeInputModalities, nativeOpenAiContextWindow, nativeOpenAiMaxOutputTokens, nativeOpenAiContextTier, nativeOpenAiSlugs, nativeReasoningEfforts, nativeDefaultReasoningEffort, omitVisibilityHiddenRows, shouldIncludeAccountBoundNativeOpenAi, shouldIncludeNativeOpenAi, uniqueCatalogModelsForRawPublicList, visibleCodexAccountSelectors, visibleNativeSlugs, desktopVisibleNativeSlugs } = await import("../../codex/catalog");
         const { ACCOUNT_GATED_NATIVE_OPENAI_MODELS } = await import("../../codex/catalog/native-models");
         const includeNativeOpenAi = shouldIncludeNativeOpenAi(config);
         const includeAccountBoundNativeOpenAi = shouldIncludeAccountBoundNativeOpenAi(config);
@@ -977,7 +993,10 @@ export function createServeOptions(ctx: ServeOptionsContext) {
           desktopNativeCandidates: desktopVisibleNativeSlugs(config),
         });
         const desktopNativeSlugs = desktopInputs.nativeSlugs;
-        const goOrdered = desktopInputs.routedModels;
+        // The picker must not outrun the dashboard: a discovery id the new-model policy has
+        // not reconciled (or that the operator disabled) stays out of every client list here,
+        // exactly as the on-disk sync already treats it.
+        const goOrdered = gateRoutedModelsToVisibleRows(config, desktopInputs.routedModels);
         // Claude Code / Claude Desktop gateway model discovery (GET /v1/models with
         // Anthropic-style headers; 003 G1-G8 + devlog 131). Entries use the official
         // ModelInfo shape incl. capabilities (effort ladder / thinking) — Desktop 3P can
@@ -1073,8 +1092,8 @@ export function createServeOptions(ctx: ServeOptionsContext) {
           // Codex client → Codex catalog shape: native gpt + namespaced routed models,
           // cloned from a native template so required fields (base_instructions, etc.) are present.
           // Pass the subagent picks so featured models lead by priority (matches the on-disk file).
-          // Disabled natives stay in the catalog shape with visibility "hide" (mirrors the
-          // on-disk sync; codex-rs keeps them out of the picker itself).
+          // Disabled natives are omitted (mirrors the on-disk sync; the codex-rs picker
+          // ignores visibility, so a retained hide row stayed selectable there).
           const maMode = config.multiAgentMode === "v1" || config.multiAgentMode === "v2" ? config.multiAgentMode : "default";
           // Account rows use the same hidden-inclusive supported set as on-disk sync. This lets a
           // newly re-enabled native reappear under each selector before the next sync, while the
@@ -1103,12 +1122,12 @@ export function createServeOptions(ctx: ServeOptionsContext) {
             config.modelPickerOrder,
           );
           return jsonResponse({
-            models: applyNativeVisibility(
+            models: omitVisibilityHiddenRows(applyNativeVisibility(
               entries,
               disabledModels,
               accountSelectors.length > 0,
               new Set(accountNativeSlugs),
-            ),
+            )),
           }, 200, req, policy);
         }
         // OpenAI list shape: native gpt bare + routed models namespaced "<provider>/<id>"
@@ -1853,6 +1872,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
         if (req.method === "GET") {
           const session = issueGuiSession(req, config, managementAuth, {
             trustedTailscaleIngress: ingress === "hub-management",
+            unauthenticatedLoopback: ingress === "unauthenticated-loopback",
           });
           return session
             ? withManagementCors(serveSessionBootstrap(session), req, config)
@@ -1912,6 +1932,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
       const guiSessionCandidate = req.method === "GET" && (url.pathname === "/" || !url.pathname.includes("."))
         ? issueGuiSession(req, config, managementAuth, {
           trustedTailscaleIngress: ingress === "hub-management",
+          unauthenticatedLoopback: ingress === "unauthenticated-loopback",
         })
         : null;
       const guiFile = serveGuiFile(

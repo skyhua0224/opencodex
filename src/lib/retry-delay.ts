@@ -61,7 +61,7 @@ function durationSeconds(tail: string, allowBareSeconds: boolean): number | unde
  * for "reset in 2026". When a message declares several usable lower bounds,
  * honour the longest one rather than re-entering a still-live quota window.
  */
-export function parseRetryAfterFromMessage(message: string): number | undefined {
+export function parseRetryAfterFromMessage(message: string, now = Date.now()): number | undefined {
   const hints = /\b(try\s+again\s+in|retry[- ]after|resets?\s+in)\s*:?\s*/gi;
   let result: number | undefined;
   for (const hint of message.matchAll(hints)) {
@@ -70,6 +70,19 @@ export function parseRetryAfterFromMessage(message: string): number | undefined 
       /^retry[- ]after$/i.test(hint[1]!),
     );
     if (seconds !== undefined) result = Math.max(result ?? 0, seconds);
+  }
+  // Some Codex/OpenAI quota responses give an absolute reset instant instead of a
+  // Retry-After header or a relative duration. Convert it to a bounded delay so clients
+  // do not immediately repeat a compact request against an exhausted five-hour window.
+  const reset = /reset[s]?\s+at\s+([0-9]{4}-[0-9]{2}-[0-9]{2}(?:[T ][0-9]{2}:[0-9]{2}(?::[0-9]{2})?(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:?[0-9]{2})?)?)/i.exec(message);
+  if (reset) {
+    const value = reset[1]!;
+    const raw = value.includes("T") || /(?:Z|[+-][0-9]{2}:?[0-9]{2})$/.test(value)
+      ? value
+      : `${value.replace(" ", "T")}Z`;
+    const at = Date.parse(raw);
+    const seconds = Number.isFinite(at) ? Math.ceil((at - now) / 1000) : 0;
+    if (seconds > 0 && seconds <= 32 * 24 * 60 * 60) result = Math.max(result ?? 0, seconds);
   }
   return result;
 }

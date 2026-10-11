@@ -4,9 +4,39 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { serveGuiFile } from "../../src/server/gui-static";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { packageVersion } from "../../src/lib/package-version";
 
 const temporaryDirectories: string[] = [];
 const previousGuiDist = process.env.OPENCODEX_GUI_DIST;
+
+/**
+ * The version a dashboard shows when it cannot reach /healthz.
+ *
+ * The loopback companion deliberately serves no health route (see
+ * tests/server/loopback-listener-integration.test.ts, "health/readiness remain data-plane-only"),
+ * which is the plane a local operator browses. The GUI's remaining source was the constant Vite
+ * baked in when gui/dist was built — a gitignored directory that survives a pull — so the badge
+ * kept naming the version of whatever build produced it. Stamping the served document makes the
+ * answer describe the runtime that answered, on every plane.
+ */
+test("every served document names the version of the runtime that served it", async () => {
+  const guiDist = mkdtempSync(join(tmpdir(), "ocx-gui-static-version-"));
+  temporaryDirectories.push(guiDist);
+  writeFileSync(join(guiDist, "index.html"), "<!doctype html><html><head></head><body></body></html>");
+
+  const bare = await serveGuiFile("/index.html", guiDist)!.text();
+  // Unconditional: no session, no role, still stamped — that is the loopback companion's shape.
+  expect(bare).toContain('<meta name="opencodex-version" content="');
+  expect(bare).toMatch(/<meta name="opencodex-version" content="[^"]+">/);
+
+  const withRole = await serveGuiFile("/index.html", guiDist, undefined, "standalone", false)!.text();
+  const version = /<meta name="opencodex-version" content="([^"]+)">/.exec(withRole)?.[1];
+  // The version the runtime itself publishes, not a value from the document being served.
+  expect(version).toBe(packageVersion());
+  // The same constant the CLI and /healthz publish, so the badge cannot disagree with them.
+  expect(withRole).toContain('<meta name="opencodex-runtime-role" content="standalone">');
+  expect(withRole.indexOf("opencodex-version")).toBeLessThan(withRole.indexOf("</head>"));
+});
 
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {

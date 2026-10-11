@@ -1,5 +1,7 @@
 import type { OcxProviderConfig } from "./provider";
 import type { CodexAccount } from "./accounts";
+import type { ResetStormConfig } from "../lib/reset-storm";
+import type { CapacityRetryConfig } from "../lib/capacity-ladder";
 
 export interface AnthropicModelRoute {
   name: string;
@@ -514,6 +516,10 @@ export interface OcxConfig {
   skills?: OcxSkillsConfig;
   /** Opt-in process-local aggregate request metrics on the authenticated management plane. */
   metricsExport?: { enabled?: boolean };
+  /** Cross-lane connection-reset storm coordination for reset-replacement sends. */
+  resetStorm?: ResetStormConfig;
+  /** Operator-extensible capacity-absorption ladder for weight-shaped shed windows. */
+  capacityRetry?: CapacityRetryConfig;
   /** Opt in to one identical-turn retry when a Responses completion has no text or tool call. */
   emptyCompletionRetry?: boolean;
   /** Suppress allowlisted client-facing Codex transport hints; provider enforcement is unchanged. */
@@ -921,6 +927,13 @@ export interface OcxConfig {
   unauthenticatedLoopbackListener?:
     | { enabled: false }
     | { enabled: true; port?: number };
+  /**
+   * Optional data-plane-only listener bound to one explicit non-loopback address.
+   * This listener never serves /api/* or the GUI; its socket address is the trust boundary.
+   */
+  unauthenticatedRemoteListener?:
+    | { enabled: false }
+    | { enabled: true; host: string; port: number };
   /**
    * Outbound proxy URL for provider requests. HTTP(S) example: "http://user:pass@proxy:8080"
    * or "${HTTPS_PROXY}". SOCKS5 example: "socks5://127.0.0.1:10808" (`ocx start --socks5`).

@@ -525,7 +525,7 @@ selection because the schema would drop the override. The model checklist is sea
 `src/server/gui-static.ts` serves the dashboard from `gui/dist`, with `OPENCODEX_GUI_DIST` taking
 priority and standalone binaries resolving the copied directory beside `ocx`. Runtime package
 metadata comes from the bundled `src/lib/package-version.ts` manifest import so compiled binaries
-do not read a source-tree `package.json`.
+do not read a source-tree `package.json`. Every served document also carries an `opencodex-version` meta naming the runtime that answered, because the loopback companion serves no `/healthz` (health and readiness stay data-plane-only) and the remaining fallback — the constant Vite bakes into a gitignored `gui/dist` — describes the build rather than what is running.
 
 ## Quota-reset notifications
 

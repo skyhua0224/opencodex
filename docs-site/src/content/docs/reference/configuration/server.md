@@ -335,16 +335,14 @@ client configuration. With the listener off, `ocx sync`, `ocx ensure` and `ocx r
 hub's own Codex/Grok/Claude writes and say so, naming
 `unauthenticatedLoopbackListener` rather than the `clientIntegrations` toggle.
 
-The listener serves only `POST /v1/responses`, its WebSocket upgrade, `POST /v1/responses/compact`,
-`POST /v1/messages` (the Anthropic wire Claude Code and Claude Desktop speak),
-`POST /v1/chat/completions` (the OpenAI chat wire Cursor and the vision helper speak),
-`POST /v1/alpha/search` (the native Codex web-search relay), `GET /v1/models`, and the realtime
-voice surface: the standalone WebSocket upgrades, WebRTC call creation (`POST /v1/live`,
-`POST /v1/realtime/calls`), and the keyed sideband join upgrades (`/v1/live/{callId}`,
-`/v1/realtime/calls/{callId}`, `/v1/realtime?call_id=`). Everything else, including `/api/*`,
-`/healthz`, `/readyz` and the dashboard, returns `404` — local management reads such as
-`ocx claude`'s discovery call go to the authenticated management surface with a management
-credential, never here.
+The listener serves the local data wires — `POST /v1/responses`, its WebSocket upgrade,
+`POST /v1/responses/compact`, `POST /v1/messages` (the Anthropic wire Claude Code and Claude
+Desktop speak), `POST /v1/chat/completions` (the OpenAI chat wire Cursor and the vision helper
+speak), `POST /v1/alpha/search` (the native Codex web-search relay), `GET /v1/models`, and the
+realtime voice surface — plus the packaged GUI, `GET`/`POST /opencodex-session`, and `/api/*`
+for the operator's local browser workflow. `/healthz` and `/readyz` stay unavailable so liveness
+discovery cannot use the unauthenticated socket. Headless management discovery still resolves the
+authenticated public surface and transports its management credential there.
 
 :::danger[This is an unauthenticated surface]
 Every process on the machine can use this listener. It spends account quota and paid provider
@@ -354,6 +352,37 @@ on. Do not enable it on a shared or multi-tenant host.
 Binding to `127.0.0.1` means the kernel refuses remote connections, but it does not stop a browser:
 a page you visit can make your browser connect to `127.0.0.1`. The listener therefore applies the
 same `Host` and `Origin` checks as an ordinary loopback bind. Off by default.
+:::
+
+### Dedicated unauthenticated remote data listener
+
+For an operator-owned trusted client that cannot receive a token, add a second socket that is
+deliberately unauthenticated and data-plane-only:
+
+```json
+{
+  "hostname": "203.0.113.10",
+  "port": 10100,
+  "unauthenticatedLoopbackListener": { "enabled": true },
+  "unauthenticatedRemoteListener": {
+    "enabled": true,
+    "host": "203.0.113.10",
+    "port": 10102
+  }
+}
+```
+
+The public `hostname:port` listener keeps its normal credential checks. `127.0.0.1:10100` serves
+the local data plane, GUI, and management API. `203.0.113.10:10102` serves only `/v1/*`;
+`/api/*`, the GUI, `/healthz`, and `/readyz` return `404` before dispatch. The remote host must
+be one explicit non-loopback IPv4 address, and its port must differ from both the public and loopback
+ports. Restart after changing the block, because all sockets are bound once at startup.
+
+:::danger[This listener has no authentication]
+Every process that can reach the chosen address and port can spend provider credentials and account
+quota. OpenCodex deliberately does not add a credential to this listener. Use it only on a network
+you own, and restrict it with the host firewall only when that restriction matches the intended
+client; the proxy itself leaves the socket unauthenticated.
 :::
 
 ### SSH port forwarding

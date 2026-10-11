@@ -113,10 +113,51 @@ export function applyNewModelPolicy(options: {
   };
 }
 
-export function effectiveNewModelPolicy(config: OcxConfig, provider: string): NewModelPolicy {
+export function effectiveNewModelPolicy(
+  config: Pick<OcxConfig, "modelDiscovery" | "providers">,
+  provider: string,
+): NewModelPolicy {
   const local = config.providers[provider]?.newModelPolicy;
   if (local === "on" || local === "off") return local;
   return config.modelDiscovery?.newModelPolicy ?? "on";
+}
+
+/** Minimal shape the live-surface visibility gate needs from a gathered routed row. */
+export interface RoutedVisibilityRow {
+  provider: string;
+  id: string;
+  /** Caller-authored rows are intentional; the gate never drops them. */
+  custom?: boolean;
+}
+
+/**
+ * Reduce a live discovery result to the rows the dashboard's own row universe calls visible.
+ *
+ * The convergence cycle owns arrivals: with the new-model policy off, a fresh discovery id waits
+ * for the reconcile (then lands in `disabledModels`), and with it on, the next convergence lists
+ * it everywhere. The HTTP read side polls far more often than convergence runs, so handing raw
+ * discovery rows to a client let a model reach the picker while `modelDiscovery.knownModels`
+ * still held the pre-arrival roster and no surface the operator controls showed it (measured
+ * 2026-10-09: five arrivals reached the codex picker that way). Disabled rows are out, a
+ * non-empty `selectedModels` allowlist is authoritative, and under an off policy an id the
+ * baseline has never met is not offered yet.
+ */
+export function gateRoutedModelsToVisibleRows<T extends RoutedVisibilityRow>(
+  config: Pick<OcxConfig, "disabledModels" | "modelDiscovery" | "providers">,
+  rows: readonly T[],
+): T[] {
+  const disabled = new Set(config.disabledModels ?? []);
+  return rows.filter(row => {
+    if (row.custom) return true;
+    if (disabled.has(`${row.provider}/${row.id}`) || disabled.has(row.id)) return false;
+    const selected = config.providers[row.provider]?.selectedModels;
+    if (selected?.length && !selected.includes(row.id)) return false;
+    if (effectiveNewModelPolicy(config, row.provider) === "off") {
+      const known = config.modelDiscovery?.knownModels?.[row.provider]?.ids ?? [];
+      if (!known.includes(row.id)) return false;
+    }
+    return true;
+  });
 }
 
 /** Normalize policy identities only; the original rows and saved wire selections stay intact. */

@@ -327,7 +327,7 @@ export function createAdapterContinuations(
             // cancel aborts `upstream` through the bridge, and upstream is also linked from
             // options.abortSignal — so this covers both cancellation paths.
             signal: upstream.signal,
-            delayMs: rateLimitRetryDelayMs(rateLimitPolicy, retryAfterHeader, Date.now()),
+            delayMs: rateLimitRetryDelayMs(rateLimitPolicy, retryAfterHeader, Date.now(), adapterExchange.rateLimitRetries - 1),
             heartbeatIntervalMs: Math.min(10_000, Math.max(250, stallTimeoutMs / 2)),
           });
         } catch {

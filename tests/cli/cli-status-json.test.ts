@@ -615,6 +615,20 @@ describe("CLI status JSON", () => {
     expect(target.dashboardUrl).toBe("http://100.64.0.11:10100/");
   });
 
+  test("an enabled loopback listener owns the local dashboard URL", () => {
+    const target = selectListenTarget(
+      {
+        port: 10100,
+        hostname: "100.64.0.12",
+        unauthenticatedLoopbackListener: { enabled: true },
+      },
+      null,
+      null,
+    );
+
+    expect(target.dashboardUrl).toBe("http://localhost:10100/");
+  });
+
   test("resolveStatusPid preserves an authoritative null from live orphan checks", () => {
     expect(resolveStatusPid({ pid: null }, 4242)).toBeNull();
     expect(resolveStatusPid({ pid: 1111 }, 4242)).toBe(1111);

@@ -531,6 +531,7 @@ test("canonical forward providers normalize trailing slashes and let the pool ov
   expect(request.url).toBe("https://chatgpt.com/backend-api/codex/responses");
   expect(request.headers.authorization).toBe("Bearer runtime-secret");
   expect(request.headers["chatgpt-account-id"]).toBe("runtime-account");
+  expect(request.headers["accept-encoding"]).toBe("identity");
 });
 
 test("noncanonical Responses preserves provider-owned safety-buffering hints", async () => {

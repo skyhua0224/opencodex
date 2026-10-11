@@ -1562,15 +1562,19 @@ describe("codexWsUpstreamFetch", () => {
         for (let step = 0; step < 7; step++) jest.advanceTimersByTime(CODEX_WS_LIVENESS_PING_INTERVAL_MS);
         expect(pingsSent).toBe(7);
         ws.emit("message", { data: JSON.stringify({ type: "response.created", response: { id: "r1" } }) });
+        // Long-running responses still need WebSocket liveness after the HTTP stream commits.
+        // Keep the response open for another minute before sending its terminal event.
+        jest.advanceTimersByTime(CODEX_WS_LIVENESS_PING_INTERVAL_MS * 4);
+        expect(pingsSent).toBe(11);
         ws.emit("message", { data: JSON.stringify({ type: "response.completed", response: { id: "r1" } }) });
         const response = await pending;
         expect(response.status).toBe(200);
         expect(await response.text()).toContain("event: response.completed");
         expect(ws.sent).toHaveLength(1);
         expect(counter.http).toBe(0);
-        // The pinger stops once the response has started.
+        // The pinger stops only after the terminal event and cleanup.
         jest.advanceTimersByTime(CODEX_WS_LIVENESS_PING_INTERVAL_MS * 4);
-        expect(pingsSent).toBe(7);
+        expect(pingsSent).toBe(11);
         expect([...ws.listeners.values()].every(listeners => listeners.length === 0)).toBe(true);
       } finally {
         jest.useRealTimers();

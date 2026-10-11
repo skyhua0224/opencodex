@@ -245,6 +245,11 @@ upstream WebSocket by default; `providers.openai.upstreamWebsocket: false` sends
 its streaming turns over HTTP/SSE instead. This explicit choice also makes
 native mid-turn steering and injection unavailable on that provider. It does
 not change the endpoint, credential, or downstream event format.
+The per-thread transport ledger also demotes a conversation to HTTP/SSE for
+30 minutes after two upstream cuts in ten minutes, including a socket that
+delivered only `response.created`/`response.in_progress` before closing. The
+hold escalates for repeated incidents; other conversations keep their normal
+upstream transport.
 Its WSS route checks NO_PROXY first, then selects the
 first non-empty HTTPS_PROXY, https_proxy, ALL_PROXY, or all_proxy value. HTTP_PROXY alone does not
 route WSS. Unsupported or malformed selected proxy values skip the WebSocket attempt and use the

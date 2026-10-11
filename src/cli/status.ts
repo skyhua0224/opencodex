@@ -224,11 +224,17 @@ export type CliStatusView = {
 };
 
 
-type StatusListenConfig = Pick<OcxConfig, "port" | "hostname" | "runtimeRole" | "hub">;
+type StatusListenConfig = Pick<
+  OcxConfig,
+  "port" | "hostname" | "runtimeRole" | "hub" | "unauthenticatedLoopbackListener"
+>;
 
 function statusDashboardUrl(config: StatusListenConfig, hostname: string | undefined, port: number): string {
   const managementOrigin = config.runtimeRole === "hub" ? config.hub?.managementPublicOrigin : undefined;
   if (managementOrigin) return managementOrigin.endsWith("/") ? managementOrigin : `${managementOrigin}/`;
+
+  const loopbackPort = effectiveLoopbackListenerPort(config, port);
+  if (loopbackPort !== null) return `http://localhost:${loopbackPort}/`;
 
   const reachableHostname = probeHostname(hostname);
   const dashboardHostname = reachableHostname === "127.0.0.1"

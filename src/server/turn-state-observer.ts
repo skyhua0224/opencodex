@@ -13,6 +13,7 @@
  * body scan reads at most the first {@link MAX_SNIFF_BYTES} of a response and never retains it.
  */
 import { appendFile, renameSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { getConfigDir } from "../config/paths";
 
@@ -113,6 +114,16 @@ function describe(value: string): string {
 }
 
 /**
+ * Turn-state values are opaque bearer-like state, and response-body snippets can contain user
+ * content. Keep the observation useful for correlation without copying either value to a service
+ * log or the JSONL file.
+ */
+export function redactTurnStateObservation(value: string): string {
+  const digest = createHash("sha256").update(value).digest("hex").slice(0, 16);
+  return `[redacted length=${value.length} sha256=${digest}]`;
+}
+
+/**
  * Header names spell the family with hyphens (`x-turn-state`) while bodies use underscores
  * (`current_turn_state`), so a header is matched on both spellings.
  */
@@ -143,7 +154,7 @@ export function observeTurnStateResponseHeaders(headers: Headers, where: TurnSta
   for (const [name, value] of headers) {
     const lower = name.toLowerCase();
     if (!headerMentionsTurnState(lower, value)) continue;
-    record("response-header", { header: lower, value: describe(value) }, where);
+    record("response-header", { header: lower, value: redactTurnStateObservation(value) }, where);
   }
 }
 
@@ -178,7 +189,7 @@ export function createTurnStateSniffer(where: TurnStateWhere): TurnStateSniffer 
         hits += 1;
         record("response-body", {
           marker,
-          snippet: describe(text.slice(Math.max(0, index - 80), index + 200)),
+          snippet: redactTurnStateObservation(text.slice(Math.max(0, index - 80), index + 200)),
           inspectedBytes,
         }, where);
         return;
@@ -214,7 +225,7 @@ export function observeTurnStateRequestBody(
     for (const [name, value] of headers) {
       const lower = name.toLowerCase();
       if (!headerMentionsTurnState(lower, value)) continue;
-      record("request-header", { header: lower, value: describe(value) }, where);
+      record("request-header", { header: lower, value: redactTurnStateObservation(value) }, where);
     }
   }
   if (!body || typeof body !== "object" || Array.isArray(body)) return;
@@ -233,7 +244,7 @@ export function observeTurnStateRequestBody(
       foundField = true;
       record("request-field", {
         field: `${label}.${key}`,
-        value: typeof value === "string" ? describe(value) : typeof value,
+        value: typeof value === "string" ? redactTurnStateObservation(value) : typeof value,
       }, where);
     }
   }
@@ -254,7 +265,7 @@ export function observeTurnStateRequestBody(
         if (index < 0) continue;
         record("request-body", {
           marker,
-          snippet: describe(serialized.slice(Math.max(0, index - 80), index + 200)),
+          snippet: redactTurnStateObservation(serialized.slice(Math.max(0, index - 80), index + 200)),
         }, where);
         return;
       }

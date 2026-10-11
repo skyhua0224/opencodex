@@ -48,6 +48,7 @@ import {
   prepareSameTarget429Wait,
   sleepWithAbort,
 } from "../../lib/upstream-retry";
+import { capacityLadderDelays } from "../../lib/capacity-ladder";
 import { describeUpstreamConnectFailure } from "./upstream-error";
 import type { OpaqueBlobRecoveryGuard } from "./core-opaque-recovery";
 import type { AttemptRecoveryKind } from "../../usage/log";
@@ -419,10 +420,17 @@ export async function prepareAdapterExchange(
               onSendsConsumed: noteTransientSends,
             }
             : canonicalForwardRow
-              ? { attempts: 1, onSendsConsumed: noteTransientSends }
+              ? {
+                // The reset-replay grant rides INSIDE this budget: a replacement the gate
+                // authorizes draws one of these sends, so the grant the operator configured
+                // is actually spendable instead of being refused by a reset-only budget of
+                // one. Rows without retryOnReset keep the historical single send.
+                attempts: 1 + (resetReplayPolicyFor(route.provider)?.replacements ?? 0),
+                onSendsConsumed: noteTransientSends,
+              }
               : {}),
           ...(canonicalForwardRow
-            ? { retrySlowCapacity: true, retryCapacityDeferralsMs: CAPACITY_RETRY_DELAYS_MS }
+            ? { retrySlowCapacity: true, retryCapacityDeferralsMs: capacityLadderDelays() ?? CAPACITY_RETRY_DELAYS_MS }
             : {}),
         },
       );
@@ -983,7 +991,7 @@ export async function prepareAdapterExchange(
           for await (const _ of prepareSameTarget429Wait({
             body: upstreamResponse.body,
             signal: options.abortSignal,
-            delayMs: rateLimitRetryDelayMs(rateLimitPolicy, retryAfterHeader, Date.now()),
+            delayMs: rateLimitRetryDelayMs(rateLimitPolicy, retryAfterHeader, Date.now(), rateLimitRetries - 1),
           })) {
             // pre-stream: no stall watchdog to feed
           }

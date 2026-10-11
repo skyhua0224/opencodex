@@ -183,15 +183,13 @@ native alias also omits disabled bare native rows from the effective catalog. Da
 derived from the static native set, and sync retains bundled/pristine native recovery sources so a
 later re-enable or alias removal restores native metadata.
 
-Without such an alias, a disabled bare native keeps a `visibility: "hide"` row, and that retention
-has an operator-visible consequence. `visibleNativeSlugs` in `src/codex/catalog/metadata.ts` drops
-the slug from `/v1/models` and the dashboard while `applyNativeVisibility` keeps the catalog row, so
-a renderer that ignores `visibility` can still offer a model every other surface calls disabled.
-Selecting it is not refused: `disabledModels` is a catalog control, and `src/router.ts` never
-consults it, so the turn resolves by the ordinary routing rules instead of failing as disabled.
-Retention is the deliberate trade — it preserves real upstream metadata for a later re-enable
-rather than synthesizing a guess — and a `nativeAlias` combo is the lever that omits the row
-outright.
+A disabled bare native is omitted from the emitted catalog outright: the codex-rs picker ignores
+`visibility: "hide"`, so retaining the row kept it selectable while `visibleNativeSlugs` in
+`src/codex/catalog/metadata.ts` already dropped the slug from `/v1/models` and the dashboard
+(measured 2026-10-09). Bundled and pristine sources retain the upstream metadata, so a later
+re-enable rebuilds the row unchanged. Selecting was never refused — `disabledModels` is a
+catalog control and `src/router.ts` never consults it — so omission changes only what the
+picker offers, and a `nativeAlias` combo keeps its existing account-qualified shape.
 
 Nothing in the catalog validates Codex's own root `model` pin against this exposed set;
 `readConfiguredDefaultModel` in `src/codex/catalog/parsing.ts` reads the pin, and `ocx doctor`

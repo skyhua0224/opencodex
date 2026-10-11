@@ -548,6 +548,31 @@ function loopbackListenerPortError(value: unknown): string | null {
   return null;
 }
 
+function remoteListenerConfigError(value: unknown): string | null {
+  const raw = rawConfigRecord(value);
+  if (!raw || !Object.hasOwn(raw, "unauthenticatedRemoteListener") || raw.unauthenticatedRemoteListener === undefined) return null;
+  const listener = rawConfigRecord(raw.unauthenticatedRemoteListener);
+  if (!listener) return "schema_invalid: unauthenticatedRemoteListener: must be an object or omitted";
+  if (typeof listener.enabled !== "boolean") return "schema_invalid: unauthenticatedRemoteListener.enabled: must be a boolean";
+  if (listener.enabled === false) return Object.keys(listener).length === 1 ? null : "schema_invalid: unauthenticatedRemoteListener: disabled listener accepts only enabled";
+  if (Object.keys(listener).some(key => !["enabled", "host", "port"].includes(key))) return "schema_invalid: unauthenticatedRemoteListener: contains an unsupported field";
+  if (typeof listener.host !== "string" || listener.host.trim() === "") return "schema_invalid: unauthenticatedRemoteListener.host: must be a nonblank address";
+  const host = listener.host.trim().toLowerCase();
+  const parts = host.split(".").map(Number);
+  if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)
+    || parts[0] === 0 || parts[0] === 127 || parts[0] >= 224) {
+    return "schema_invalid: unauthenticatedRemoteListener.host: must be a specific non-loopback IPv4 address";
+  }
+  if (typeof listener.port !== "number" || !Number.isInteger(listener.port) || listener.port < 1 || listener.port > 65535) {
+    return "schema_invalid: unauthenticatedRemoteListener.port: must be an integer port when enabled";
+  }
+  const proxyPort = typeof raw.port === "number" ? raw.port : 10100;
+  if (listener.port === proxyPort) return "schema_invalid: unauthenticatedRemoteListener.port: must differ from the proxy port";
+  const loopback = rawConfigRecord(raw.unauthenticatedLoopbackListener);
+  if (loopback?.enabled === true && loopback.port === listener.port) return "schema_invalid: unauthenticatedRemoteListener.port: must differ from unauthenticatedLoopbackListener.port";
+  return null;
+}
+
 /**
  * The one sentence both the write boundary and startup use for an impossible companion bind.
  *
@@ -697,6 +722,7 @@ export function validateConfigCandidate(value: unknown): { ok: true; config: Ocx
     ?? clientConnectionConfigError(value)
     ?? clientRolePairError(value)
     ?? loopbackListenerPortError(value)
+    ?? remoteListenerConfigError(value)
     ?? managementIngressConfigError(value)
     ?? metricsExportConfigError(value)
     ?? skillsConfigError(value);

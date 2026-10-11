@@ -14,9 +14,11 @@ test("provider management validates retryOnReset bounds and unknown keys", () =>
   const base = { adapter: "openai-responses", baseUrl: "https://api.openai.com/v1" };
   expect(providerManagementConfigError("custom", { ...base, retryOnReset: {} })).toBeNull();
   expect(providerManagementConfigError("custom", { ...base, retryOnReset: { enabled: true, replacements: 2 } })).toBeNull();
+  expect(providerManagementConfigError("custom", { ...base, retryOnReset: { allowStateful: true } })).toBeNull();
   expect(providerManagementConfigError("custom", { ...base, retryOnReset: { replacements: 0 } }))
     .toContain("retryOnReset.replacements is invalid");
-  expect(providerManagementConfigError("custom", { ...base, retryOnReset: { replacements: 3 } }))
+  expect(providerManagementConfigError("custom", { ...base, retryOnReset: { replacements: 3 } })).toBeNull();
+  expect(providerManagementConfigError("custom", { ...base, retryOnReset: { replacements: 5 } }))
     .toContain("retryOnReset.replacements is invalid");
   // The old field name from the pre-rework branch is rejected rather than silently ignored:
   // `attempts` was a per-leg send count and this is a per-request replacement count.
@@ -28,7 +30,8 @@ test("provider management validates retryOnReset bounds and unknown keys", () =>
   // compares it against the seed with an exact key match: the field must be admitted
   // there like requestPacing is, while its value is still validated.
   expect(providerManagementConfigError("openai", { ...canonicalDirect, retryOnReset: { replacements: 2 } })).toBeNull();
-  expect(providerManagementConfigError("openai", { ...canonicalDirect, retryOnReset: { replacements: 3 } }))
+  expect(providerManagementConfigError("openai", { ...canonicalDirect, retryOnReset: { replacements: 3 } })).toBeNull();
+  expect(providerManagementConfigError("openai", { ...canonicalDirect, retryOnReset: { replacements: 5 } }))
     .toContain("retryOnReset.replacements is invalid");
   // A secret-shaped unknown field name and a secret-shaped provider name are both redacted.
   const secretError = providerManagementConfigError("custom", { ...base, retryOnReset: { "sk-super-secret-9876": true } })!;

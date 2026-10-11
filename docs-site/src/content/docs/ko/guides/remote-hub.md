@@ -139,7 +139,7 @@ ocx sync          # 이제 허브가 자기 Codex/Grok 블록을 기록합니다
 ocx claude        # 허브 자신의 루프백 주소로 연결된 Claude Code
 ```
 
-이 리스너는 추론 경로만 제공합니다: `POST /v1/responses`와 그 WebSocket 업그레이드, `POST /v1/responses/compact`, `POST /v1/messages`, `POST /v1/chat/completions`, `POST /v1/alpha/search`, `GET /v1/models`, 그리고 실시간 음성 표면입니다. `POST /v1/messages/count_tokens`는 의도적으로 허용하지 않으므로 Claude Code는 로컬 토큰 추정으로 대체합니다. 실행이 깨지는 문제가 아니라 표시상의 손실입니다. `/api/*`, `/healthz`, `/readyz`, 대시보드는 이 리스너에서 모두 `404`입니다. `ocx claude`의 탐색 호출 같은 로컬 관리 읽기는 관리 자격 증명을 들고 인증된 관리 표면으로 가며, 인증 없는 소켓으로 가지 않습니다. 관리 인그레스와 이 리스너가 서로 다른 것인 이유가 그것입니다.
+이 리스너는 로컬 `/v1` 데이터 경로, `GET /v1/models`, 실시간 음성 표면, 번들 대시보드, session bootstrap, 운영자 브라우저 워크플로를 위한 `/api/*`를 제공합니다. `/healthz`와 `/readyz`는 여기서 `404`입니다. `ocx claude`의 탐색 호출 같은 헤드리스 관리 읽기는 자기 관리 자격 증명을 들고 인증된 공개 관리 표면으로 갑니다.
 
 리스너를 **끈** 상태에서는 허브가 의도적으로 자기 클라이언트 설정을 고치지 않으며, 건너뛸 때마다 무엇이 막았는지 말해 줍니다.
 

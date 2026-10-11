@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 /**
  * Self-test for the lane-level WebSocket breaker (2026-09-26).
  *
@@ -20,7 +21,7 @@ import { join } from "node:path";
 process.env.OPENCODEX_HOME = mkdtempSync(join(tmpdir(), "ocx-ws-lane-"));
 const home = process.env.OPENCODEX_HOME;
 
-const PKG = new URL("../src", import.meta.url).pathname.replace(/\/$/, "");
+const PKG = fileURLToPath(new URL("../src/", import.meta.url)).replace(/[\\/]+$/, "").replace(/\\/g, "/");
 const { codexWsLaneDisabled, codexWsLaneSnapshot, noteCodexWsLaneRefusal, noteCodexWsLaneSuccess,
   clearCodexWsLaneHold, resetCodexWsLaneForTests } = await import(PKG + "/server/responses/codex-ws-lane.ts");
 
