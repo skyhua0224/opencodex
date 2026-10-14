@@ -1,5 +1,6 @@
 import type { OcxProviderConfig } from "./provider";
 import type { CodexAccount } from "./accounts";
+import type { ResetStormConfig } from "../lib/reset-storm";
 
 export interface AnthropicModelRoute {
   name: string;
@@ -514,6 +515,8 @@ export interface OcxConfig {
   skills?: OcxSkillsConfig;
   /** Opt-in process-local aggregate request metrics on the authenticated management plane. */
   metricsExport?: { enabled?: boolean };
+  /** Cross-lane connection-reset storm coordination for reset-replacement sends. */
+  resetStorm?: ResetStormConfig;
   /** Opt in to one identical-turn retry when a Responses completion has no text or tool call. */
   emptyCompletionRetry?: boolean;
   /** Suppress allowlisted client-facing Codex transport hints; provider enforcement is unchanged. */

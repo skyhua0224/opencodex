@@ -104,6 +104,20 @@ export const configSchema = z.object({
   skills: skillsConfigSchema.optional().catch(undefined),
   // Malformed hand edits disable this opt-in exporter. Live writes reject them in diagnostics.ts.
   metricsExport: z.object({ enabled: z.boolean().optional() }).strict().optional().catch(undefined),
+  // Cross-lane connection-reset storm coordination (src/lib/reset-storm.ts). Coordination
+  // only ever delays or skips a replacement send the reset ladder already authorized, so
+  // the bounds here cap pacing, never verdicts. Malformed hand edits disable coordination
+  // and the per-lane ladder behaves exactly as before.
+  resetStorm: z.object({
+    enabled: z.boolean().optional(),
+    minLanes: z.number().int().min(2).max(64).optional(),
+    detectionWindowMs: z.number().int().min(1000).max(60000).optional(),
+    stormWindowMs: z.number().int().min(5000).max(300000).optional(),
+    maxStormWindowMs: z.number().int().min(30000).max(900000).optional(),
+    staggerSpreadMs: z.number().int().min(0).max(60000).optional(),
+    maxConcurrentReplacements: z.number().int().min(1).max(16).optional(),
+    queueDeadlineMs: z.number().int().min(250).max(120000).optional(),
+  }).strict().optional().catch(undefined),
   // Kept raw on purpose: `.catch(undefined)` would turn a mistyped `enabled` into "inherit",
   // which can reopen a surface the operator meant to close. src/protocols/settings.ts parses it
   // and fails closed instead.

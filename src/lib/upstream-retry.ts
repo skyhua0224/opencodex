@@ -19,6 +19,7 @@ import { withSsePreludeDeclineRetry } from "./sse-prelude-retry";
 
 import { clearableDeadline } from "./abort";
 import { redactSecretString } from "./redact";
+import { resetStorm } from "./reset-storm";
 
 /**
  * Responses the origin may already be executing. RFC 9110 §9.2.2 forbids an intermediary
@@ -153,6 +154,9 @@ export function carryReplayRefusal<T extends Response>(source: Response, rewrapp
 const RESET_RETRY_MAX_ATTEMPTS = 3;
 const RESET_RETRY_BASE_DELAY_MS = 150;
 const RESET_RETRY_MAX_DELAY_MS = 1_000;
+// Storm-lane identity for legs the caller did not name: one id per helper call, so the
+// retries inside one call count as ONE lane while concurrent calls count as their own.
+let resetStormLegCounter = 0;
 
 // Transient-5xx status retry layer (pre-stream only; devlog/_plan/260716_claudecode_hardening/010).
 /** Total sends one transient-retry helper call may make: 1 initial + 2 retries. */
@@ -525,6 +529,13 @@ export interface ResetRetryOptions {
    * `attempts`, exactly like every other send this leg makes.
    */
   claimAmbiguousResend?: () => boolean;
+  /**
+   * Stable identity for reset-storm coordination. Every retry inside one call shares it,
+   * so the storm counts this leg as ONE lane; concurrent legs of the same logical request
+   * pass different ids (a request id is ideal). Absent falls back to a per-call unique id,
+   * which is still correct for the gate and only coarser for detection.
+   */
+  stormLaneId?: string;
 }
 
 export interface TransientRetryOptions extends ResetRetryOptions {
@@ -684,18 +695,41 @@ export async function fetchWithResetRetry(
   // settles as the refusal or an unambiguous answer: a second send of a possibly-executed turn
   // is already out, and handing the client anything it would retry compounds it.
   let spentOperatorReplacement = false;
+  // One stable identity per leg (see ResetRetryOptions.stormLaneId), and the same origin
+  // label the retry warn log prints as the coordination scope.
+  const stormLane = opts.stormLaneId ?? "leg-" + String(resetStormLegCounter++);
+  const stormScope = opts.label ?? "";
   for (let attempt = 0; attempt < attempts; attempt++) {
     if (opts.abortSignal?.aborted) throw abortError(opts.abortSignal);
+    // The storm gate delays REPLACEMENT sends only. The first send of a leg is never
+    // gated: one request's latency must not depend on its neighbors' connection health.
+    // A "defer" settles this leg without the send -- the budget never counted it, so no
+    // phantom spend is reported -- with exactly the verdict an exhausted budget has.
+    const stormGate = attempt === 0
+      ? null
+      : await resetStorm().acquireReplacementSlot(stormScope, opts.abortSignal);
+    if (stormGate === "defer") {
+      if (opts.abortSignal?.aborted) throw abortError(opts.abortSignal);
+      if (opts.replaySafe === true) throw lastError ?? new Error("upstream fetch failed");
+      return replayRefusalResponse();
+    }
     // Reported before the await, one physical send at a time: a send that rejects has still
     // been made, and this helper leaves through four exits (return, reset give-up, non-reset
     // rethrow, abort), so a per-send report is the only shape that is correct on all of them.
     opts.onSendsConsumed?.(1);
     try {
       const response = await doFetch(attempt === 0 ? firstRecovery : "connection-reset");
+      // Headers arrived over a live connection: proof the reclaim window has passed. Any
+      // send under an active storm counts as the probe that lifts it for every queued lane.
+      resetStorm().noteSendSuccess(stormScope);
+      stormGate?.release();
       return spentOperatorReplacement ? settleOperatorReplacement(response) : response;
     } catch (err) {
+      stormGate?.release();
       if (opts.abortSignal?.aborted) throw err;
-      if (!isConnectionResetError(err)) {
+      const connectionReset = isConnectionResetError(err);
+      if (connectionReset) resetStorm().recordReset(stormScope, stormLane);
+      if (!connectionReset) {
         // Whatever ended the leg, an operator replacement already went out, so the first send
         // may have run the turn. Settle it as the refusal instead of throwing into a caller
         // whose transport-failure path answers with a client-retryable 502.
@@ -728,10 +762,17 @@ export async function fetchWithResetRetry(
           spentOperatorReplacement ? "replacing" : "retrying"
         } (${attempt + 2}/${attempts})`,
       );
-      await sleepWithAbort(retryBackoffDelayMs(attempt, {
+      // A storm adds a lane-stable offset on top of the paced ladder, so a herd of
+      // simultaneous resets re-sends across a spread instead of in one clump. Zero unless
+      // a storm is active for this scope.
+      const pacedWaitMs = retryBackoffDelayMs(attempt, {
         baseDelayMs: RESET_RETRY_BASE_DELAY_MS,
         maxDelayMs: RESET_RETRY_MAX_DELAY_MS,
-      }), opts.abortSignal);
+      });
+      await sleepWithAbort(
+        pacedWaitMs + resetStorm().replacementStaggerMs(stormScope, stormLane),
+        opts.abortSignal,
+      );
     }
   }
   throw lastError ?? new Error("upstream fetch failed");
