@@ -525,7 +525,7 @@ jobs:
           PATH_SELECTED: ${{ steps.filter.outputs.windows }}
         run: bash scripts/ci/windows-sensitive-diff.sh
 
-      # A scheduled run starts from main's head. Resolve dev ONCE so the nine
+      # A scheduled run starts from main's head. Resolve main ONCE so the nine
       # Windows shards, the macOS control and every other job test one commit,
       # however long the queue between them. contents: read already covers it.
       - name: Resolve the commit a scheduled run tests
@@ -540,14 +540,14 @@ jobs:
             echo 'checkout_ref=' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/dev" --jq .sha)"
+          sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)"
           if ! printf '%s' "$sha" | grep -Eqx '[0-9a-f]{40}'; then
-            printf '::error::could not resolve dev to a commit SHA\n'
+            printf '::error::could not resolve main to a commit SHA\n'
             exit 1
           fi
           printf 'checkout_ref=%s\n' "$sha" >> "$GITHUB_OUTPUT"
-          printf 'Scheduled run: workflow from %s, testing dev at %s\n' "$GITHUB_SHA" "$sha" >> "$GITHUB_STEP_SUMMARY"
-          printf 'scheduled run tests dev at %s (workflow %s)\n' "$sha" "$GITHUB_SHA"
+          printf 'Scheduled run: workflow from %s, testing main at %s\n' "$GITHUB_SHA" "$sha" >> "$GITHUB_STEP_SUMMARY"
+          printf 'scheduled run tests main at %s (workflow %s)\n' "$sha" "$GITHUB_SHA"
 
   # The suite, split by file across four Linux runners.
   #
