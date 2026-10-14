@@ -199,7 +199,17 @@
       ]
     },
     {
-        "path": "transports/policy-fallback.md",
+      "path": "transports/responses-provider-recovery.md",
+      "tier": 3,
+      "title": "Responses Provider Recovery Lanes",
+      "scope": "Provider-specific pre-output recovery: Console Go upload-rejection replay and Grok Devin pre-output rate limits.",
+      "documents": [
+        "src/providers/",
+        "src/server/"
+      ]
+    },
+    {
+      "path": "transports/policy-fallback.md",
         "tier": 3,
         "title": "Policy Candidate Fallback",
         "scope": "Original policy authorization, concrete candidate retries and physical destination deduplication.",
@@ -442,6 +452,15 @@
         "src/usage/",
         "src/usage/timeline.ts",
         "src/vision/"
+      ]
+    },
+    {
+      "path": "gui-service-controls.md",
+      "tier": 5,
+      "title": "GUI Service Controls",
+      "scope": "The dashboard stop control and the Bun runtime provenance the running service reports about itself.",
+      "documents": [
+        "src/lib/"
       ]
     },
     {

@@ -11,6 +11,7 @@ import { parseDesktopProfile } from "../../src/claude/desktop-profile";
 import { desktopVisibleNativeSlugs, type CatalogModel } from "../../src/codex/catalog";
 import { MAIN_CODEX_ACCOUNT_ID } from "../../src/codex/main-account";
 import type { CodexModelEntitlementSnapshot } from "../../src/codex/model-entitlements";
+import { gateRoutedModelsToVisibleRows } from "../../src/providers/new-model-policy";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "../helpers/isolated-codex-home";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { SUBAGENT_MODELS_VERSION } from "../../src/config/subagent-models";
@@ -93,9 +94,30 @@ describe("shared Desktop discovery inputs", () => {
       expect(resolveDesktop3pAlias("claude-opus-4-8-vdu")).toBe("test/model-155");
       const models = generateDesktop3pModels(inputs.nativeSlugs, inputs.routedModels, undefined, inputs.nativeContextCap);
       expect(models.map(model => model.name)).toEqual(["claude-opus-4-8-vdu"]);
-      expect(resolveDesktop3pAlias("claude-opus-4-8-vdu")).toBe("test/model-155");
-    } finally { warning.mockRestore(); }
+    expect(resolveDesktop3pAlias("claude-opus-4-8-vdu")).toBe("test/model-155");
+  } finally { warning.mockRestore(); }
+});
+
+describe("Desktop 3P configuration visibility gate", () => {
+  afterEach(() => buildDesktop3pRegistry([], []));
+
+  test("a row the visibility gate rejects is absent from the Desktop 3P configuration", () => {
+    const config = {
+      ...projectionConfig(),
+      disabledModels: ["test/model-456"],
+      modelDiscovery: { newModelPolicy: "off", knownModels: { test: { ids: ["model-123", "model-155"], removed: [], updatedAt: "2026-10-10T00:00:00Z" } } },
+    } as OcxConfig;
+    const gated = gateRoutedModelsToVisibleRows(config, [
+      { provider: "test", id: "model-123" },
+      { provider: "test", id: "model-456" },
+    ]);
+    const inputs = buildDesktopDiscoveryInputs({
+      config, modelEntitlements: emptyEntitlements(), desktopNativeCandidates: [], models: gated,
+    });
+    const models = generateDesktop3pModels(inputs.nativeSlugs, inputs.routedModels, undefined, inputs.nativeContextCap);
+    expect(JSON.stringify(models)).not.toContain("model-456");
   });
+});
 });
 
 describe("Desktop snapshot through authenticated model discovery", () => {

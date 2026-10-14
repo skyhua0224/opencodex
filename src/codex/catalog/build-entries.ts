@@ -948,7 +948,25 @@ export function mergeCatalogEntriesFromObservedState({
     delete entry.opencodex_catalog_kind;
     entry.opencodex_catalog_kind = kind;
   }
-  return versionedEntries;
+  return omitVisibilityHiddenRows(versionedEntries);
+}
+
+/**
+ * Drop rows a renderer must not offer.
+ *
+ * `applyNativeVisibility` answers a disabled bare native with `visibility: "hide"`, but the
+ * codex-rs picker ignores that field, so a retained row stayed selectable in the one surface
+ * the catalog file serves — the picker and the dashboard disagreed by construction (measured
+ * 2026-10-09). The emitted catalog therefore omits those rows outright: bundled and pristine
+ * sources keep the metadata, and a later re-enable rebuilds the row unchanged, so the
+ * retention the old hide flag bought is now free. Reserve projections and native-alias rows
+ * are carried through — neither is a bare native row.
+ */
+export function omitVisibilityHiddenRows(entries: RawEntry[]): RawEntry[] {
+  return entries.filter(entry =>
+    entry.visibility !== "hide"
+    || isNativeAliasCatalogEntry(entry)
+    || isReserveCatalogProjection(entry));
 }
 
 /** Merge retained-sync rows using the process-observed Codex feature state. */

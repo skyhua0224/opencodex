@@ -18,6 +18,7 @@ export { finishUpstreamNativeEntry, isExactComboCatalogModel, deriveEntry } from
 export {
   buildCatalogEntries,
   buildCatalogEntriesFromObservedState,
+  omitVisibilityHiddenRows,
   resetCatalogRuntimeStateForTests,
   orderForSubagents,
   orderForModelPicker,
