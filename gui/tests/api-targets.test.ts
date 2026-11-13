@@ -1,0 +1,202 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Window } from "happy-dom";
+import {
+  apiBaseForPlane,
+  apiTargetIdentity,
+  ClientStateChangedError,
+  discoverApiTargets,
+  relayUrlForPath,
+  standaloneApiTargets,
+  targetsFromMachineStatus,
+  type MachineStatusV1,
+} from "../src/api-targets";
+
+test("a relay base shared by two hubs still has distinct logical target identities", () => {
+  const base = standaloneApiTargets("");
+  const hubA = apiTargetIdentity({
+    ...base,
+    shared: { ...base.shared, serverOrigin: "https://hub-a.example" },
+    apiKeyId: "machine-key",
+  });
+  const hubB = apiTargetIdentity({
+    ...base,
+    shared: { ...base.shared, serverOrigin: "https://hub-b.example" },
+    apiKeyId: "machine-key",
+  });
+  expect(hubA.key).not.toBe(hubB.key);
+  expect(hubA.label).toBe("https://hub-a.example");
+  expect(hubA.label).not.toContain("machine-key");
+});
+
+test("API-key rotation is not a logical target change, but a different link is", () => {
+  const base = standaloneApiTargets("");
+  const shared = { ...base.shared, serverOrigin: "https://hub.example" };
+  const keyA = apiTargetIdentity({ ...base, shared, apiKeyId: "key-a" });
+  const keyB = apiTargetIdentity({ ...base, shared, apiKeyId: "key-b" });
+  expect(keyA.key).toBe(keyB.key);
+  const linkA = apiTargetIdentity({ ...base, shared, link: { linkId: "link-a", home: null, readOnly: true } });
+  const linkB = apiTargetIdentity({ ...base, shared, link: { linkId: "link-b", home: null, readOnly: true } });
+  expect(linkA.key).not.toBe(linkB.key);
+  expect(linkA.label).toBe("https://hub.example");
+});
+
+let win: Window;
+let previousWindow: unknown;
+let previousDocument: unknown;
+let previousFetch: typeof fetch;
+
+/**
+ * Stand in for the runtime-role meta tag the server injects into the served document.
+ * `null` means the server said nothing, which every reader must treat as standalone.
+ */
+function setRuntimeRole(role: string | null): void {
+  const existing = win.document.querySelector('meta[name="opencodex-runtime-role"]');
+  existing?.remove();
+  if (role === null) return;
+  const meta = win.document.createElement("meta");
+  meta.setAttribute("name", "opencodex-runtime-role");
+  meta.setAttribute("content", role);
+  win.document.head.append(meta);
+}
+
+const status = (transport: "direct" | "relay"): MachineStatusV1 => ({
+  mode: "client",
+  connected: true,
+  machineBase: "http://localhost",
+  sharedBase: transport === "direct" ? "https://hub.example.test" : "http://localhost/api/machine/hub-relay",
+  sharedServerOrigin: "https://hub.example.test",
+  managementTransport: transport,
+  apiKeyId: "client-key-a",
+  protocolVersion: 1,
+  connectedAt: "2026-08-28T00:00:00.000Z",
+  catalogSyncedAt: "2026-08-28T00:05:00.000Z",
+  hubReachability: "unknown",
+});
+
+beforeEach(() => {
+  previousWindow = Reflect.get(globalThis, "window");
+  previousDocument = Reflect.get(globalThis, "document");
+  previousFetch = globalThis.fetch;
+  win = new Window({ url: "http://localhost/" });
+  Object.defineProperty(globalThis, "window", { configurable: true, value: win });
+  Object.defineProperty(globalThis, "document", { configurable: true, value: win.document });
+  // Most rows here exercise the connected path; the standalone rows set their own role.
+  setRuntimeRole("client");
+});
+
+afterEach(() => {
+  globalThis.fetch = previousFetch;
+  Object.defineProperty(globalThis, "window", { configurable: true, value: previousWindow });
+  Object.defineProperty(globalThis, "document", { configurable: true, value: previousDocument });
+  win.close();
+});
+
+describe("two-plane API targets", () => {
+  test("404 selects the unchanged standalone same-origin target", async () => {
+    globalThis.fetch = (async () => new Response(null, { status: 404 })) as typeof fetch;
+    const targets = await discoverApiTargets("");
+    expect(targets).toEqual(standaloneApiTargets(""));
+    expect(apiBaseForPlane("machine", targets)).toBe("");
+    expect(apiBaseForPlane("shared", targets)).toBe("");
+  });
+
+  test("constructs exact direct and fixed relay shared bases", () => {
+    const direct = targetsFromMachineStatus("", status("direct"));
+    expect(direct.shared).toMatchObject({ baseUrl: "https://hub.example.test", serverOrigin: "https://hub.example.test", transport: "direct" });
+    expect(direct.catalogSyncedAt).toBe("2026-08-28T00:05:00.000Z");
+    const relay = targetsFromMachineStatus("", status("relay"));
+    expect(relay.machine.baseUrl).toBe("");
+    expect(relay.shared).toMatchObject({ baseUrl: "/api/machine/hub-relay", serverOrigin: "https://hub.example.test", transport: "relay" });
+    expect(relayUrlForPath(relay.shared, "/api/usage?range=all")).toBe("/api/machine/hub-relay/api/usage?range=all");
+    expect(() => relayUrlForPath(relay.shared, "/api/%2e%2e/config")).toThrow();
+    expect(() => relayUrlForPath(relay.shared, "//evil.example/api/config")).toThrow();
+  });
+
+  test("a machine-status network failure is not treated as standalone", async () => {
+    setRuntimeRole("client");
+    globalThis.fetch = (async () => { throw new TypeError("offline"); }) as typeof fetch;
+    await expect(discoverApiTargets("")).rejects.toThrow("local machine plane unavailable");
+  });
+
+  test("a Remote Link Child's relay targets this machine and carries the Home it is managed by", () => {
+    const machine = "http://localhost";
+    const linked = targetsFromMachineStatus("", {
+      ...status("relay"),
+      sharedBase: `${machine}/api/machine/hub-relay`,
+      sharedServerOrigin: machine,
+      link: { linkId: `lnk_${"a".repeat(16)}`, home: "home-box", readOnly: true },
+    });
+    expect(linked.shared).toMatchObject({ baseUrl: "/api/machine/hub-relay", serverOrigin: machine, transport: "relay" });
+    expect(linked.usageTopology).toBe("link");
+    expect(linked.link).toEqual({ linkId: `lnk_${"a".repeat(16)}`, home: "home-box" });
+    const malformed = targetsFromMachineStatus("", {
+      ...status("relay"),
+      link: { linkId: "not-a-link", home: "x", readOnly: true },
+    });
+    expect(malformed.link).toBeUndefined();
+    expect(malformed.usageTopology).toBe("unknown");
+    const hubRelay = targetsFromMachineStatus("", status("relay"));
+    expect(hubRelay.link).toBeUndefined();
+    expect(hubRelay.usageTopology).toBe("hub");
+    expect(targetsFromMachineStatus("", { ...status("relay"), sharedServerOrigin: machine }).usageTopology).toBe("unknown");
+    expect(targetsFromMachineStatus("", status("direct")).usageTopology).toBe("hub");
+    expect(standaloneApiTargets("").usageTopology).toBe("home");
+  });
+
+  test("rejects a non-string catalog fetch timestamp", async () => {
+    globalThis.fetch = (async () => new Response(JSON.stringify({ ...status("direct"), catalogSyncedAt: 42 }), {
+      headers: { "content-type": "application/json" },
+    })) as typeof fetch;
+    await expect(discoverApiTargets("")).rejects.toThrow("local machine plane returned invalid status");
+  });
+
+  test("an unknown relay capability is legacy, not an invalid status", async () => {
+    // A relay that advertises a capability this dashboard does not understand is an older
+    // or newer peer. Treating it as malformed would break discovery; it must read as
+    // legacy so the preflight path applies.
+    globalThis.fetch = (async () => new Response(JSON.stringify({ ...status("relay"), relayTargetCheck: "expected-target-v2" }), {
+      headers: { "content-type": "application/json" },
+    })) as typeof fetch;
+    const targets = await discoverApiTargets("");
+    expect(targets.shared.transport).toBe("relay");
+    expect(targets.relayTargetCheck).toBeUndefined();
+    expect(targetsFromMachineStatus("", { ...status("relay"), relayTargetCheck: "expected-target-v2" } as MachineStatusV1).relayTargetCheck)
+      .toBeUndefined();
+  });
+
+  test("standalone discovers nothing and sends no request", async () => {
+    // The whole point of the runtime-role meta tag: a user who never enabled remote hub
+    // must not have their browser probe a remote-hub endpoint. Discovery previously ran
+    // unconditionally and inferred standalone from the resulting 404 — a request that
+    // announced the feature's existence on every dashboard load.
+    let calls = 0;
+    globalThis.fetch = (async () => { calls += 1; return new Response(null, { status: 404 }); }) as typeof fetch;
+
+    for (const role of [null, "standalone", "hub"] as const) {
+      calls = 0;
+      setRuntimeRole(role);
+      const targets = await discoverApiTargets("");
+      expect(targets.connected).toBe(false);
+      expect(targets).toEqual(standaloneApiTargets(""));
+      expect(calls).toBe(0);
+    }
+  });
+
+  test("a connected runtime still discovers", async () => {
+    // The tag narrows who asks; it does not remove discovery for the role that needs it.
+    setRuntimeRole("client");
+    let calls = 0;
+    globalThis.fetch = (async () => { calls += 1; return new Response(null, { status: 404 }); }) as typeof fetch;
+    await discoverApiTargets("");
+    expect(calls).toBe(1);
+  });
+
+  test("a Child whose saved connection diverged reports client_state_changed instead of a generic refusal", async () => {
+    globalThis.fetch = (async () => Response.json({ error: "client_state_changed" }, { status: 503 })) as typeof fetch;
+    await expect(discoverApiTargets("")).rejects.toBeInstanceOf(ClientStateChangedError);
+    globalThis.fetch = (async () => Response.json({ error: "busy" }, { status: 503 })) as typeof fetch;
+    const generic = discoverApiTargets("");
+    await expect(generic).rejects.toThrow("local machine plane refused discovery (503)");
+    await expect(generic).rejects.not.toBeInstanceOf(ClientStateChangedError);
+  });
+});

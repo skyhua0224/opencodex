@@ -1,0 +1,44 @@
+/* ============================================================================
+   subagents-workspace — what Tailwind utilities on the v2 Subagents page cannot say.
+   The panels, rows and controls are utilities in the components (v2-subagents/frame.tsx);
+   this file keeps the page width, the scroll offset under the sticky section strip, and
+   the delegation suggest form. Namespace: subagents-workspace-  |  widgets: swi-
+   ============================================================================ */
+
+.main-inner:has(.subagents-workspace-shell) {
+  max-width: 1080px;
+}
+
+.subagents-workspace-shell {
+  width: 100%;
+  min-width: 0;
+  container-type: inline-size;
+  container-name: subagents-workspace;
+}
+
+/* The sticky section strip covers the top of a section it jumps to. */
+.subagents-workspace-section {
+  min-width: 0;
+  scroll-margin-top: 72px;
+}
+
+/* Suggest: describe the delegated work, review one sized proposal, accept through the save. */
+.swi-suggest { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; padding-top: var(--space-1); }
+.swi-suggest-label { font-size: 13px; font-weight: 500; color: var(--ocx-fg-muted); }
+.swi-suggest-input { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-2); align-items: start; }
+.swi-suggest-input > textarea { width: 100%; min-width: 0; resize: vertical; }
+.swi-suggest-result {
+  display: flex; flex-direction: column; gap: 4px; min-width: 0;
+  padding: var(--space-3); border-radius: 8px;
+  background: var(--ocx-surface); box-shadow: inset 0 0 0 1px var(--ocx-line);
+  font-size: 13px;
+}
+.swi-suggest-result p { margin: 0; overflow-wrap: anywhere; }
+.swi-suggest-head { display: flex; align-items: baseline; gap: 6px 10px; flex-wrap: wrap; }
+.swi-suggest-change { display: flex; align-items: center; gap: 6px 8px; flex-wrap: wrap; overflow-wrap: anywhere; font-family: var(--font-code); }
+.swi-suggest-actions { display: flex; align-items: center; justify-content: flex-end; gap: var(--space-2); margin-top: 4px; }
+.swi-suggest-done { color: var(--ocx-success); font-weight: 600; margin-right: auto; }
+@media (max-width: 640px) {
+  .swi-suggest-input { grid-template-columns: minmax(0, 1fr); }
+  .swi-suggest-input > .btn { justify-self: end; }
+}

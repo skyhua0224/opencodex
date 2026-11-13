@@ -1,0 +1,14 @@
+/* Imported by its component, so it sits in the `legacy` cascade layer itself:
+   unlayered CSS would outrank design/bridge.css and every Tailwind utility.
+   The v2 Remote Link page draws itself with utilities (components/v2-startup);
+   the switch is painted by bridge.css with every other `.switch`. What is left
+   here is what utilities cannot say. */
+@layer legacy {
+/* the knob: bridge.css sizes and colours it, the drawing itself lives here */
+.remote-link-switch { cursor: pointer; }
+.remote-link-switch::after { display: block; content: ""; border-radius: 50%; transition: transform 0.15s ease; }
+.remote-link-sheet input[type="checkbox"], .remote-link-confirm-dialog input[type="checkbox"] { accent-color: var(--ocx-fg); width: 15px; height: 15px; margin: 0; }
+@media (prefers-reduced-motion: reduce) {
+  .remote-link-page *, .remote-link-page *::before, .remote-link-page *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
+}
+}

@@ -1,0 +1,1181 @@
+# opencodex 2.63.0 — SSE prelude hold + retry (2026-09-24)
+#
+# The SSE lane's counterpart of the WebSocket prelude hold: a capacity decline that arrives after
+# a 200 and before any content never reaches the client -- the wrapper holds the prelude, throws
+# that attempt away and splices the next attempt's frames into the same body.
+#
+# Also carries: the WS prelude hold + replayable decline (earlier today), the capacity ladder on
+# the passthrough initial send, and the raised WS->HTTP demotion threshold.
+#
+# Apply from a pristine package root:  patch -p1 --dry-run < this-file  then  patch -p1 < this-file
+
+--- /dev/null	2026-09-23 02:42:19.090885446 +0800
++++ b/src/lib/sse-prelude-retry.ts	2026-09-24 18:48:04.634539503 +0800
+@@ -0,0 +1,167 @@
++/**
++ * Retry a capacity decline that arrives INSIDE an already-200 SSE body.
++ *
++ * The WebSocket lane holds its prelude, so a decline that arrives after `response.created` is still
++ * a pre-commit event and the attempt can be re-dialled. The SSE lane had no such hold: the backend
++ * answered 200, emitted the prelude, then sent "Our servers are currently overloaded" as a stream
++ * event, and that event went straight into the client (measured 2026-09-24 14:15-15:49: four such
++ * turns, `transportPhase: terminal_sse`, `sendCount: 1`, nothing retryable left).
++ *
++ * This wrapper sits between the upstream body and the delivery layer, so it can do what the
++ * delivery layer cannot: see the decline before the client does, throw that attempt away, and splice
++ * the NEXT attempt's frames into the same body. The client never sees the declined attempt at all --
++ * not its prelude, not the error -- and the response head it already received stays valid.
++ *
++ * Safety: only frames that carry no content are ever held, and a decline is only retried while
++ * nothing has been forwarded. Once any content frame is out, a resend would generate a second answer
++ * for the same turn, so the decline is passed through and the client's own retry owns the outcome.
++ */
++
++const DEFAULT_HOLD_MS = 25_000;
++
++export interface SsePreludeDeclineRetryOptions {
++  /** Waits before each resend, indexed by rung; its length is the resend budget. */
++  delaysMs: readonly number[];
++  /** Perform one more physical send. Null when the caller has no rung left to spend. */
++  resend: (rung: number) => Promise<Response | null>;
++  /** How long prelude frames may be held before they are released unconditionally. */
++  holdMs?: number;
++  /** Host label for logs. */
++  label?: string;
++  /** Abort while waiting between resends. */
++  signal?: AbortSignal;
++}
++
++const PRELUDE_TYPES: ReadonlySet<string> = new Set(["response.created", "response.in_progress"]);
++const DECLINE_TYPES: ReadonlySet<string> = new Set(["error", "response.failed"]);
++
++function decodeFrame(frame: Uint8Array): string {
++  return new TextDecoder().decode(frame);
++}
++
++/** The `type` of an SSE frame, or undefined when it is not a JSON event we recognise. */
++function frameType(text: string): string | undefined {
++  const dataLine = text.split("\n").filter(line => line.startsWith("data:")).pop();
++  if (!dataLine) return undefined;
++  try {
++    const parsed = JSON.parse(dataLine.slice(5).trim()) as { type?: unknown };
++    return typeof parsed?.type === "string" ? parsed.type : undefined;
++  } catch {
++    return undefined;
++  }
++}
++
++function isCapacityDecline(text: string): boolean {
++  const lower = text.toLowerCase();
++  return lower.includes("overloaded") || lower.includes("capacity") || lower.includes("server_is_overloaded");
++}
++
++function sleep(ms: number, signal?: AbortSignal): Promise<void> {
++  if (ms <= 0) return Promise.resolve();
++  return new Promise((resolve, reject) => {
++    const timer = setTimeout(() => { signal?.removeEventListener("abort", onAbort); resolve(); }, ms);
++    const onAbort = () => { clearTimeout(timer); reject(signal!.reason ?? new Error("aborted")); };
++    if (signal?.aborted) onAbort();
++    else signal?.addEventListener("abort", onAbort, { once: true });
++  });
++}
++
++export function withSsePreludeDeclineRetry(
++  response: Response,
++  options: SsePreludeDeclineRetryOptions,
++): Response {
++  const contentType = response.headers.get("content-type") ?? "";
++  if (!response.body || !contentType.includes("text/event-stream")) return response;
++  const holdMs = options.holdMs ?? DEFAULT_HOLD_MS;
++  let reader = response.body.getReader();
++  let flushTimer: ReturnType<typeof setTimeout> | undefined;
++  const body = new ReadableStream<Uint8Array>({
++    async start(controller) {
++      let buffer = new Uint8Array(0);
++      const held: Uint8Array[] = [];
++      let released = false;
++      let contentSeen = false;
++      let rung = 0;
++      const emit = (frame: Uint8Array) => {
++        try { controller.enqueue(frame); } catch { /* the client is gone */ }
++      };
++      const flushHeld = () => {
++        clearTimeout(flushTimer); flushTimer = undefined;
++        released = true;
++        for (const frame of held.splice(0, held.length)) emit(frame);
++      };
++      const release = () => { clearTimeout(flushTimer); flushTimer = undefined; try { controller.close(); } catch { /* already closed */ } };
++      try {
++        for (;;) {
++          const { value, done } = await reader.read();
++          if (done) {
++            if (!released && held.length > 0) flushHeld();
++            release();
++            return;
++          }
++          if (!value) continue;
++          const merged = new Uint8Array(buffer.byteLength + value.byteLength);
++          merged.set(buffer); merged.set(value, buffer.byteLength);
++          buffer = merged;
++          for (;;) {
++            const text = decodeFrame(buffer);
++            const boundary = text.indexOf("\n\n");
++            if (boundary < 0) break;
++            const frameText = text.slice(0, boundary + 2);
++            const frameBytes = new TextEncoder().encode(frameText);
++            buffer = buffer.slice(frameBytes.byteLength);
++            const type = frameType(frameText);
++            const decline = type !== undefined && DECLINE_TYPES.has(type) && isCapacityDecline(frameText);
++            const prelude = type === undefined || PRELUDE_TYPES.has(type) || type.startsWith("codex.");
++            if (!contentSeen && decline && rung < options.delaysMs.length) {
++              const waitMs = options.delaysMs[rung]!;
++              rung += 1;
++              held.length = 0;
++              console.warn(
++                "[upstream-retry] sse prelude declined before any content"
++                + (options.label ? " (" + options.label + ")" : "")
++                + " - resending in " + waitMs + "ms (" + rung + "/" + options.delaysMs.length + ")",
++              );
++              try { await reader.cancel(); } catch { /* the declined body is going away anyway */ }
++              try {
++                await sleep(waitMs, options.signal);
++                const next = await options.resend(rung);
++                // Only another STREAM may be spliced in: a non-ok answer (a refusal, a budget
++                // error) has no frames to give the client, and its JSON body would land inside an
++                // event stream. Fall back to the decline instead.
++                const nextType = next?.headers.get("content-type") ?? "";
++                if (!next?.body || !next.ok || !nextType.includes("text/event-stream")) {
++                  throw new Error("no further stream attempt available");
++                }
++                reader = next.body.getReader();
++                buffer = new Uint8Array(0);
++              } catch (error) {
++                // No rung left or the wait was aborted: hand the client the decline it was going to
++                // get anyway rather than a broken stream.
++                if (!released) flushHeld();
++                emit(frameBytes);
++                console.warn("[upstream-retry] sse prelude decline could not be retried: " + String(error));
++                release();
++                return;
++              }
++              break;   // re-read from the new attempt
++            }
++            if (!contentSeen && prelude && !released) {
++              held.push(frameBytes);
++              flushTimer ??= setTimeout(flushHeld, holdMs);
++              continue;
++            }
++            if (!contentSeen && !prelude) contentSeen = true;
++            if (!released && held.length > 0) flushHeld();
++            emit(frameBytes);
++          }
++        }
++      } catch (error) {
++        if (!released && held.length > 0) flushHeld();
++        try { controller.error(error); } catch { /* already closed */ }
++      }
++    },
++    cancel() { clearTimeout(flushTimer); void reader.cancel(); },
++  });
++  return new Response(body, { status: response.status, statusText: response.statusText, headers: new Headers(response.headers) });
++}
+
+--- /dev/null	2026-09-23 02:42:19.090885446 +0800
++++ b/src/server/ws-thread-transport.ts	2026-09-24 18:35:08.084054879 +0800
+@@ -0,0 +1,314 @@
++/**
++ * Per-thread transport demotion for the ChatGPT Codex WebSocket lane.
++ *
++ * Why this exists: the Codex backend serves the `responses_websockets` path from a measurably
++ * faster queue, so every request rides WS by default. That lane is not uniformly available to every
++ * conversation, though: on 2026-09-23 one conversation answered `Our servers are currently
++ * overloaded` on 50% of its turns (17 of 34) while a sibling conversation on the SAME account,
++ * model, effort, tier and cache profile answered 200 on 61 of 61 turns in the same minutes. Moving
++ * only the failing conversation to plain HTTP dropped it to 1 failure in 7 turns.
++ *
++ * So the demotion is per THREAD, not per account: a conversation that collects repeated overload
++ * verdicts steps off the WS lane for a while, and everything else keeps the faster lane. The hold
++ * escalates (30m -> 1h -> 2h) because the backend's shedding of that conversation is persistent
++ * rather than momentary, and it decays after a quiet window so a recovered thread starts fresh.
++ */
++import { normalizeLogConversationId } from "./request-log-conversation";
++import { readFileSync, statSync, writeFileSync } from "node:fs";
++import { join } from "node:path";
++import { getConfigDir } from "../config/paths";
++
++/**
++ * Overload verdicts inside {@link VERDICT_WINDOW_MS} before the thread steps off the WS lane.
++ *
++ * Six, not two. The demotion was written when the WS lane had no protection of its own, so moving
++ * a shedding conversation to plain HTTP was strictly better. The lanes have since swapped: the WS
++ * exchange now HOLDS its prelude and can re-dial a declined attempt, while the SSE delivery path
++ * still relays a pre-content overload straight into the client's stream. Demoting on two verdicts
++ * therefore pushed this conversation onto the one lane that cannot recover from a shed -- measured
++ * 2026-09-24: after a demotion, every remaining failure of that conversation was `ws=n`,
++ * `transportPhase: terminal_sse`, with nothing retryable left to act on. The threshold stays high
++ * enough to catch a lane that is genuinely unusable, not merely busy. */
++const VERDICT_THRESHOLD = 6;
++const VERDICT_WINDOW_MS = 10 * 60_000;
++/** Escalating holds; the last value repeats. */
++const DEMOTION_HOLD_MS = [30 * 60_000, 60 * 60_000, 120 * 60_000];
++/** A thread with no verdicts for this long starts over at the first hold. */
++const VERDICT_DECAY_MS = 30 * 60_000;
++/** Bounded ledger: threads are long-lived, but memory is not. */
++const LEDGER_CAPACITY = 512;
++/**
++ * How long one shed verdict keeps this thread's routing identity re-rolled.
++ *
++ * Six hours, not one. The A/B on 2026-09-23 (arm 22:59:30 -> disarm 23:11:49) put the shed back
++ * within ten seconds of the disarm and kept the conversation at ~8s turns while armed, so the hold
++ * is the thing that is working: a one-hour window simply expires in the middle of a working session
++ * and the conversation falls back onto whatever lane it had before.
++ */
++const AFFINITY_RESET_HOLD_MS = 6 * 60 * 60_000;
++/** Re-read budget for the operator's manual-arm file. */
++const MANUAL_ARM_TTL_MS = 10_000;
++
++interface ThreadTransportEntry {
++  /** Verdict timestamps inside the current window. */
++  verdicts: number[];
++  /**
++   * While now < this, the thread's outbound `x-codex-window-id` is dropped.
++   *
++   * The shed conversation is not merely shedding: it is served 2-3x slower than its sibling at
++   * EVERY hour of the evening (13.9s vs 6.3s median time-to-first-token across 593/837 successful
++   * turns, with comparable input sizes -- measured 2026-09-23), and it collects 51 sheds against
++   * its sibling's 11. A per-turn cost explanation cannot produce that: after its compaction the
++   * shed conversation sent SMALLER prompts (175k vs 443k) and stayed both slow and shed. What is
++   * left is how that conversation is `routed`, and the one per-conversation routing hint the client
++   * sends is `x-codex-window-id`. Dropping it asks the backend to place this conversation afresh;
++   * the proxy changes no content, no model and no credential.
++   */
++  affinityResetUntil: number;
++  /** Demotion level reached so far (index into {@link DEMOTION_HOLD_MS}). */
++  rung: number;
++  /** While now < this, the thread must use plain HTTP. */
++  httpOnlyUntil: number;
++  lastAt: number;
++}
++
++const ledger = new Map<string, ThreadTransportEntry>();
++
++/**
++ * The armed conversations, persisted so a restart cannot silently un-fix a working conversation.
++ *
++ * The ledger itself is deliberately in-memory: a demotion is a fresh judgement about recent
++ * verdicts. The AFFINITY hold is different -- it is the one piece of state whose loss costs the
++ * operator a slow, shedding conversation again (observed: the shed came back ten seconds after a
++ * disarm, and every restart in this session cleared the holds). Only the key and its expiry are
++ * written; verdict history is not.
++ */
++const AFFINITY_STATE_FILE = "thread-affinity.json";
++const AFFINITY_STATE_VERSION = 1;
++
++function affinityStatePath(): string {
++  return join(getConfigDir(), AFFINITY_STATE_FILE);
++}
++
++function loadAffinityState(): void {
++  try {
++    const raw = JSON.parse(readFileSync(affinityStatePath(), "utf8")) as { version?: unknown; armed?: unknown };
++    if (raw.version !== AFFINITY_STATE_VERSION || typeof raw.armed !== "object" || raw.armed === null) return;
++    const now = Date.now();
++    for (const [key, until] of Object.entries(raw.armed as Record<string, unknown>)) {
++      if (typeof until !== "number" || !Number.isFinite(until) || until <= now) continue;
++      const entry: ThreadTransportEntry = { verdicts: [], rung: 0, httpOnlyUntil: 0, affinityResetUntil: until, lastAt: now };
++      ledger.set(key, entry);
++    }
++  } catch {
++    /* absent or malformed state means "nothing armed" */
++  }
++}
++
++function persistAffinityState(now: number): void {
++  const armed: Record<string, number> = {};
++  for (const [key, entry] of ledger) {
++    if (entry.affinityResetUntil > now) armed[key] = entry.affinityResetUntil;
++  }
++  try {
++    writeFileSync(affinityStatePath(), JSON.stringify({ version: AFFINITY_STATE_VERSION, armed }, null, 2) + "\n", { mode: 0o600 });
++  } catch {
++    /* persistence is best-effort: the in-memory hold still applies for this process */
++  }
++}
++
++loadAffinityState();
++
++/** Messages that mean "this conversation is being shed", not "this request was malformed". */
++export function isOverloadVerdictText(message: string | undefined): boolean {
++  const text = (message ?? "").toLowerCase();
++  if (text.length === 0) return false;
++  // Substring matching on purpose: relays spell it `capacity_exceeded`, `at capacity`, `Capacity`,
++  // and the canonical backend answers "Our servers are currently overloaded". A word-boundary
++  // pattern misses the underscore forms, which are exactly the ones a relay sends.
++  return /currently overloaded|server_is_overloaded|overloaded|capacity/.test(text);
++}
++
++function trim(threadId: string | undefined): string | undefined {
++  const value = threadId?.trim();
++  return value && value.length > 0 ? value : undefined;
++}
++
++/**
++ * The identity both sides of this ledger agree on.
++ *
++ * The recording side sees `logCtx.conversationId`, which the proxy derives (and hashes) from the
++ * request headers with a fixed precedence. Recomputing that same value from the outgoing request's
++ * headers is what lets a verdict recorded during the response land on the thread that asked for it.
++ */
++export function conversationKeyFromHeaders(headers: HeadersInit | undefined): string | undefined {
++  if (!headers) return undefined;
++  let map: Headers;
++  try {
++    map = new Headers(headers);
++  } catch {
++    return undefined;
++  }
++  return normalizeLogConversationId(
++    map.get("x-codex-parent-thread-id")
++      ?? map.get("session_id")
++      ?? map.get("session-id")
++      ?? map.get("thread-id"),
++  );
++}
++
++/**
++ * Record one overload verdict for a thread and demote it once the threshold is reached.
++ *
++ * Called from the request-log funnel that already classifies the upstream error text, so the
++ * ledger sees exactly the verdicts the operator sees in `/api/logs`.
++ */
++export function noteThreadOverloadVerdict(
++  threadId: string | undefined,
++  message: string | undefined,
++  now = Date.now(),
++): void {
++  const key = trim(threadId);
++  if (!key || !isOverloadVerdictText(message)) return;
++  const previous = ledger.get(key);
++  // Quiet time is measured from whichever came LAST: the newest verdict or the end of the hold.
++  // Measuring it from the verdict alone would reset the ladder during every hold (a demoted thread
++  // produces no verdicts while it rides HTTP), so a thread that is shed again the moment its hold
++  // expires would start over at 30 minutes forever instead of escalating.
++  const quietSince = Math.max(previous?.lastAt ?? 0, previous?.httpOnlyUntil ?? 0);
++  const entry: ThreadTransportEntry = previous && now - quietSince < VERDICT_DECAY_MS
++    ? { ...previous, verdicts: [...previous.verdicts, now] }
++    : { verdicts: [now], rung: 0, httpOnlyUntil: 0, affinityResetUntil: 0, lastAt: now };
++  entry.verdicts = entry.verdicts.filter(at => now - at < VERDICT_WINDOW_MS);
++  entry.lastAt = now;
++  // Armed on the first verdict, not on the demotion threshold: the window id is a ROUTING hint,
++  // and the point of the experiment is to find out whether re-rolling it changes the service this
++  // conversation gets. Refreshed by every later verdict, so a conversation that keeps shedding
++  // keeps the reset until it has been quiet for the decay window.
++  if (entry.affinityResetUntil <= now) {
++    entry.affinityResetUntil = now + AFFINITY_RESET_HOLD_MS;
++    persistAffinityState(now);
++    console.warn(
++      `[opencodex] thread ${key.slice(0, 8)}: dropping x-codex-window-id for ${Math.round(AFFINITY_RESET_HOLD_MS / 60_000)}min `
++      + `(this conversation is served slower and sheds more than its siblings; asking the backend to route it afresh)`,
++    );
++  } else {
++    entry.affinityResetUntil = now + AFFINITY_RESET_HOLD_MS;
++    persistAffinityState(now);
++  }
++  if (entry.verdicts.length >= VERDICT_THRESHOLD && entry.httpOnlyUntil <= now) {
++    const hold = DEMOTION_HOLD_MS[Math.min(entry.rung, DEMOTION_HOLD_MS.length - 1)]!;
++    entry.httpOnlyUntil = now + hold;
++    entry.rung = Math.min(entry.rung + 1, DEMOTION_HOLD_MS.length - 1);
++    entry.verdicts = [];
++    console.warn(
++      `[opencodex] thread ${key.slice(0, 8)} demoted to HTTP for ${Math.round(hold / 60_000)}min `
++      + `(ChatGPT WebSocket lane kept answering overloaded; ${message?.slice(0, 60) ?? ""})`,
++    );
++  }
++  ledger.delete(key);
++  ledger.set(key, entry);
++  while (ledger.size > LEDGER_CAPACITY) {
++    const oldest = ledger.keys().next().value;
++    if (oldest === undefined) break;
++    ledger.delete(oldest);
++  }
++}
++
++/** True while this thread must use plain HTTP instead of the WebSocket lane. */
++export function threadTransportDemotedToHttp(
++  threadId: string | undefined,
++  now = Date.now(),
++): boolean {
++  const key = trim(threadId);
++  if (!key) return false;
++  const entry = ledger.get(key);
++  if (!entry) return false;
++  if (entry.httpOnlyUntil <= now) return false;
++  // Refresh recency so an active demoted thread is not evicted by the capacity bound.
++  ledger.delete(key);
++  ledger.set(key, entry);
++  return true;
++}
++
++/** Test-only reset, alongside the combo state resets. */
++export function clearThreadTransportLedgerForTests(): void {
++  ledger.clear();
++}
++
++/**
++ * True while this conversation's outbound routing identity should be re-rolled.
++ *
++ * The caller (the canonical OpenAI forward header builder) drops `x-codex-window-id` when this
++ * answers true. Nothing else about the request changes: same credential, same model, same body.
++ */
++export function threadAffinityResetActive(
++  threadId: string | undefined,
++  now = Date.now(),
++): boolean {
++  const key = trim(threadId);
++  if (!key) return false;
++  if (manualArmMatches(key, now)) return true;
++  const entry = ledger.get(key);
++  if (!entry || entry.affinityResetUntil <= now) return false;
++  ledger.delete(key);
++  ledger.set(key, entry);
++  return true;
++}
++
++/**
++ * The operator's on-demand arm: `~/.opencodex/affinity-arm.json` = {keys:[prefix...], until:epochMs}.
++ *
++ * The verdict-driven arm can only fire once the backend has already shed the conversation, which
++ * makes it useless for testing whether a re-roll changes the service a STILL-SLOW conversation gets
++ * (measured: one conversation at 14-22s time-to-first-token against its sibling's 8s, for hours).
++ * Prefixes rather than full keys, because the ledger's key is the proxy's own conversation hash and
++ * the first eight characters are what every log line already shows. Read with a short TTL: the file
++ * is operator state, not hot-path input.
++ */
++let manualArmCache: { at: number; keys: string[]; until: number; mtimeMs: number } | undefined;
++function manualArmState(now: number): { keys: string[]; until: number } {
++  const path = join(getConfigDir(), "affinity-arm.json");
++  let mtimeMs = 0;
++  try { mtimeMs = statSync(path).mtimeMs; } catch { mtimeMs = 0; }
++  if (manualArmCache && manualArmCache.mtimeMs === mtimeMs && now - manualArmCache.at < MANUAL_ARM_TTL_MS) {
++    return manualArmCache;
++  }
++  let keys: string[] = [];
++  let until = 0;
++  try {
++    const parsed = JSON.parse(readFileSync(path, "utf8")) as { keys?: unknown; until?: unknown };
++    if (Array.isArray(parsed.keys)) {
++      keys = parsed.keys.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
++        .map(value => value.trim());
++    }
++    if (typeof parsed.until === "number" && Number.isFinite(parsed.until)) until = parsed.until;
++  } catch {
++    /* absent or malformed file means "no manual arm" */
++  }
++  manualArmCache = { at: now, keys, until, mtimeMs };
++  return manualArmCache;
++}
++
++function manualArmMatches(key: string, now: number): boolean {
++  const state = manualArmState(now);
++  if (state.until <= now || state.keys.length === 0) return false;
++  return state.keys.some(prefix => key.startsWith(prefix));
++}
++
++/** Test-only reset for the manual-arm cache. */
++export function clearManualAffinityArmCacheForTests(): void {
++  manualArmCache = undefined;
++}
++
++/** Diagnostics for tests and the operator: the current demotion, or undefined. */
++export function threadTransportDemotion(
++  threadId: string | undefined,
++  now = Date.now(),
++): { until: number; rung: number } | undefined {
++  const key = trim(threadId);
++  if (!key) return undefined;
++  const entry = ledger.get(key);
++  if (!entry || entry.httpOnlyUntil <= now) return undefined;
++  return { until: entry.httpOnlyUntil, rung: entry.rung };
++}
+
+--- a/src/lib/upstream-retry.ts	1985-10-26 16:15:00.000000000 +0800
++++ b/src/lib/upstream-retry.ts	2026-09-24 18:48:13.354204458 +0800
+@@ -15,6 +15,8 @@
+  * MUST stay a leaf module: imports nothing from server.ts or adapters (kiro-retry imports
+  * the shared abort helpers from here).
+  */
++import { withSsePreludeDeclineRetry } from "./sse-prelude-retry";
++
+ import { clearableDeadline } from "./abort";
+ import { redactSecretString } from "./redact";
+ 
+@@ -510,6 +512,34 @@
+   /** Test seam: per-attempt slow budget override (defaults to TRANSIENT_RETRY_SLOW_ATTEMPT_MS). */
+   slowAttemptMs?: number;
+   /**
++   * Allow ONE extra send when a 502/503/504 arrived after {@link slowAttemptMs}.
++   *
++   * The ChatGPT backend answers capacity pressure slowly, so the elapsed-time guard -- which exists
++   * to stop doubling the latency of a genuinely slow failure -- would otherwise suppress the retry
++   * exactly when it is most useful. Opt-in per caller; the send budget still bounds the total.
++   */
++  retrySlowCapacity?: boolean;
++  /**
++   * Paced extra sends for a CAPACITY verdict, as the waits before each one.
++   *
++   * `retrySlowCapacity` buys one send and only for a SLOW failure; the canonical backend also
++   * sheds a heavy turn in 1-4 seconds, and a run of sheds inside one window outlives a single
++   * retry. A caller that opts in hands over the ladder it is willing to wait (see
++   * {@link CAPACITY_RETRY_DELAYS_MS}); an empty or absent list keeps the previous behaviour
++   * exactly. These sends are additional to `attempts`, never a widening of it, and a
++   * non-capacity failure still returns on the first response.
++   */
++  retryCapacityDeferralsMs?: readonly number[];
++  /**
++   * Also retry a capacity decline that arrives INSIDE an already-200 SSE body.
++   *
++   * The transient ladder can only act on a status; the ChatGPT backend also declines *after* a 200,
++   * by emitting the prelude and then an overload event. `lib/sse-prelude-retry.ts` holds those
++   * prelude frames and splices a fresh attempt into the same body, so the client never sees the
++   * declined one. Opt-in, and bounded by the same ladder the caller passed above.
++   */
++  retrySsePreludeDecline?: boolean;
++  /**
+    * How long this caller can wait on an honoured `Retry-After`, defaulting to
+    * {@link RETRY_AFTER_CEILING_MS}. It is a deadline, never a clamp: an instruction inside it
+    * is slept in full, and an instruction past it ends the call with the upstream answer and
+@@ -691,11 +721,40 @@
+  * `opts.attempts` is ONE total-send budget covering this layer and the inner reset layer
+  * together, so it bounds the real number of upstream requests rather than multiplying.
+  */
++/**
++ * Extra sends a caller may spend on a CAPACITY verdict, and the waits between them.
++ *
++ * The canonical backend answers a heavy turn "Our servers are currently overloaded" while the
++ * SAME account serves a lighter conversation in the same minute (measured 2026-09-23: 8% shed on
++ * one conversation, 0.6% on its sibling). Rejections cluster into windows of minutes, and inside
++ * a window the very next attempt succeeds only about half the time, so a single retry cannot ride
++ * one out. The waits are deliberately paced: they let a window close instead of spending the
++ * client's own retry budget against it. Bounded by the array length, and spent only on a
++ * 502/503/504 the caller opted into reading as capacity -- never on a request-shaped error.
++ *
++ * Measured again at 23:00-23:31 on the same day with the earlier three-rung ladder: every one of
++ * the shedding conversation's five failures was PRE-content (absorbable), which is the class this
++ * ladder exists for -- so the ladder, not the routing, was the binding constraint. Four rungs and
++ * a longer tail cover roughly one more halving of the residual.
++ */
++export const CAPACITY_RETRY_DELAYS_MS: readonly number[] = [5_000, 12_000, 25_000, 45_000];
++
+ export async function fetchWithTransientRetry(
+   doFetch: ReplayableFetch,
+   opts: TransientRetryOptions = {},
+ ): Promise<Response> {
+   const budget = normalizeSendAttempts(opts.attempts, TRANSIENT_RETRY_MAX_ATTEMPTS);
++  /**
++   * Capacity sends are ADDITIONAL to the transient budget on purpose.
++   *
++   * That budget exists to stop per-request amplification of RETRIES against a provider that keeps
++   * answering the same way; a capacity verdict is the opposite case -- the provider just said
++   * "not now" about a turn nothing has started, and the operator's whole complaint is that the
++   * turn dies instead of progressing. Each one is still a real send and is reported as such.
++   */
++  const capacityDelays = opts.retryCapacityDeferralsMs ?? [];
++  let capacityRetriesUsed = 0;
++  const totalBudget = budget + capacityDelays.length;
+   const slowAttemptMs = opts.slowAttemptMs ?? TRANSIENT_RETRY_SLOW_ATTEMPT_MS;
+   const transientStatuses: number[] = [];
+   // `attempts` is ONE total-send budget shared with the inner reset layer, not a per-layer
+@@ -706,6 +765,8 @@
+   // `transientRetryOn5xx` policy is the first one that does, and multiplying load against an
+   // already-failing provider is worse than not retrying at all.
+   let sent = 0;
++  /** Set once the opt-in extra send for a SLOW capacity verdict has been spent. */
++  let slowCapacityRetryUsed = false;
+   const countedFetch: ReplayableFetch = (recovery) => {
+     // Incremented BEFORE the await so a rejected send still consumes budget; counting only
+     // successes would let a reset storm loop without bound.
+@@ -720,9 +781,12 @@
+   // sends `countedFetch` already counts. Forwarding the reporter down the `remaining()` path
+   // would report each of them twice, which is how a four-send cap becomes a two-send cap. One
+   // send is counted once, by the outermost layer that owns the budget.
+-  const innerResetOptions = (): ResetRetryOptions => ({
++  const innerResetOptions = (floor = 0): ResetRetryOptions => ({
+     ...opts,
+-    attempts: remaining(),
++    // `floor` is the capacity lane's one physical send: it is a NEW send the caller authorized,
++    // not a refund of a budget this helper already spent. A reset on that send is still refused
++    // by the inner layer, which is exactly the behaviour the missing allowance should keep.
++    attempts: Math.max(remaining(), floor),
+     onSendsConsumed: undefined,
+   });
+   // Reported in `finally` rather than at each exit: this function returns from five places
+@@ -732,14 +796,55 @@
+   if (budget === 0) throw new SendBudgetExhaustedError(opts.label);
+   let attemptStart = Date.now();
+   let res = await fetchWithResetRetry(countedFetch, innerResetOptions());
+-  for (let attempt = 0; sent < budget; attempt++) {
++  for (let attempt = 0; sent < totalBudget; attempt++) {
+     // A non-replayable gateway status was settled after the request body had already left
+     // for the origin; retrying it here is the automatic resend the marker exists to forbid.
+     if (res.ok || !isTransientUpstreamStatus(res.status) || isNonReplayableResponse(res)) return res;
+     // Checked before cancelResponseBodyBestEffort so an already-aborted caller never receives
+     // a response whose body we just cancelled.
+     if (opts.abortSignal?.aborted) return res;
+-    if (Date.now() - attemptStart > slowAttemptMs) return res;
++    // Capacity lane, checked BEFORE the slow gate: the canonical backend's shed answers arrive in
++    // anywhere from 1s to 36s (measured 2026-09-23), so gating on elapsed time missed the fast
++    // half of them entirely.
++    if ((res.status === 502 || res.status === 503 || res.status === 504)
++      && capacityRetriesUsed < capacityDelays.length) {
++      const waitMs = capacityDelays[capacityRetriesUsed]!;
++      capacityRetriesUsed += 1;
++      console.warn(
++        `[upstream-retry] capacity ${res.status}${opts.label ? ` (${opts.label})` : ""} — absorbing: waiting ${waitMs}ms before resend ${capacityRetriesUsed}/${capacityDelays.length}`,
++      );
++      cancelResponseBodyBestEffort(res);
++      await sleepWithAbort(waitMs, opts.abortSignal);
++      attemptStart = Date.now();
++      transientStatuses.push(res.status);
++      try {
++        res = await fetchWithResetRetry(countedFetch, innerResetOptions(1), "transient-5xx");
++      } catch (err) {
++        if (err instanceof SendBudgetExhaustedError) throw err;
++        throw new UpstreamRetryEvidenceError(transientStatuses, err);
++      }
++      continue;
++    }
++    // Everything that is NOT a capacity verdict keeps the caller's original budget, even when the
++    // capacity rungs below have not been spent: the extra sends exist for "the origin said not now"
++    // and must never widen the general transient ladder (a forward pool that retries its own 429s
++    // and 500s is the amplification the send budget was built to stop).
++    if (sent >= budget) return res;
++    if (Date.now() - attemptStart > slowAttemptMs) {
++      // The ChatGPT backend's capacity verdicts arrive SLOWLY: on 2026-09-23 one conversation was
++      // answered `Our servers are currently overloaded` after 8-57 seconds, every one of them past
++      // this 15s guard, so the transient layer never resent and the caller saw a bare 502/503 on a
++      // lane where the very next attempt usually succeeds. A caller that opted in gets exactly ONE
++      // extra send for a slow capacity status; the elapsed-time guard still stops everything else.
++      const capacityStatus = res.status === 502 || res.status === 503 || res.status === 504;
++      if (!(opts.retrySlowCapacity === true && capacityStatus && !slowCapacityRetryUsed && remaining() > 0)) {
++        return res;
++      }
++      slowCapacityRetryUsed = true;
++      console.warn(
++        `[upstream-retry] slow ${res.status}${opts.label ? ` (${opts.label})` : ""} treated as a capacity verdict - one extra send`,
++      );
++    }
+     const instructedDelay = retryAfterDelayMs(res.headers);
+     // The deadline is the CALLER'S, not this module's default. Reading the constant directly
+     // broke it in both directions: a caller with a 30s budget slept the full 45s an upstream
+@@ -778,6 +883,21 @@
+       throw new UpstreamRetryEvidenceError(transientStatuses, err);
+     }
+   }
++  // A 200 whose body never produces content can still be a decline: the SSE lane has no status to
++  // react to, so the wrapper holds its prelude and splices a fresh attempt in when the backend says
++  // "overloaded" before any content. Only when the caller opted in and a ladder was supplied.
++  if (opts.retrySsePreludeDecline === true && capacityDelays.length > 0 && res.ok && res.body) {
++    return withSsePreludeDeclineRetry(res, {
++      delaysMs: capacityDelays,
++      label: opts.label,
++      signal: opts.abortSignal,
++      resend: async () => {
++        // One more physical send, counted exactly like every send this helper owns.
++        opts.onSendsConsumed?.(1);
++        return await fetchWithResetRetry(countedFetch, innerResetOptions(1), "transient-5xx");
++      },
++    });
++  }
+   // Budget exhausted: the last response is returned with its body intact.
+   return res;
+   } finally {
+
+--- a/src/server/responses/codex-ws-exchange.ts	1985-10-26 16:15:00.000000000 +0800
++++ b/src/server/responses/codex-ws-exchange.ts	2026-09-24 10:16:24.812119962 +0800
+@@ -8,9 +8,11 @@
+ import { CODEX_RESPONSES_HTTP_URL, type PreparedCodexWsRequest } from "./codex-ws-request";
+ import { CodexWsCorrelation } from "./codex-ws-correlation";
+ import type { CodexWsSession } from "./codex-ws-session";
++import { isOverloadVerdictText } from "../ws-thread-transport";
+ import { UPGRADE_DEADLINE_MS, CODEX_WS_LIVENESS_PING_INTERVAL_MS, CODEX_WS_RESPONSE_PRELUDE_TIMEOUT_MS, MAX_CODEX_WS_FRAME_BYTES,
+   MAX_CODEX_WS_QUEUE_BYTES, markCodexWsResponse, normalizeResponsesWsRelayEvent, closedBeforeTerminalMessage,
+   codexWsCreateFrameExceedsLimit, codexWsFailureDetail, codexWsPreResponseFailure, markCodexWsStage, codexWsOcxVersion,
++  codexWsCapacityDeclineFailure,
+   type CodexWsFailureStage, type CodexWsStageRecord } from "./codex-ws-wire";
+ 
+ interface ExchangeOptions {
+@@ -90,6 +92,59 @@
+   }), { status, headers });
+ }
+ 
++/**
++ * Events the backend sends before it has generated anything: they describe the response it is about
++ * to produce, and nothing in them is user-visible content.
++ *
++ * The capacity absorbs below are only honest while no CONTENT has been relayed, and these two are
++ * exactly the events that carry no content of their own. Anything else -- an output item, a delta,
++ * a terminal event -- means the turn has begun and a re-send would be a second generation.
++ */
++const PRELUDE_EVENT_TYPES: ReadonlySet<string> = new Set(["response.created", "response.in_progress"]);
++
++/**
++ * Terminal markers that carry no content of their own.
++ *
++ * A \`response.failed\` is a verdict, not a payload: it must not count as "content was delivered",
++ * or a decline that arrives as a failed event instead of an \`error\` frame would be relayed
++ * unchecked (and the retryable-decline path below would never run).
++ */
++/**
++ * Waits before an in-socket resend of a declined create frame.
++ *
++ * Short on purpose: this path exists for LATENCY, not for patience. The socket is already open and
++ * the backend has stated it did not start the turn, so a one-frame retry after a beat is the
++ * cheapest possible recovery. The patient ladder (5/12/25/45s, fresh socket each time) takes over
++ * as soon as this budget is spent or the socket is gone.
++ */
++const CODEX_WS_CAPACITY_ABSORB_DELAYS_MS: readonly number[] = [1_500, 4_000];
++
++const CONTENT_FREE_TERMINALS: ReadonlySet<string> = new Set(["response.failed", "response.incomplete"]);
++
++/**
++ * How long the two prelude events may be held before the client is told the response started.
++ *
++ * They are held so a decline that arrives AFTER the prelude is still a pre-commit event: the whole
++ * point is that nothing has been promised to the client yet, so the turn can be re-dialled instead
++ * of surfacing a capacity error. Sheds arrive 1-36s after the prelude (measured), so the window is
++ * generous; anything the backend actually generates flushes it immediately.
++ */
++const CODEX_WS_PRELUDE_HOLD_MS = 25_000;
++
++
++/** The message an upstream error frame carries, in any of the shapes the backend uses. */
++function errorVerdictText(payload: Record<string, unknown>): string {
++  const error = record(payload.error) ? payload.error : undefined;
++  // A refusal can arrive either as a bare \`error\` event or as a terminal \`response.failed\`, and the
++  // failed form nests its reason under \`response.error\`. Reading only the flat shape made the
++  // second kind look like ordinary content, which is how it reached the client while the first kind
++  // was being absorbed.
++  const nested = record(payload.response) && record(payload.response.error) ? payload.response.error : undefined;
++  return [payload.message, payload.code, error?.message, error?.code, nested?.message, nested?.code]
++    .filter((value): value is string => typeof value === "string")
++    .join(" ");
++}
++
+ /** The sole SSE exchange state machine for both one-shot and retained sockets. */
+ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
+   const { session, url, init, prepared, sseFallback, onQuota, beforeDispatch, bunVersion, nativeControl, beforeContinuation } = options;
+@@ -112,6 +167,19 @@
+     let relayedEvents = 0;
+     let pings = 0;
+     let pongs = 0;
++    /** Relayed events that were neither a prelude event nor an error: the turn has begun. */
++    let contentEvents = 0;
++    /** How many capacity verdicts this exchange has already absorbed with a re-send. */
++    /**
++     * Prelude frames held back until something content-shaped arrives, and the timer that gives up
++     * waiting. Holding them is what keeps a late decline pre-commit, which is what makes the turn
++     * re-dialable instead of reportable.
++     */
++    /** In-socket resends already spent on this exchange. */
++    let capacityAbsorbsUsed = 0;
++    let absorbTimer: ReturnType<typeof setTimeout> | undefined;
++    const heldPrelude: Uint8Array[] = [];
++    let preludeHoldTimer: ReturnType<typeof setTimeout> | undefined;
+     let sentAt: number | null = null;
+     let firstFrameAt: number | null = null;
+     // Numeric close code for the durable stage record; the reason string stays
+@@ -146,6 +214,8 @@
+       clearTimeout(upgradeTimer);
+       clearTimeout(silenceTimer);
+       clearTimeout(pingTimer);
++      clearTimeout(absorbTimer);
++      clearTimeout(preludeHoldTimer);
+       signal?.removeEventListener("abort", onAbort);
+       metadata?.finish();
+       correlation?.finish();
+@@ -202,6 +272,7 @@
+       responseCommitted = true;
+       clearTimeout(silenceTimer);
+       clearTimeout(pingTimer);
++      clearTimeout(preludeHoldTimer);
+       const responseHeaders = metadata?.snapshot() ?? new Headers();
+       responseHeaders.set("content-type", "text/event-stream; charset=utf-8");
+       const response = new Response(stream, { status: 200, headers: responseHeaders });
+@@ -213,6 +284,24 @@
+       resolve(response);
+     };
+ 
++    /**
++     * Release the held prelude: commit the response and then relay what was held, in order.
++     *
++     * Called the moment anything else has to reach the client (content, a terminal event, or a
++     * decline we are NOT re-dialling) and by the hold timer, so a backend that produces nothing for
++     * {@link CODEX_WS_PRELUDE_HOLD_MS} still gets its prelude delivered instead of a silent stall.
++     */
++    const flushHeldPrelude = () => {
++      clearTimeout(preludeHoldTimer);
++      preludeHoldTimer = undefined;
++      if (heldPrelude.length === 0) return;
++      const frames = heldPrelude.splice(0, heldPrelude.length);
++      commitResponse();
++      for (const frame of frames) {
++        try { controller?.enqueue(frame); } catch { /* the stream is already gone */ }
++      }
++    };
++
+     const failStream = (error: unknown, status: 502 | 504 = 502) => {
+       if (terminal) return;
+       terminal = true;
+@@ -482,20 +571,98 @@
+         // Correlation must run first: a reused socket's foreign-stream error settles as a
+         // non-replayable 502 above, never as the refused-create 4xx projection below, which
+         // is the one status family that could authorize an account replay.
+-        if (metadata && sent && !responseCommitted && type === "error") {
+-          let rejection: Response | null;
+-          try { rejection = wrappedRejectionResponse(normalized.payload, metadata.snapshot()); }
+-          catch (error) { failStream(error); return; }
+-          if (rejection) {
+-            terminal = true;
+-            cleanup();
+-            try { controller.close(); } catch { /* unused stream already closed */ }
+-            session.dispose();
+-            resolve(rejection);
++        if (metadata && sent && type === "error") {
++          if (!responseCommitted) {
++            let rejection: Response | null;
++            try { rejection = wrappedRejectionResponse(normalized.payload, metadata.snapshot()); }
++            catch (error) { failStream(error); return; }
++            if (rejection) {
++              terminal = true;
++              cleanup();
++              try { controller.close(); } catch { /* unused stream already closed */ }
++              session.dispose();
++              resolve(rejection);
++              return;
++            }
++          }
++        }
++        // A decline the backend stated outright, before anything was relayed: settle it as a
++        // REPLAYABLE 503 instead of dragging it into the client's stream.
++        //
++        // This replaces the in-socket absorb that used to live here. Twelve of twelve absorbs in
++        // the log stopped at rung 1 and the turn failed anyway: the second decline does not always
++        // arrive as an "error" frame and the socket is not always still open, so a resend on the
++        // same socket is a bet this lane kept losing. The caller's capacity ladder re-dials a
++        // FRESH socket with its own pacing, and that path is proven end to end.
++        //
++        // Only while nothing has been relayed: once content is out, a resend would generate a
++        // second answer for the same turn, so the decline is relayed and the client's own retry
++        // owns the outcome.
++        const capacityDecline = metadata != null
++          && sent
++          && !responseCommitted
++          && contentEvents === 0
++          && !nativeControl
++          && (type === "error" || CONTENT_FREE_TERMINALS.has(type))
++          && isOverloadVerdictText(errorVerdictText(normalized.payload));
++        if (capacityDecline) {
++          const declineText = errorVerdictText(normalized.payload).trim() || "upstream refused to start the turn";
++          // Fast path first: the backend declined BEFORE producing anything, so a resend on the
++          // socket that is already open cannot duplicate work, and it costs one frame instead of a
++          // fresh dial plus the ladder's first wait. This is the resend that used to live here and
++          // never worked -- it never recognised a decline stated as response.failed, so the second
++          // refusal was relayed instead. Both shapes are recognised now, and anything the declined
++          // attempt had already held is discarded so the client sees exactly one prelude.
++          if (!nativeControl
++            && capacityAbsorbsUsed < CODEX_WS_CAPACITY_ABSORB_DELAYS_MS.length
++            && ws.readyState === WebSocket.OPEN) {
++            const waitMs = CODEX_WS_CAPACITY_ABSORB_DELAYS_MS[capacityAbsorbsUsed]!;
++            capacityAbsorbsUsed += 1;
++            heldPrelude.length = 0;
++            console.warn(
++              "[codex-ws] " + type + " declined before any content - resending on the live socket in "
++              + waitMs + "ms (" + capacityAbsorbsUsed + "/" + CODEX_WS_CAPACITY_ABSORB_DELAYS_MS.length + ")",
++            );
++            armSilence();
++            schedulePing();
++            absorbTimer = setTimeout(() => {
++              if (terminal || contentEvents > 0 || signal?.aborted) return;
++              try {
++                ws.send(frameText);
++                sentAt = Date.now();
++                received = false;
++              } catch {
++                failStream("codex websocket capacity resend failed");
++              }
++            }, waitMs);
+             return;
+           }
++          // No socket to reuse (or the resend budget is spent): settle a REPLAYABLE 503 so the
++          // caller's capacity ladder re-dials a fresh socket with its own pacing.
++          terminal = true;
++          cleanup();
++          try { controller.close(); } catch { /* unused stream already closed */ }
++          session.dispose();
++          console.warn(
++            "[codex-ws] " + type + " declined before any content and the socket cannot be reused -"
++            + " settling a replayable 503 so the retry ladder re-dials (" + declineText.slice(0, 60) + ")",
++          );
++          resolve(codexWsCapacityDeclineFailure(503, declineText, metadata.snapshot()));
++          return;
++        }
++        // Prelude events are HELD until something else has to be delivered, so a decline that
++        // arrives after them is still pre-commit, and therefore still re-dialable. Nothing is
++        // withheld from the client for long: any content, any terminal event, or the hold timer
++        // releases the frames immediately.
++        const holdPrelude = metadata != null && !responseCommitted
++          && contentEvents === 0 && PRELUDE_EVENT_TYPES.has(type);
++        if (!holdPrelude) commitResponse();
++        if (holdPrelude) {
++          preludeHoldTimer ??= setTimeout(() => {
++            console.warn("[codex-ws] prelude held for the capacity window - releasing it to the client");
++            flushHeldPrelude();
++          }, CODEX_WS_PRELUDE_HOLD_MS);
+         }
+-        commitResponse();
+       }
+       const prefix = encoder.encode(`event: ${type}\ndata: `);
+       const suffix = encoder.encode("\n\n");
+@@ -513,6 +680,12 @@
+       sseFrame.set(prefix);
+       sseFrame.set(encodedText, prefix.byteLength);
+       sseFrame.set(suffix, prefix.byteLength + encodedText.byteLength);
++      if (metadata != null && !responseCommitted && PRELUDE_EVENT_TYPES.has(type) && contentEvents === 0) {
++        heldPrelude.push(sseFrame);
++        relayedEvents += 1;
++        return;
++      }
++      flushHeldPrelude();
+       try {
+         controller.enqueue(sseFrame);
+       } catch {
+@@ -520,6 +693,10 @@
+         return;
+       }
+       if (!controlFrame) relayedEvents += 1;
++      // Counted separately from relayedEvents: the absorb budget is priced in CONTENT, and a
++      // prelude event or an error is not content.
++      if (!controlFrame && !PRELUDE_EVENT_TYPES.has(type) && type !== "error"
++        && !CONTENT_FREE_TERMINALS.has(type)) contentEvents += 1;
+       if (nativeControl ? steeringEnded : (type === "response.completed" || type === "response.failed" || type === "response.incomplete" || type === "error")) {
+         const completedId = correlation?.completed(normalized.payload) ?? null;
+         terminal = true;
+
+--- a/src/server/responses/codex-ws-wire.ts	1985-10-26 16:15:00.000000000 +0800
++++ b/src/server/responses/codex-ws-wire.ts	2026-09-24 09:33:18.218324918 +0800
+@@ -148,6 +148,28 @@
+   return response;
+ }
+ 
++/**
++ * A capacity decline the origin stated outright, settled so the caller MAY send the turn again.
++ *
++ * {@link codexWsPreResponseFailure} is deliberately non-replayable: a socket that died mid-send is
++ * ambiguous and the turn may be running. A DECLINE is not ambiguous -- the backend answered "not
++ * now" before producing anything -- and the difference is the whole reason this helper exists.
++ * Measured 2026-09-23/24: every shed that reached the client arrived as a decline after the
++ * prelude, was absorbed once by an in-socket resend, and then settled as a failure anyway (12 of 12
++ * absorbs in the log stopped at rung 1), because the second decline is not always an \`error\` frame
++ * and the socket is not always still open. Returning a replayable 503 instead lets the caller's
++ * capacity ladder re-dial a FRESH socket with its own pacing, which is the path that has been
++ * proven to work end to end.
++ */
++export function codexWsCapacityDeclineFailure(status: 502 | 503, message: string, prelude: Headers): Response {
++  const headers = new Headers(prelude);
++  headers.set("content-type", "application/json");
++  headers.set("cache-control", "no-store");
++  return new Response(JSON.stringify({
++    error: { type: "server_error", code: "server_is_overloaded", message },
++  }), { status, headers });
++}
++
+ const CLOSED_BEFORE_TERMINAL = "codex websocket closed before a Responses terminal event";
+ 
+ /**
+
+--- a/src/server/responses/codex-ws-request.ts	1985-10-26 16:15:00.000000000 +0800
++++ b/src/server/responses/codex-ws-request.ts	2026-09-23 23:31:47.513316312 +0800
+@@ -3,6 +3,7 @@
+   CODEX_RESPONSES_LITE_HEADER,
+   CODEX_RESPONSES_LITE_METADATA_KEY,
+ } from "../../codex/forward-transport-headers";
++import { conversationKeyFromHeaders, threadAffinityResetActive } from "../ws-thread-transport";
+ 
+ export const CODEX_RESPONSES_HTTP_URL = "https://chatgpt.com/backend-api/codex/responses";
+ export const CODEX_RESPONSES_WS_URL = "wss://chatgpt.com/backend-api/codex/responses";
+@@ -39,6 +40,18 @@
+       body.client_metadata = { ...current, [name]: value };
+     }
+   }
++  // The affinity re-roll drops this conversation's identity hints, and this function is the one
++  // place the canonical WS path copies a header into the JSON frame: without the check, a header
++  // the forward builder already removed would come straight back through client_metadata.
++  const affinityKey = conversationKeyFromHeaders(headers);
++  if (affinityKey && threadAffinityResetActive(affinityKey)) {
++    const current = body.client_metadata as Record<string, string> | undefined;
++    if (current && Object.hasOwn(current, "x-codex-turn-state")) {
++      const next = { ...current };
++      delete next["x-codex-turn-state"];
++      body.client_metadata = next;
++    }
++  }
+   return true;
+ }
+ 
+
+--- a/src/server/responses/passthrough-dispatch.ts	1985-10-26 16:15:00.000000000 +0800
++++ b/src/server/responses/passthrough-dispatch.ts	2026-09-24 18:48:30.019722169 +0800
+@@ -110,6 +110,7 @@
+ import {
+   SendBudgetExhaustedError,
+   fetchWithTransientRetry,
++  CAPACITY_RETRY_DELAYS_MS,
+   applyUpstreamRecoveryInit,
+   isNonReplayableResponse,
+   refetchAfterProtocolSafeReset,
+@@ -159,6 +160,20 @@
+ import { isTransientConsoleGoUploadRejection } from "../../providers/opencode-zen-rate-limit";
+ import { planReasoningEffortDowngrade } from "../../providers/reasoning-metadata";
+ 
++/**
++ * The paced capacity ladder for one provider, or nothing when it is not opted in.
++ *
++ * Only the canonical OpenAI forward row earns it by default: that is the lane whose shed answers
++ * ("Our servers are currently overloaded", 8% of one conversation's turns on 2026-09-23) are the
++ * operator's actual complaint. OCX_CAPACITY_ABSORB_ALL=1 widens it for every provider,
++ * which exists so the same path can be exercised against a local stub instead of production.
++ */
++function capacityAbsorbDelays(provider: OcxProviderConfig): readonly number[] | undefined {
++  if (isCanonicalOpenAiForwardProvider(provider)) return CAPACITY_RETRY_DELAYS_MS;
++  return process.env.OCX_CAPACITY_ABSORB_ALL === "1" ? CAPACITY_RETRY_DELAYS_MS : undefined;
++}
++
++
+ /** Prepares and recovers one native Responses exchange before client commitment. */
+ export async function preparePassthroughExchange(
+   requestContext: Pick<ResponsesRequestContext, "config" | "logCtx" | "options" | "req">,
+@@ -889,6 +904,15 @@
+         { abortSignal: upstream.signal, label: safeHostLabel(request.url),
+           attempts: remainingTransientSendBudget(transientSendAttempts()), onSendsConsumed: noteTransientSends,
+           claimAmbiguousResend: claimPreHeaderResend,
++          // The FIRST send of a native request needs the capacity ladder too. It was missing here
++          // while the four recovery legs already had it, and the consequence was exact: a native
++          // gpt-6-sol turn whose first send came back 503 "Our servers are currently overloaded"
++          // went straight to the client as a capacity error (measured 2026-09-24 13:27, three in a
++          // row, sendCount=1) while the same provider on the recovery legs retried. Scoped to the
++          // canonical forward row; the ladder's sends are additional to the budget and unlock only
++          // on 502/503/504.
++          retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
++          retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider), retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider),
+           // The OpenCode Go destination stalls-then-drops inference sends (ambiguous
+           // pre-header resets surfacing as refused 429s); its subscription traffic is
+           // inference-only, so a bounded reset replay here absorbs the blip instead of
+@@ -994,7 +1018,12 @@
+               .then(adoptObservedResponse);
+           },
+           { abortSignal: upstream.signal, label: safeHostLabel(request.url), attempts: allowance.attempts,
+-            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend },
++            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend,
++            // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
++            // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
++            retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
++            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider),
++            retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider) },
+         );
+       } catch (err) {
+         return { failed: transportFailureResponse(err) };
+@@ -1121,7 +1150,12 @@
+           },
+           { abortSignal: upstream.signal, label: safeHostLabel(request.url),
+             attempts: remainingTransientSendBudget(transientSendAttempts()),
+-            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend },
++            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend,
++            // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
++            // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
++            retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
++            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider),
++            retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider) },
+         );
+       } catch (err) {
+         return transportFailureResponse(err);
+@@ -1247,7 +1281,12 @@
+               .then(adoptObservedResponse);
+           },
+           { abortSignal: upstream.signal, label: safeHostLabel(request.url), attempts: remainingTransientSendBudget(transientSendAttempts()),
+-            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend },
++            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend,
++            // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
++            // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
++            retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
++            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider),
++            retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider) },
+         );
+       } catch (err) {
+         return transportFailureResponse(err);
+@@ -1380,7 +1419,12 @@
+               .then(adoptObservedResponse);
+           },
+           { abortSignal: upstream.signal, label: safeHostLabel(request.url), attempts: remainingTransientSendBudget(transientSendAttempts()),
+-            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend },
++            onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend,
++            // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
++            // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
++            retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
++            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider),
++            retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider) },
+         );
+       } catch (err) {
+         return transportFailureResponse(err);
+
+--- a/src/server/responses/adapter-dispatch.ts	1985-10-26 16:15:00.000000000 +0800
++++ b/src/server/responses/adapter-dispatch.ts	2026-09-24 10:30:53.617487243 +0800
+@@ -19,6 +19,7 @@
+ import { redactSecretString } from "../../lib/redact";
+ import { waitForProviderRequestSlot } from "../../providers/request-pacing";
+ import { providerFetch, fetchWithHeaderTimeout, safeHostLabel } from "./fetch-helpers";
++import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
+ import {
+   transientRetryPolicyFor,
+   rateLimitRetryPolicyFor,
+@@ -32,6 +33,7 @@
+   fetchWithTransientRetry,
+   fetchWithResetRetry,
+   applyUpstreamRecoveryInit,
++  CAPACITY_RETRY_DELAYS_MS,
+   SendBudgetExhaustedError,
+   prepareSameTarget429Wait,
+   sleepWithAbort,
+@@ -311,7 +313,19 @@
+       // legacy direct-Google exception is preserved exactly; every other adapter still keeps
+       // reset-only semantics so combo failover hops on the first 5xx.
+       const transientPolicy = transientRetryPolicyFor(route.provider);
+-      const fetchWithRetryPolicy = (route.provider.adapter === "google" || transientPolicy)
++      /**
++       * The canonical ChatGPT forward row needs the CAPACITY ladder even though it keeps a
++       * reset-only SEND budget.
++       *
++       * Measured 2026-09-24: native `gpt-6-sol` sessions (this path, not the combo passthrough) were
++       * handed every shed verdict as a 502/503, because `transientRetryPolicyFor` returns null for
++       * forward auth and this lane then wrapped the send in `fetchWithResetRetry`, which never
++       * retries a status. The exchange could settle a replayable 503 and nothing would use it. The
++       * ladder's sends are ADDITIONAL to the send budget and unlock only on 502/503/504, so a
++       * non-capacity failure still returns on the first response exactly as before.
++       */
++      const canonicalForwardRow = isCanonicalOpenAiForwardProvider(route.provider);
++      const fetchWithRetryPolicy = (route.provider.adapter === "google" || transientPolicy || canonicalForwardRow)
+         ? fetchWithTransientRetry
+         : fetchWithResetRetry;
+       upstreamResponse = await fetchWithRetryPolicy(
+@@ -339,6 +353,11 @@
+               attempts: remainingTransientSendBudget(transientPolicy.attempts),
+               onSendsConsumed: noteTransientSends,
+             }
++            : canonicalForwardRow
++              ? { attempts: 1, onSendsConsumed: noteTransientSends }
++              : {}),
++          ...(canonicalForwardRow
++            ? { retrySlowCapacity: true, retryCapacityDeferralsMs: CAPACITY_RETRY_DELAYS_MS }
+             : {}),
+         },
+       );
+

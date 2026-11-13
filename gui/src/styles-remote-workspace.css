@@ -1,0 +1,97 @@
+/* Remote Workspace sessions (components/remote-workspace/RemoteWorkspaceChats.tsx). The page
+   around them is drawn with v2 utilities (pages/RemoteWorkspace.tsx); these rules paint the
+   split-pane chats in the same card language with the v2 tokens: 12px cards, 8px insets,
+   hairlines, and the inverse primary — never blue — for the active pane and session. */
+.remote-empty { margin: 12px 0 0; color: var(--ocx-fg-muted); font-size: 13px; text-align: center; }
+.remote-empty--console { display: grid; min-height: 260px; place-items: center; margin: 0; }
+.remote-console-panel { min-height: 440px; }
+.remote-status { padding: 2px 8px; border-radius: 999px; background: var(--ocx-surface-2); color: var(--ocx-fg-muted); font-size: 12px; font-weight: 600; line-height: 18px; white-space: nowrap; }
+.remote-status--ready { color: var(--ocx-success); background: var(--ocx-success-soft); }
+.remote-status--running, .remote-status--starting { color: var(--ocx-fg); background: var(--ocx-accent-soft); }
+.remote-status--failed { color: var(--ocx-danger); background: var(--ocx-danger-soft); }
+.remote-status--waiting_for_executor { color: var(--ocx-warning); background: var(--ocx-warning-soft); }
+.remote-events { display: flex; min-height: 240px; max-height: min(48vh, 520px); flex-direction: column; gap: 8px; margin-top: 10px; padding: 10px; overflow: auto; border: 1px solid var(--ocx-line); border-radius: 8px; background: var(--ocx-bg); content-visibility: auto; }
+.remote-console-panel > .notice { margin-top: 10px; }
+.remote-event { max-width: 88%; padding: 8px 10px; border-radius: 8px; background: var(--ocx-surface); }
+.remote-event > span { color: var(--ocx-fg-muted); font-size: 12px; font-weight: 600; }
+.remote-event > p { margin: 3px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.55; }
+.remote-event--assistant { align-self: flex-start; box-shadow: inset 2px 0 0 var(--ocx-fg); }
+.remote-event--tool { align-self: center; max-width: 96%; background: var(--ocx-surface-2); }
+.remote-event--error { box-shadow: inset 2px 0 0 var(--ocx-danger); background: var(--ocx-danger-soft); }
+.remote-composer { display: block; margin-top: 12px; }
+.remote-composer textarea { min-height: 92px; font-family: var(--font-sans); }
+.remote-console-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 9px; }
+
+@media (max-width: 620px) {
+  .remote-console-actions { display: grid; grid-template-columns: 1fr 1fr; }
+  .remote-console-actions .btn { min-height: 44px; }
+  .remote-event { max-width: 100%; }
+}
+
+/* Session layout is shared by the browser dashboard and the desktop webview. */
+.remote-chats-workspace { min-width: 0; }
+.remote-chats-toolbar { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin-bottom: 12px; padding: 0 4px; }
+.remote-chats-toolbar h3 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+.remote-chats-toolbar p, .remote-split-limit { margin: 0; color: var(--ocx-fg-muted); font-size: 13px; line-height: 1.5; }
+.remote-split-limit { padding: 4px 8px; }
+.remote-chats-layout { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 12px; align-items: stretch; }
+.remote-session-rail { display: flex; flex-direction: column; gap: 4px; padding: 4px; border-radius: 12px; background: var(--ocx-surface); box-shadow: 0 0 0 1px var(--ocx-line); min-width: 0; max-height: 720px; overflow: auto; }
+.remote-session-row { border-radius: 8px; background: transparent; cursor: grab; }
+.remote-session-row:hover { background: var(--ocx-surface-2); }
+.remote-session-row.is-active { background: var(--ocx-bg); box-shadow: 0 0 0 1px var(--ocx-line-strong), var(--ocx-shadow-sm); }
+.remote-session-open { display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0; padding: 10px; color: var(--ocx-fg); background: transparent; border: 0; text-align: left; cursor: pointer; border-radius: 8px; }
+.remote-session-open > span { display: grid; min-width: 0; gap: 2px; }
+.remote-session-open strong, .remote-session-open small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.remote-session-open strong { font-size: 13px; font-weight: 600; }
+.remote-session-open small { color: var(--ocx-fg-muted); font-size: 12px; }
+.remote-session-open svg { flex: 0 0 auto; width: 14px; height: 14px; color: var(--ocx-fg-subtle); }
+.remote-session-split-actions { display: flex; justify-content: flex-end; padding: 0 6px 6px; gap: 2px; }
+.remote-session-split-actions .btn { min-height: 28px; padding: 4px 8px; }
+.remote-session-split-actions svg, .remote-pane-close svg { width: 14px; height: 14px; }
+.remote-pane-surface { min-width: 0; height: clamp(560px, 75vh, 900px); overflow: auto; border-radius: 12px; }
+/* A track holding a nested split reserves that subtree's minimum, so nested side-by-side splits
+   never scroll inside a pane column; when the tree is wider than the surface, the surface scrolls once. */
+.remote-split-branch { display: grid; min-width: calc(var(--split-min-width, 0) * 1px); height: 100%; }
+.remote-split-branch--row { grid-template-columns: minmax(calc(var(--split-first-min, 0) * 1px), calc(var(--split-ratio) * 100% - 4px)) 8px minmax(calc(var(--split-second-min, 0) * 1px), 1fr); }
+.remote-split-branch--column { grid-template-rows: minmax(0, calc(var(--split-ratio) * 100% - 4px)) 8px minmax(0, 1fr); }
+.remote-split-child { min-width: 0; min-height: 0; overflow: auto; }
+.remote-split-divider { position: relative; background: transparent; touch-action: none; cursor: col-resize; }
+.remote-split-branch--column > .remote-split-divider { cursor: row-resize; }
+.remote-split-divider::after { content: ""; position: absolute; inset: 0 3px; background: var(--ocx-line-strong); border-radius: 2px; }
+.remote-split-branch--column > .remote-split-divider::after { inset: 3px 0; }
+.remote-split-divider:hover::after, .remote-split-divider:focus-visible::after { background: var(--ocx-fg-muted); }
+.remote-split-divider:focus-visible, .remote-session-open:focus-visible, .remote-chat-pane-name:focus-visible { outline: 2px solid var(--ocx-highlight); outline-offset: -2px; }
+.remote-chat-pane { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; overflow: auto; padding: 12px; border-radius: 12px; background: var(--ocx-surface); box-shadow: 0 0 0 1px var(--ocx-line); }
+.remote-chat-pane.is-active { box-shadow: 0 0 0 1px var(--ocx-line-strong), var(--ocx-shadow-sm); }
+.remote-chat-pane-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.remote-chat-pane-name { display: flex; align-items: center; flex: 1; min-width: 0; gap: 8px; cursor: grab; }
+.remote-chat-pane-name > div { display: grid; min-width: 0; }
+.remote-chat-pane-name strong { font-size: 14px; font-weight: 600; }
+.remote-chat-pane-name small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ocx-fg-muted); font-size: 12px; }
+.remote-chat-pane-name svg { flex: 0 0 auto; width: 14px; height: 14px; color: var(--ocx-fg-subtle); }
+.remote-chat-access { color: var(--ocx-fg-muted); font-size: 12px; margin-top: 8px; }
+.remote-chat-pane .remote-events { flex: 1 1 180px; min-height: 100px; max-height: none; }
+.remote-chat-pane > :not(.remote-events) { flex-shrink: 0; }
+.remote-chat-pane .remote-composer textarea { min-height: 44px; height: 64px; }
+.remote-pane-drop-targets { position: absolute; inset: 0; border-radius: inherit; overflow: hidden; }
+.remote-pane-drop { position: absolute; display: grid; place-items: center; color: var(--ocx-fg); font-size: 13px; font-weight: 600; background: color-mix(in srgb, var(--ocx-surface-2) 94%, transparent); border: 2px dashed var(--ocx-line-strong); }
+.remote-pane-drop.is-over { background: var(--ocx-accent-soft); border-color: var(--ocx-fg); border-style: solid; }
+.remote-pane-drop--left { inset: 0 70% 0 0; }
+.remote-pane-drop--right { inset: 0 0 0 70%; }
+.remote-pane-drop--up { inset: 0 30% 50%; }
+.remote-pane-drop--down { inset: 50% 30% 0; }
+@media (max-width: 980px) {
+  .remote-chats-layout { grid-template-columns: 1fr; }
+  .remote-session-rail { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); max-height: 220px; }
+}
+@media (max-width: 760px) {
+  /* Keep every composer reachable without nested horizontal scrolling. The saved
+     split tree and ratios remain intact for a return to a wider viewport. */
+  .remote-pane-surface { height: auto; overflow: visible; }
+  .remote-split-branch { display: flex; flex-direction: column; gap: 12px; height: auto; min-width: 0; }
+  .remote-split-child { overflow: visible; }
+  .remote-split-divider { display: none; }
+  .remote-chat-pane { height: auto; min-height: 440px; }
+  .remote-session-split-actions .btn, .remote-pane-close { min-height: 44px; min-width: 44px; }
+  .remote-chat-pane .remote-console-actions .btn { min-height: 44px; }
+}
